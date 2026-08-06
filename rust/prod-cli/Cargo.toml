@@ -1,0 +1,15 @@
+[package]
+name = "prod-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["UOR Foundation"]
+license = "MIT"
+
+[[bin]]
+name = "prod"
+path = "src/main.rs"
+
+[dependencies]
+prod-ir = { path = "../prod-ir" }
+prod-codegen = { path = "../prod-codegen" }
+clap = { workspace = true }

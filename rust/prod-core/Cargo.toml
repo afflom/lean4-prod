@@ -1,0 +1,16 @@
+[package]
+name = "prod-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["UOR Foundation"]
+license = "MIT"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+prod-ir = { path = "../prod-ir" }
+
+[dev-dependencies]
+prod-macros = { path = "../prod-macros" }

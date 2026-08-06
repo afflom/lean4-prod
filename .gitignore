@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.result
+lean/.lake
+rust/target
+rust/prod-core/kernel.ir
+roots.json
+coverage.md
+goldens.txt

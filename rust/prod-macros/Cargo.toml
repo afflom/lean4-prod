@@ -1,0 +1,16 @@
+[package]
+name = "prod-macros"
+version = "0.1.0"
+edition = "2021"
+authors = ["UOR Foundation"]
+license = "MIT"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }
+prod-ir = { path = "../prod-ir" }
+prod-codegen = { path = "../prod-codegen" }

@@ -1,0 +1,33 @@
+{
+  description = "lean4-prod — whole-language Lean 4 → production Rust (LCNF-based, no_std + wasm)";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+  };
+
+  outputs = { self, nixpkgs, flake-utils }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+      in
+      {
+        devShells.default = pkgs.mkShell {
+          buildInputs = [
+            pkgs.lean4          # Lean 4.30.0 (matches lean/lean-toolchain)
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.clippy
+            pkgs.rustfmt
+            pkgs.just
+            pkgs.wasm-pack
+          ];
+          shellHook = ''
+            # wasm target for the portable half (prod-ir / prod-codegen / prod-wasm)
+            if command -v rustup >/dev/null 2>&1; then
+              rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true
+            fi
+          '';
+        };
+      });
+}

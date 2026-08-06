@@ -6,9 +6,11 @@
 //! def      ::= "(" "def" ident "(" param* ")" type expr ")"
 //! param    ::= "(" ident type ")"
 //! type     ::= "Nat" | "Int" | "Bool" | "Instance" | "(" "Option" type ")" | "(" "Vec" type ")"
+//!            | "(" "Tuple" type* ")" | "(" "opaque" '"' ident '"' ")"
 //! expr     ::= nat | ident | "(" "param" nat ")" | "(" "field" expr ident ")"
 //!            | "(" "add" expr expr ")" | "(" "sub" expr expr ")" | "(" "mul" expr expr ")"
 //!            | "(" "div" expr expr ")" | "(" "mod" expr expr ")" | "(" "shl" expr expr ")"
+//!            | "(" "pow" expr expr ")" | "(" "opaque" '"' ident '"' ")"
 //!            | "(" "eq" expr expr ")" | "(" "lt" expr expr ")" | "(" "gt" expr expr ")"
 //!            | "(" "if" expr expr expr ")" | "(" "let" ident expr expr ")"
 //!            | "(" "call" ident expr* ")"
@@ -101,6 +103,14 @@ fn parse_type(input: &str) -> IResult<&str, Type> {
                 char(')'),
             ),
             |(_, ts)| Type::Tuple(ts),
+        ),
+        map(
+            delimited(
+                char('('),
+                tuple((tag("opaque"), ws(quoted_ident))),
+                char(')'),
+            ),
+            |(_, s)| Type::Opaque(s),
         ),
     )))(input)
 }
@@ -197,6 +207,10 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                     |(_, a, b)| Expr::Shl(Box::new(a), Box::new(b)),
                 ),
                 map(
+                    tuple((tag("pow"), ws(parse_expr), ws(parse_expr))),
+                    |(_, a, b)| Expr::Pow(Box::new(a), Box::new(b)),
+                ),
+                map(
                     tuple((tag("eq"), ws(parse_expr), ws(parse_expr))),
                     |(_, a, b)| Expr::Eq(Box::new(a), Box::new(b)),
                 ),
@@ -256,6 +270,9 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                     |(_, name, args)| Expr::Jmp(name, args),
                 ),
                 map(tag("unreachable"), |_| Expr::Unreachable),
+                map(tuple((tag("opaque"), ws(quoted_ident))), |(_, s)| {
+                    Expr::Opaque(s)
+                }),
             )),
         ))),
         ws(char(')')),
@@ -393,8 +410,7 @@ mod tests {
     #[test]
     fn test_parse_jp_jmp() {
         let (rest, expr) =
-            parse_expr(r#"(jp loop (i acc) (if (lt i 10) (jmp loop (add i 1) acc) acc))"#)
-                .unwrap();
+            parse_expr(r#"(jp loop (i acc) (if (lt i 10) (jmp loop (add i 1) acc) acc))"#).unwrap();
         assert!(rest.is_empty());
         match expr {
             Expr::Jp { name, params, body } => {
@@ -418,5 +434,32 @@ mod tests {
         let (rest, expr) = parse_expr("(gt (param 0) 1)").unwrap();
         assert!(rest.is_empty());
         assert!(matches!(expr, Expr::Gt(..)));
+    }
+
+    #[test]
+    fn test_parse_pow() {
+        let (rest, expr) = parse_expr("(pow 2 (sub (proj \"Instance\" 2 i) 1))").unwrap();
+        assert!(rest.is_empty());
+        match expr {
+            Expr::Pow(a, b) => {
+                assert_eq!(*a, Expr::Nat(2));
+                assert!(matches!(*b, Expr::Sub(..)));
+            }
+            _ => panic!("Expected Pow, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_opaque_expr() {
+        let (rest, expr) = parse_expr(r#"(opaque "f1-closure")"#).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(expr, Expr::Opaque("f1-closure".into()));
+    }
+
+    #[test]
+    fn test_parse_opaque_type() {
+        let (rest, ty) = parse_type(r#"(opaque "Foo.Bar")"#).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(ty, Type::Opaque("Foo.Bar".into()));
     }
 }

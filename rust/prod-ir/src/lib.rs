@@ -62,6 +62,7 @@ pub enum Expr {
     Div(Box<Expr>, Box<Expr>),
     Mod(Box<Expr>, Box<Expr>),
     Shl(Box<Expr>, Box<Expr>),
+    Pow(Box<Expr>, Box<Expr>),
     Eq(Box<Expr>, Box<Expr>),
     Lt(Box<Expr>, Box<Expr>),
     Gt(Box<Expr>, Box<Expr>),

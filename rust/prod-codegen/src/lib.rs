@@ -7,10 +7,13 @@
 //!
 //! # Code generation policy
 //!
-//! - **Nat policy**: Lean `Nat` maps to `u64` and Lean `Int` to `i64`.
-//!   Arithmetic (`add`/`sub`/`mul`/`div`/`mod`/`shl`) maps directly to the
-//!   corresponding `u64` operators, e.g. `(shl 1 (sub o 1))` → `(1 << (o - 1))`.
-//!   No overflow checks or bignum fallback — the caller owns that risk.
+//! - **Nat policy**: Lean `Nat` maps to bounded `u64` and Lean `Int` to `i64`.
+//!   The current generated arithmetic is Nat-focused and makes the semantic
+//!   boundary explicit: addition, multiplication, shifts, and powers panic on
+//!   `u64` overflow; subtraction saturates at zero (Lean Nat subtraction);
+//!   division and modulo by zero return zero (Lean Nat's total operations).
+//!   There is no bignum fallback, so this is exact only while values fit in
+//!   `u64`. Typed Int arithmetic remains a separate lowering task.
 //! - **Instance**: the IR `Instance` type maps to `crate::Instance` (by value;
 //!   it is a small `Copy` struct in `prod-core`).
 //! - **Field access**: `(field e "name")` renders as `e.name`, except for the
@@ -27,10 +30,24 @@
 //! - **LCNF nodes**:
 //!   - `Match` renders as a Rust `match`, with `default` becoming the `_` arm.
 //!   - `Ctor` renders as tuple-style construction `Name(args...)` (bare `Name`
-//!     when there are no args).
-//!   - `Proj` renders as tuple-style field access `(e).<idx>`. A named-field
-//!     map (Lean structure field names) is future work; the type name is
-//!     currently emitted only in generated comments where useful.
+//!     when there are no args), except `Prod.mk`, which renders as a Rust
+//!     tuple `(a, b)` — nested for right-nested pairs.
+//!   - `Proj` renders through the projection-field table below for known
+//!     structure types, and tuple-style `.idx` for unknown `(type, idx)`
+//!     pairs. The table maps Lean structure projection indices to the
+//!     runtime's named Rust fields; `("UorAtlas.Instance", i)` follows the
+//!     field declaration order `q T O` in `lean/Example/Kernel.lean`, matching
+//!     `prod_core::Instance { q, t, o }`:
+//!
+//!     | (type, idx)               | Rust rendering |
+//!     |---------------------------|----------------|
+//!     | `("UorAtlas.Instance", 0)` | `e.q`          |
+//!     | `("UorAtlas.Instance", 1)` | `e.t`          |
+//!     | `("UorAtlas.Instance", 2)` | `e.o`          |
+//!     | anything else             | `e.<idx>`      |
+//!
+//!   - `Type::Tuple` renders as a Rust tuple type, so
+//!     `(Tuple Nat (Tuple Nat Nat))` becomes `(u64, (u64, u64))`.
 //!   - `Unreachable` renders as `unreachable!()`.
 //!   - **Jp/Jmp policy**: a join point with exactly one `jmp` caller that is
 //!     not inside its own body is inlined at the jump site as
@@ -194,6 +211,7 @@ fn children(expr: &Expr) -> impl Iterator<Item = &Expr> {
         | Expr::Div(a, b)
         | Expr::Mod(a, b)
         | Expr::Shl(a, b)
+        | Expr::Pow(a, b)
         | Expr::Eq(a, b)
         | Expr::Lt(a, b)
         | Expr::Gt(a, b) => {
@@ -251,12 +269,34 @@ fn expr_to_rust(
                 Ok(format!("{}.{}", obj, field))
             }
         }
-        Expr::Add(a, b) => binop(a, b, "+", params, ctx),
-        Expr::Sub(a, b) => binop(a, b, "-", params, ctx),
-        Expr::Mul(a, b) => binop(a, b, "*", params, ctx),
-        Expr::Div(a, b) => binop(a, b, "/", params, ctx),
-        Expr::Mod(a, b) => binop(a, b, "%", params, ctx),
-        Expr::Shl(a, b) => binop(a, b, "<<", params, ctx),
+        Expr::Add(a, b) => checked_binop(
+            a,
+            b,
+            "checked_add",
+            "Lean Nat addition overflow",
+            params,
+            ctx,
+        ),
+        Expr::Sub(a, b) => saturating_binop(a, b, "saturating_sub", params, ctx),
+        Expr::Mul(a, b) => checked_binop(
+            a,
+            b,
+            "checked_mul",
+            "Lean Nat multiplication overflow",
+            params,
+            ctx,
+        ),
+        Expr::Div(a, b) => total_binop(a, b, "/", params, ctx),
+        Expr::Mod(a, b) => total_binop(a, b, "%", params, ctx),
+        Expr::Shl(a, b) => checked_shift(a, b, params, ctx),
+        Expr::Pow(a, b) => {
+            let a = expr_to_rust(a, params, ctx)?;
+            let b = expr_to_rust(b, params, ctx)?;
+            Ok(format!(
+                "(({}) as u64).checked_pow(u32::try_from({}).expect(\"Lean Nat power exponent exceeds u32\")).expect(\"Lean Nat power overflow\")",
+                a, b
+            ))
+        }
         Expr::Eq(a, b) => binop(a, b, "==", params, ctx),
         Expr::Lt(a, b) => binop(a, b, "<", params, ctx),
         Expr::Gt(a, b) => binop(a, b, ">", params, ctx),
@@ -300,15 +340,21 @@ fn expr_to_rust(
         }
         Expr::Ctor(name, args) => {
             let args = render_args(args, params, ctx)?;
-            if args.is_empty() {
+            if name == "Prod.mk" {
+                Ok(format!("({})", args.join(", ")))
+            } else if args.is_empty() {
                 Ok(name.clone())
             } else {
                 Ok(format!("{}({})", name, args.join(", ")))
             }
         }
-        Expr::Proj(_ty, idx, e) => {
+        Expr::Proj(ty, idx, e) => {
             let e = expr_to_rust(e, params, ctx)?;
-            Ok(format!("({}).{}", e, idx))
+            if let Some(field) = instance_field(ty, *idx) {
+                Ok(format!("({}).{}", e, field))
+            } else {
+                Ok(format!("({}).{}", e, idx))
+            }
         }
         Expr::Jp { name, body, .. } => {
             if ctx.jmp_count(name) == 0 {
@@ -371,12 +417,85 @@ fn binop(
     Ok(format!("({} {} {})", a, op, b))
 }
 
+fn checked_binop(
+    a: &Expr,
+    b: &Expr,
+    method: &str,
+    message: &str,
+    params: &[(String, Type)],
+    ctx: &JpContext,
+) -> Result<String, Error> {
+    let a = expr_to_rust(a, params, ctx)?;
+    let b = expr_to_rust(b, params, ctx)?;
+    Ok(format!(
+        "({}).{}({}).expect(\"{}\")",
+        a, method, b, message
+    ))
+}
+
+fn saturating_binop(
+    a: &Expr,
+    b: &Expr,
+    method: &str,
+    params: &[(String, Type)],
+    ctx: &JpContext,
+) -> Result<String, Error> {
+    let a = expr_to_rust(a, params, ctx)?;
+    let b = expr_to_rust(b, params, ctx)?;
+    Ok(format!("({}).{}({})", a, method, b))
+}
+
+fn total_binop(
+    a: &Expr,
+    b: &Expr,
+    op: &str,
+    params: &[(String, Type)],
+    ctx: &JpContext,
+) -> Result<String, Error> {
+    let a = expr_to_rust(a, params, ctx)?;
+    let b = expr_to_rust(b, params, ctx)?;
+    Ok(format!("if ({}) == 0 {{ 0 }} else {{ ({}) {} ({}) }}", b, a, op, b))
+}
+
+fn checked_shift(
+    a: &Expr,
+    b: &Expr,
+    params: &[(String, Type)],
+    ctx: &JpContext,
+) -> Result<String, Error> {
+    let a = expr_to_rust(a, params, ctx)?;
+    let b = expr_to_rust(b, params, ctx)?;
+    Ok(format!(
+        "({}).checked_shl(u32::try_from({}).expect(\"Lean Nat shift amount exceeds u32\")).expect(\"Lean Nat shift overflow\")",
+        a, b
+    ))
+}
+
 fn render_args(
     args: &[Expr],
     params: &[(String, Type)],
     ctx: &JpContext,
 ) -> Result<Vec<String>, Error> {
     args.iter().map(|a| expr_to_rust(a, params, ctx)).collect()
+}
+
+/// The projection-field table (see the module docs): Lean structure
+/// projection indices → the runtime's named Rust fields. The
+/// `UorAtlas.Instance` row is verified against the field declaration order
+/// `q T O` in `lean/Example/Kernel.lean` (LCNF projection indices follow
+/// declaration order) and `prod_core::Instance { q, t, o }`. Unknown
+/// `(type, idx)` pairs fall back to tuple-style `.idx`.
+fn instance_field(type_name: &str, idx: u64) -> Option<&'static str> {
+    if type_name == "UorAtlas.Instance" || type_name == "Instance" {
+        match idx {
+            0 => Some("q"),
+            1 => Some("t"),
+            2 => Some("o"),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -405,7 +524,7 @@ mod tests {
         let out = generate(ir);
         assert_eq!(
             out,
-            "pub fn classIndex(h2: u64, d: u64, l: u64, inst: crate::Instance) -> u64 {\n    ((inst.stride() * h2) + ((inst.o * d) + l))\n}\n\npub fn belt(inst: crate::Instance) -> u64 {\n    (class_count(inst) * (1 << (inst.o - 1)))\n}\n\n"
+            "pub fn classIndex(h2: u64, d: u64, l: u64, inst: crate::Instance) -> u64 {\n    ((inst.stride()).checked_mul(h2).expect(\"Lean Nat multiplication overflow\")).checked_add(((inst.o).checked_mul(d).expect(\"Lean Nat multiplication overflow\")).checked_add(l).expect(\"Lean Nat addition overflow\")).expect(\"Lean Nat addition overflow\")\n}\n\npub fn belt(inst: crate::Instance) -> u64 {\n    (class_count(inst)).checked_mul((1).checked_shl(u32::try_from((inst.o).saturating_sub(1)).expect(\"Lean Nat shift amount exceeds u32\")).expect(\"Lean Nat shift overflow\")).expect(\"Lean Nat multiplication overflow\")\n}\n\n"
         );
     }
 
@@ -442,6 +561,75 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_instance_projection_and_prod_tuple() {
+        let ir = r#"
+(module UorAtlas.Kernel
+  (def decode ((i Instance)) (Tuple Nat (Tuple Nat Nat))
+    (ctor "Prod.mk" (proj "UorAtlas.Instance" 0 i)
+      (ctor "Prod.mk" (proj "UorAtlas.Instance" 2 i) 1)))
+)
+"#;
+        let out = generate(ir);
+        assert_eq!(
+            out,
+            "pub fn decode(i: crate::Instance) -> (u64, (u64, u64)) {\n    ((i).q, ((i).o, 1))\n}\n\n"
+        );
+    }
+
+    #[test]
+    fn test_generate_kernel_ir_shapes() {
+        // The exact def shapes prod-export emits for stride and classDecode
+        // (see rust/prod-core/kernel.ir).
+        let ir = r#"
+(module UorAtlas.Kernel
+  (def stride ((i Instance)) Nat
+    (let _x_4 (proj "UorAtlas.Instance" 1 i) (let _x_5 (proj "UorAtlas.Instance" 2 i) (let _x_13 (mul _x_4 _x_5) _x_13))))
+
+  (def classDecode ((idx Nat) (i Instance)) (Tuple Nat (Tuple Nat Nat))
+    (let _x_4 (call stride i) (let h2 (div idx _x_4) (let rem (mod idx _x_4) (let _x_10 (proj "UorAtlas.Instance" 2 i) (let d (div rem _x_10) (let l (mod rem _x_10) (let _x_13 (ctor "Prod.mk" d l) (let _x_14 (ctor "Prod.mk" h2 _x_13) _x_14)))))))))
+)
+"#;
+        let out = generate(ir);
+        assert_eq!(
+            out,
+            "pub fn stride(i: crate::Instance) -> u64 {\n    { let _x_4 = (i).t; { let _x_5 = (i).o; { let _x_13 = (_x_4).checked_mul(_x_5).expect(\"Lean Nat multiplication overflow\"); _x_13 } } }\n}\n\npub fn classDecode(idx: u64, i: crate::Instance) -> (u64, (u64, u64)) {\n    { let _x_4 = stride(i); { let h2 = if (_x_4) == 0 { 0 } else { (idx) / (_x_4) }; { let rem = if (_x_4) == 0 { 0 } else { (idx) % (_x_4) }; { let _x_10 = (i).o; { let d = if (_x_10) == 0 { 0 } else { (rem) / (_x_10) }; { let l = if (_x_10) == 0 { 0 } else { (rem) % (_x_10) }; { let _x_13 = (d, l); { let _x_14 = (h2, _x_13); _x_14 } } } } } } } }\n}\n\n"
+        );
+    }
+
+    #[test]
+    fn test_generate_unknown_projection_falls_back_to_index() {
+        let ir = r#"
+(module M
+  (def f ((x Nat)) Nat
+    (proj "Unknown.Struct" 3 (ctor "Unknown.Struct" x)))
+)
+"#;
+        let out = generate(ir);
+        assert_eq!(
+            out,
+            "pub fn f(x: u64) -> u64 {\n    (Unknown.Struct(x)).3\n}\n\n"
+        );
+    }
+
+    #[test]
+    fn test_generate_zero_param_golden_def() {
+        // The shape prod-export uses for goldens.ir entries.
+        let ir = r#"
+(module UorAtlas.Goldens
+  (def golden_stride_canonical () Nat 24)
+
+  (def golden_classDecode_43_canonical () (Tuple Nat (Tuple Nat Nat))
+    (ctor "Prod.mk" 1 (ctor "Prod.mk" 2 3)))
+)
+"#;
+        let out = generate(ir);
+        assert_eq!(
+            out,
+            "pub fn golden_stride_canonical() -> u64 {\n    24\n}\n\npub fn golden_classDecode_43_canonical() -> (u64, (u64, u64)) {\n    (1, (2, 3))\n}\n\n"
+        );
+    }
+
+    #[test]
     fn test_generate_jp_jmp_inlined() {
         let ir = r#"
 (module M
@@ -452,7 +640,7 @@ mod tests {
         let out = generate(ir);
         assert_eq!(
             out,
-            "pub fn f(x: u64) -> u64 {\n    { let g = /* jp \"g\" inlined at its jump site */ (); { let a = x; (a + 1) } }\n}\n\n"
+            "pub fn f(x: u64) -> u64 {\n    { let g = /* jp \"g\" inlined at its jump site */ (); { let a = x; (a).checked_add(1).expect(\"Lean Nat addition overflow\") } }\n}\n\n"
         );
     }
 
@@ -470,8 +658,43 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_unreachable() {
-        let ir = "(module M (def f ((x Nat)) Nat (unreachable)))";
+    fn test_generate_pow() {
+        let ir = r#"
+(module M
+  (def belt ((i Nat)) Nat
+    (pow 2 (sub i 1)))
+)
+"#;
+        let out = generate(ir);
+        assert_eq!(
+            out,
+            "pub fn belt(i: u64) -> u64 {\n    ((2) as u64).checked_pow(u32::try_from((i).saturating_sub(1)).expect(\"Lean Nat power exponent exceeds u32\")).expect(\"Lean Nat power overflow\")\n}\n\n"
+        );
+    }
+
+    #[test]
+    fn test_generate_nat_arithmetic_policy() {
+        let ir = r#"
+(module M
+  (def add ((x Nat) (y Nat)) Nat (add x y))
+  (def sub ((x Nat) (y Nat)) Nat (sub x y))
+  (def div ((x Nat) (y Nat)) Nat (div x y))
+  (def modu ((x Nat) (y Nat)) Nat (mod x y))
+  (def shl ((x Nat) (y Nat)) Nat (shl x y))
+  (def pow ((x Nat) (y Nat)) Nat (pow x y))
+)
+"#;
+        let out = generate(ir);
+        assert!(out.contains("checked_add(y).expect(\"Lean Nat addition overflow\")"));
+        assert!(out.contains("saturating_sub(y)"));
+        assert!(out.contains("if (y) == 0 { 0 } else { (x) / (y) }"));
+        assert!(out.contains("if (y) == 0 { 0 } else { (x) % (y) }"));
+        assert!(out.contains("checked_shl(u32::try_from(y).expect(\"Lean Nat shift amount exceeds u32\")).expect(\"Lean Nat shift overflow\")"));
+        assert!(out.contains("checked_pow(u32::try_from(y).expect(\"Lean Nat power exponent exceeds u32\")).expect(\"Lean Nat power overflow\")"));
+    }
+
+    #[test]
+    fn test_generate_unreachable() {        let ir = "(module M (def f ((x Nat)) Nat (unreachable)))";
         let out = generate(ir);
         assert_eq!(
             out,

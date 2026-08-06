@@ -1,7 +1,7 @@
 import Lake
 open Lake DSL
 
--- No mathlib: load-bearing identities are proved in pure Lean 4 by
+-- No external libraries: load-bearing identities are proved in pure Lean 4 by
 -- `decide` / `omega` / `rfl` (same discipline as uor-addr-lean).
 package «lean4-prod» where
 

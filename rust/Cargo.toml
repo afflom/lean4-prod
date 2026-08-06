@@ -6,6 +6,7 @@ members = [
     "prod-macros",
     "prod-core",
     "prod-cli",
+    "prod-wasm",
 ]
 
 [workspace.dependencies]

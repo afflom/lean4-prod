@@ -16,7 +16,7 @@ Lean 4 project (native — the Lean toolchain cannot run in wasm)
 @[prod] def foo ...        theorem bar ...
         │  lake exe prod-export
         ▼
-kernel.ir (sexp)   roots.json   coverage.md
+kernel.ir (sexp)   roots.json   coverage.md   goldens.ir
         │
 ════════ portable half: no_std + alloc, wasm32-clean ════════
         ▼
@@ -53,6 +53,10 @@ what Lean means.
   `coverage.md`.
 - We couple to Lean's internal LCNF API. The toolchain is pinned
   (`leanprover/lean4:v4.30.0`) and CI-gated against API drift.
+- Generated `Nat` code uses bounded `u64`: addition, multiplication, shifts,
+  and powers fail explicitly on overflow (including shift/power exponents that
+  do not fit `u32`); subtraction truncates at zero; and division/modulo by zero
+  return zero. Exact arbitrary-precision `Nat` output is future work.
 - The wasm package houses the portable half (parse + codegen + roots). The
   Lean extractor itself is native-only.
 
@@ -70,7 +74,7 @@ Lean side:
 ```
 
 ```sh
-cd lean && lake exe prod-export   # → rust/prod-core/kernel.ir, roots.json, coverage.md
+cd lean && lake exe prod-export   # → rust/prod-core/{kernel,goldens}.ir, roots.json, coverage.md
 ```
 
 Rust side:
@@ -91,6 +95,20 @@ prod roots pareto    # Pareto front over (proof size, kernel depth, check time)
 prod roots connect   # hypothesized bridges between roots sharing kernel deps
 ```
 
+The roots commands operate on the generated registry directly:
+
+```sh
+cd rust
+cargo run -p prod-cli -- roots check ../roots.json
+cargo run -p prod-cli -- roots pareto ../roots.json
+cargo run -p prod-cli -- roots connect ../roots.json
+```
+
+The Pareto analysis currently uses proof-term size and kernel depth; the Lean
+export does not yet record check-time measurements. Compact theorem IDs may
+repeat when Lean generates private helper theorems, and `roots check` reports
+those as warnings while using the dependency names to resolve graph edges.
+
 ## Layout
 
 - `lean/Prod/` — the extractor: attribute, LCNF extraction, lowering, roots,
@@ -98,7 +116,8 @@ prod roots connect   # hypothesized bridges between roots sharing kernel deps
 - `lean/Example/` — worked example: the UOR Atlas coordinate kernel with
   machine-checked proofs (no mathlib — `decide`/`omega`/`rfl` discipline).
 - `rust/prod-ir`, `rust/prod-codegen` — `no_std` + `alloc` portable core.
-- `rust/prod-macros`, `rust/prod-cli`, `rust/prod-wasm` — thin shells.
+- `rust/prod-macros`, `rust/prod-cli` — thin native shells.
+- `rust/prod-wasm` — wasm-bindgen API: `generate(ir)` and `roots_pareto(json)`.
 - `rust/prod-core` — runtime types + generated definitions + golden tests.
 
 ## Roadmap

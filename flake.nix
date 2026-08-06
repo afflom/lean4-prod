@@ -13,8 +13,8 @@
       in
       {
         devShells.default = pkgs.mkShell {
-          buildInputs = [
-            pkgs.lean4          # Lean 4.30.0 (matches lean/lean-toolchain)
+          packages = [
+            pkgs.lean4
             pkgs.cargo
             pkgs.rustc
             pkgs.clippy
@@ -22,10 +22,19 @@
             pkgs.just
             pkgs.wasm-pack
           ];
+
           shellHook = ''
-            # wasm target for the portable half (prod-ir / prod-codegen / prod-wasm)
+            # wasm target for the portable half
+            # (prod-ir / prod-codegen / prod-wasm)
             if command -v rustup >/dev/null 2>&1; then
-              rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true
+              rustup target add wasm32-unknown-unknown \
+                >/dev/null 2>&1 || true
+            fi
+
+            # nix develop initially starts Bash. Replace only the
+            # interactive shell with the user's configured zsh.
+            if [[ "$-" == *i* ]]; then
+              exec /bin/zsh -il
             fi
           '';
         };

@@ -11,6 +11,4 @@ std = []
 
 [dependencies]
 prod-ir = { path = "../prod-ir" }
-
-[dev-dependencies]
 prod-macros = { path = "../prod-macros" }

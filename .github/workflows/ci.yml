@@ -1,0 +1,20 @@
+name: lean4-prod CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - name: Export Lean definitions and run Rust goldens
+        run: nix develop --command just prod
+      - name: Check proof-root graph
+        run: nix develop --command just roots-check
+      - name: Run clippy
+        run: nix develop --command just lint
+      - name: Check wasm32 portability
+        run: nix develop --command just wasm-check

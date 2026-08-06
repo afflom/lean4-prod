@@ -7,3 +7,5 @@ rust/prod-core/kernel.ir
 roots.json
 coverage.md
 goldens.txt
+.direnv/
+rust/prod-core/goldens.ir

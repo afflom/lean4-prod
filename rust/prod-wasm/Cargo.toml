@@ -1,17 +1,16 @@
 [package]
-name = "prod-cli"
+name = "prod-wasm"
 version = "0.1.0"
 edition = "2021"
 authors = ["UOR Foundation"]
 license = "MIT"
 
-[[bin]]
-name = "prod"
-path = "src/main.rs"
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 prod-ir = { path = "../prod-ir" }
 prod-codegen = { path = "../prod-codegen" }
-clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+wasm-bindgen = "0.2.122"

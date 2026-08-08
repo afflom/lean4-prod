@@ -20,7 +20,7 @@ use prod_core::{
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-const CANONICAL: Instance = Instance { q: 4, t: 3, o: 8 };
+const CANONICAL: Instance = Instance { q: 4, T: 3, O: 8 };
 
 /// Run `body`, and fail if it caused any heap activity.
 ///
@@ -99,7 +99,7 @@ fn generated_definitions_never_touch_the_heap() -> Result<(), ComputeError> {
 
     // Error construction and propagation must be allocation-free too — an
     // error path that allocates is still an allocation on hostile input.
-    let overflowing = Instance { q: 1, t: 1, o: 70 };
+    let overflowing = Instance { q: 1, T: 1, O: 70 };
     assert_eq!(
         assert_no_allocation("belt overflow", || belt(overflowing)),
         Err(ComputeError::PowOverflow)

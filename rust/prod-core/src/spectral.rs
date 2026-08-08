@@ -11,8 +11,8 @@ pub struct SpectralOperator;
 impl SpectralOperator {
     /// Eigenvalues for a given instance (T must be 3 for spectral validity)
     pub const fn eigenvalues(inst: &Instance) -> [i64; 4] {
-        let o = inst.o as i64;
-        let t = inst.t as i64;
+        let o = inst.O as i64;
+        let t = inst.T as i64;
         [
             o + 2,     // global
             o + 2 - t, // modality
@@ -22,19 +22,19 @@ impl SpectralOperator {
     }
 
     pub const fn multiplicities(inst: &Instance) -> [u64; 4] {
-        [1, inst.t - 1, inst.o - 1, (inst.t - 1) * (inst.o - 1)]
+        [1, inst.T - 1, inst.O - 1, (inst.T - 1) * (inst.O - 1)]
     }
 
     /// Check spectral validity: T = 3 and indefiniteness (negative eigendirection exists)
     pub const fn is_spectrally_valid(inst: &Instance) -> bool {
-        inst.t == 3 && inst.o >= 3
+        inst.T == 3 && inst.O >= 3
     }
 
     /// S-23: signature defect = negative_dim - positive_dim = (T-1)(O-1) - (T+O-1)
     /// At canonical instance: 14 - 10 = 4 = scope q
     pub const fn signature_defect(inst: &Instance) -> i64 {
-        let pos = (inst.t + inst.o - 1) as i64;
-        let neg = ((inst.t - 1) * (inst.o - 1)) as i64;
+        let pos = (inst.T + inst.O - 1) as i64;
+        let neg = ((inst.T - 1) * (inst.O - 1)) as i64;
         neg - pos
     }
 }
@@ -45,7 +45,7 @@ mod tests {
 
     #[test]
     fn test_canonical_spectrum() {
-        let inst = Instance { q: 4, t: 3, o: 8 };
+        let inst = Instance { q: 4, T: 3, O: 8 };
         assert!(SpectralOperator::is_spectrally_valid(&inst));
         let vals = SpectralOperator::eigenvalues(&inst);
         let mults = SpectralOperator::multiplicities(&inst);
@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn test_signature_defect() {
-        let inst = Instance { q: 4, t: 3, o: 8 };
+        let inst = Instance { q: 4, T: 3, O: 8 };
         assert_eq!(SpectralOperator::signature_defect(&inst), 4);
         assert_eq!(inst.q as i64, 4);
     }
@@ -64,13 +64,13 @@ mod tests {
     fn test_spectral_validity() {
         assert!(SpectralOperator::is_spectrally_valid(&Instance {
             q: 4,
-            t: 3,
-            o: 8
+            T: 3,
+            O: 8
         }));
         assert!(!SpectralOperator::is_spectrally_valid(&Instance {
             q: 2,
-            t: 2,
-            o: 4
+            T: 2,
+            O: 4
         }));
     }
 }

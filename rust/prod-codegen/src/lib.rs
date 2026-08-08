@@ -83,19 +83,14 @@
 //!     when there are no args), except `Prod.mk`, which renders as a Rust
 //!     tuple `(a, b)` — nested for right-nested pairs — and the Bool/Option
 //!     ctors, which render as `true`/`false` and `None`/`Some(x)`.
-//!   - `Proj` renders through the projection-field table below for known
-//!     structure types, and tuple-style `.idx` for unknown `(type, idx)`
-//!     pairs. The table maps Lean structure projection indices to the
-//!     runtime's named Rust fields; `("UorAtlas.Instance", i)` follows the
-//!     field declaration order `q T O` in `lean/Example/Kernel.lean`, matching
-//!     `prod_core::Instance { q, t, o }`:
-//!
-//!     | (type, idx)               | Rust rendering |
-//!     |---------------------------|----------------|
-//!     | `("UorAtlas.Instance", 0)` | `e.q`          |
-//!     | `("UorAtlas.Instance", 1)` | `e.t`          |
-//!     | `("UorAtlas.Instance", 2)` | `e.o`          |
-//!     | anything else             | `e.<idx>`      |
+//!   - `Proj` renders straight through: `(proj "Type" "field" e)` becomes
+//!     `e.field` (raw-escaped if `field` is a Rust keyword). The field name
+//!     is resolved once, in `Lower.lean`, against Lean's own structure info
+//!     — codegen holds no type-keyed lookup table, so there is no second
+//!     copy of the declaration that could disagree with the first and swap
+//!     fields silently. `prod_core::Instance` (`coordinate.rs`) mirrors the
+//!     Lean structure's own field spelling (`q`, `T`, `O`) for exactly this
+//!     reason.
 //!
 //!   - `Type::Tuple` renders as a Rust tuple type, so
 //!     `(Tuple Nat (Tuple Nat Nat))` becomes `(u64, (u64, u64))`.

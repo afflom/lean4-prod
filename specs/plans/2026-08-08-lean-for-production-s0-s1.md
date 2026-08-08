@@ -726,12 +726,6 @@ fn test_duplicate_last_component_is_rejected() {
 }
 
 #[test]
-fn test_unknown_named_type_is_rejected() {
-    let ir = r#"(module M (def f ((x (named "M.Nope"))) Nat 0))"#;
-    assert!(matches!(generate_err(ir), Error::OpaqueType(_)));
-}
-
-#[test]
 fn test_polymorphic_type_is_rejected_with_its_reason() {
     // The exporter cannot describe a parameterised inductive, so it declares
     // the type as unsupported rather than omitting it — that turns a generic
@@ -744,7 +738,7 @@ fn test_polymorphic_type_is_rejected_with_its_reason() {
 }
 ```
 
-Note the last test expects `Error::OpaqueType`, which Task 10 introduces. To keep this task self-contained, add that variant now (it is a one-line addition) and let Task 10 wire it to `Type::Opaque`.
+`Error::OpaqueType` is introduced here (a one-line addition) because `check_field_type` needs it for an undeclared field type. Task 10 wires it to `Type::Opaque`, and Task 7 adds the parameter-position test — parameter types only route through the table once `Type::Instance` is gone, so testing it here would require an `#[ignore]`, and a disabled test is worse than a test that arrives one task later.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1297,7 +1291,7 @@ Inspect `lean/Conformance/golden.ir` for `c_proj_middle_prop`: it must project `
 Run: `nix develop path:/Users/auser/work/rust/mine/lean4-prod --command just prod && cd rust && cargo clippy --all-targets -- -D warnings && cargo fmt --all -- --check`
 
 ```bash
-git add lean/Prod/Lower.lean rust/prod-ir/src rust/prod-codegen/src lean/Conformance/golden.ir rust/prod-core/kernel.ir
+git add lean/Prod/Lower.lean rust/prod-ir/src rust/prod-codegen/src lean/Conformance/golden.ir
 git commit -m "Projections carry field names instead of indices
 
 Lower.lean has the environment, so it resolves .proj's index to a field
@@ -1366,11 +1360,19 @@ In `rust/prod-core/src/spectral.rs`, change `use crate::coordinate::Instance;` t
 
 In both `rust/prod-core/tests/macro_generation.rs` and `rust/prod-core/tests/no_alloc.rs`, every `Instance { q: 4, t: 3, o: 8 }` becomes `Instance { q: 4, T: 3, O: 8 }`. The loop bounds in `generated_definitions_roundtrip_lean_examples` use `inst.t` and `inst.o` — update those to `inst.T` and `inst.O`.
 
-- [ ] **Step 5: Re-enable the deferred test**
+- [ ] **Step 5: Add the parameter-position rejection test**
 
-Remove the `#[ignore]` from `test_unknown_named_type_is_rejected` (Task 4, Step 7) and confirm it passes: parameter types now route through `type_to_rust`, and an undeclared `Named` has no rendering.
+Parameter types only route through the type table now that `Type::Instance` is gone, so this test can be written here and pass on arrival. Add to `rust/prod-codegen/src/tests.rs`:
 
-If it still does not fail correctly, add the table check to `param_type_to_rust` and `generate_def_in` by threading `&TypeTable` through, and note the signature change here.
+```rust
+#[test]
+fn test_undeclared_named_type_in_a_signature_is_rejected() {
+    let ir = r#"(module M (def f ((x (named "M.Nope"))) Nat 0))"#;
+    assert!(matches!(generate_err(ir), Error::OpaqueType(_)));
+}
+```
+
+If it does not fail correctly, thread `&TypeTable` through `param_type_to_rust` and `generate_def_in` so an undeclared name is caught, and record the signature change in the task report.
 
 - [ ] **Step 6: Rebuild everything**
 

@@ -9,6 +9,11 @@
   (def c_list_consume ((x_1 (List Nat))) Nat
     (cases x_1 (alt "List.nil" () (let _x_31 0 _x_31)) (alt "List.cons" (head_16 tail_17) (let _x_32 (call c_list_consume tail_17) (let _x_33 (add head_16 _x_32) _x_33)))))
 
+  ;; full: Conformance.c_proj_no_prop
+  ;; arity: 2 erased/type args dropped
+  (def c_proj_no_prop ((n (opaque "Conformance.NoProp"))) (Tuple Nat Nat)
+    (let _x_1 (proj "Conformance.NoProp" 0 n) (let _x_2 (proj "Conformance.NoProp" 1 n) (let _x_3 (ctor "Prod.mk" _x_1 _x_2) _x_3))))
+
   ;; full: Conformance.c_option
   ;; arity: 2 erased/type args dropped
   (def c_option ((a Nat)) (Option Nat)
@@ -29,6 +34,11 @@
   ;; full: Conformance.c_nat_rec
   (def c_nat_rec ((fuel Nat) (n Nat)) Nat
     (cases fuel (alt "Nat.zero" () (let _x_58 0 _x_58)) (alt "Nat.succ" (n_32) (let _x_59 2 (if (lt n _x_59) (let _x_68 1 _x_68) (let _x_62 1 (let _x_63 1 (let _x_64 (call shiftRight n _x_63) (let _x_65 (call c_nat_rec n_32 _x_64) (let _x_66 (add _x_62 _x_65) _x_66))))))))))
+
+  ;; full: Conformance.c_proj_middle_prop
+  ;; arity: 4 erased/type args dropped
+  (def c_proj_middle_prop ((m (opaque "Conformance.MidProp"))) (Tuple Nat (Tuple Nat Nat))
+    (let _x_1 (proj "Conformance.MidProp" 0 m) (let _x_2 (proj "Conformance.MidProp" 2 m) (let _x_3 (proj "Conformance.MidProp" 3 m) (let _x_4 (ctor "Prod.mk" _x_2 _x_3) (let _x_5 (ctor "Prod.mk" _x_1 _x_4) _x_5))))))
 
   ;; full: Conformance.c_bool
   ;; arity: 1 erased/type args dropped

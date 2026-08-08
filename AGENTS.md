@@ -181,6 +181,18 @@ Verified Lean 4.30.0 API facts (from leanprover/lean4 v4.30.0 sources — trust 
 - Theorem deps: `ConstantInfo.value?` → `Expr.getUsedConstants`; size = Expr node
   count (document the counting); kernel_depth = longest chain in the module's own
   dependency graph.
+- Structure projection indices: LCNF `.proj typeName idx fvar` indexes into the
+  declared field list — verified with `Conformance.MidProp`, whose
+  `Prop` field sits in the middle (`Conformance/Structures.lean`). Field names
+  come from `getStructureFields env structName` (resolves directly under 4.30,
+  returns declared field names in declaration order including `Prop` fields;
+  `Lean.getStructureInfo?` corroborates via `.fieldNames`); `Prop` fields are
+  retained as an index slot (their projection is simply never emitted/used by
+  `@[prod]` code, since no computational code touches a `Prop`). Constructor
+  `numFields` also counts the declared (not erased) fields — confirmed
+  `Conformance.MidProp.mk` has `numParams=0 numFields=4` for 4 declared fields.
+  Getting this wrong swaps struct fields SILENTLY, so any change here must
+  re-run that conformance case.
 
 Lowerer requirements:
 - Emit sexp matching `rust/prod-ir` grammar EXACTLY — read `rust/sample.ir`,

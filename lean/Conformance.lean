@@ -3,6 +3,7 @@
 -- change here or in Prod/Lower.lean shows up as a reviewable golden diff.
 -- Regenerate with `just conformance-bless`. Never hand-edit the golden.
 import Prod.Attribute
+import Conformance.Structures
 
 namespace Conformance
 

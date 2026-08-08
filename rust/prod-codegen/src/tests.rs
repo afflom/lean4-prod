@@ -185,23 +185,6 @@ fn test_vec_type_is_rejected_as_heap_allocating() {
 }
 
 #[test]
-fn test_named_type_is_not_yet_renderable() {
-    // Transitional: `(named ...)` parses (prod-ir), but codegen doesn't yet
-    // render `Module::types` into Rust structs/enums, so any reference is
-    // rejected precisely rather than silently mishandled. Task 4 replaces
-    // this with real struct/enum rendering, and this test goes with it.
-    let ir = r#"
-(module M
-  (def f ((s (named "M.Shape"))) Nat 0)
-)
-"#;
-    assert_eq!(
-        generate_err(ir),
-        Error::UnsupportedNamedType("M.Shape".to_string())
-    );
-}
-
-#[test]
 fn test_computed_zero_arg_list_is_a_codegen_error() {
     // A golden whose elements are computed cannot be a promoted static slice.
     let ir = r#"
@@ -412,4 +395,93 @@ fn test_param_out_of_bounds_is_an_error() {
     let ir = "(module M (def f ((x Nat)) Nat (param 5)))";
     let (_, module) = parse_module(ir).unwrap();
     assert_eq!(generate_module(&module), Err(Error::ParamOutOfBounds(5)));
+}
+
+#[test]
+fn test_generate_struct_from_single_ctor_type() {
+    let ir = r#"
+(module M
+  (type "UorAtlas.Instance"
+    (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
+  (def stride ((i (named "UorAtlas.Instance"))) Nat 0)
+)
+"#;
+    let out = generate(ir);
+    assert!(out.contains(
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n"
+    ));
+    assert!(out.contains("pub fn stride(i: crate::Instance) -> u64 {"));
+}
+
+#[test]
+fn test_generate_enum_from_multi_ctor_type() {
+    let ir = r#"
+(module M
+  (type "M.Shape"
+    (ctor "M.Shape.circle" (radius Nat))
+    (ctor "M.Shape.rect" (w Nat) (h Nat)))
+)
+"#;
+    let out = generate(ir);
+    assert!(out.contains(
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum Shape {\n    circle { radius: u64 },\n    rect { w: u64, h: u64 },\n}\n"
+    ));
+}
+
+#[test]
+fn test_generate_fieldless_ctor_renders_unit_variant() {
+    let ir = r#"
+(module M
+  (type "M.Flag" (ctor "M.Flag.off") (ctor "M.Flag.on")))
+"#;
+    let out = generate(ir);
+    assert!(out.contains("pub enum Flag {\n    off,\n    on,\n}\n"));
+}
+
+#[test]
+fn test_rust_keyword_field_names_are_raw_escaped() {
+    // A Lean field named `type` or `fn` is legal Lean and illegal Rust.
+    let ir = r#"
+(module M
+  (type "M.Rec" (ctor "M.Rec.mk" (type Nat) (fn Nat))))
+"#;
+    let out = generate(ir);
+    assert!(out.contains("pub r#type: u64"));
+    assert!(out.contains("pub r#fn: u64"));
+}
+
+#[test]
+fn test_recursive_type_is_rejected() {
+    let ir = r#"
+(module M
+  (type "M.Tree"
+    (ctor "M.Tree.leaf")
+    (ctor "M.Tree.node" (left (named "M.Tree")) (right (named "M.Tree")))))
+"#;
+    assert_eq!(generate_err(ir), Error::RecursiveType("M.Tree".to_string()));
+}
+
+#[test]
+fn test_duplicate_last_component_is_rejected() {
+    let ir = r#"
+(module M
+  (type "A.Thing" (ctor "A.Thing.mk" (x Nat)))
+  (type "B.Thing" (ctor "B.Thing.mk" (y Nat))))
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::DuplicateTypeName("Thing".to_string())
+    );
+}
+
+#[test]
+fn test_polymorphic_type_is_rejected_with_its_reason() {
+    // The exporter cannot describe a parameterised inductive, so it declares
+    // the type as unsupported rather than omitting it — that turns a generic
+    // "unknown type" into a rejection that names monomorphization.
+    let ir = r#"(module M (type "M.Box" (unsupported "type parameters")))"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::PolymorphicType("M.Box".to_string())
+    );
 }

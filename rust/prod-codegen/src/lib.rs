@@ -123,7 +123,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
-use prod_ir::{Alt, Definition, Expr, Module, Type};
+use prod_ir::{Alt, Definition, Expr, Module, Type, TypeDecl};
 
 /// Fields rendered as method calls rather than plain field accesses.
 /// Legacy table carried over unchanged from `uor-atlas-macros`.
@@ -142,9 +142,16 @@ pub enum Error {
     UnsupportedList(String),
     /// A type that would require a heap allocation in generated code.
     HeapType(String),
-    /// A `(named "...")` reference to a declared type; codegen does not yet
-    /// render generated types from `Module::types`.
-    UnsupportedNamedType(String),
+    /// A type is defined in terms of itself; needs the tier-1 memory profile.
+    RecursiveType(String),
+    /// A type takes type parameters; needs monomorphization (S5).
+    PolymorphicType(String),
+    /// A field's type cannot appear in an allocation-free generated type.
+    UnsupportedFieldType(String),
+    /// Two Lean types share a last name component, so they would collide.
+    DuplicateTypeName(String),
+    /// A type reached codegen with no rendering.
+    OpaqueType(String),
 }
 
 impl fmt::Display for Error {
@@ -160,11 +167,23 @@ impl fmt::Display for Error {
                 "type would require a heap allocation in generated code: {}",
                 s
             ),
-            Error::UnsupportedNamedType(s) => write!(
+            Error::RecursiveType(s) => write!(
                 f,
-                "named type reference not yet supported by codegen: {}",
+                "recursive type `{}` cannot be rendered allocation-free (needs the tier-1 profile)",
                 s
             ),
+            Error::PolymorphicType(s) => write!(
+                f,
+                "type `{}` has type parameters; monomorphization is not implemented",
+                s
+            ),
+            Error::UnsupportedFieldType(s) => {
+                write!(f, "field type is not allowed in a generated type: {}", s)
+            }
+            Error::DuplicateTypeName(s) => {
+                write!(f, "two Lean types share the last name component `{}`", s)
+            }
+            Error::OpaqueType(s) => write!(f, "no Rust rendering for type: {}", s),
         }
     }
 }
@@ -188,10 +207,159 @@ pub enum Shape {
 /// Definition name → [`Shape`], for one module.
 type Signatures<'m> = BTreeMap<&'m str, Shape>;
 
+/// Rust keywords that a Lean field or constructor name may legitimately be.
+/// Escaped with the raw-identifier prefix rather than renamed, so the Rust
+/// name still matches the Lean name exactly.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+    "where", "while", "abstract", "become", "box", "do", "final", "macro", "override", "priv",
+    "typeof", "unsized", "virtual", "yield", "try", "gen",
+];
+
+/// A Lean identifier as a Rust identifier, raw-escaped if it is a keyword.
+fn rust_ident(name: &str) -> String {
+    if RUST_KEYWORDS.contains(&name) {
+        format!("r#{}", name)
+    } else {
+        String::from(name)
+    }
+}
+
+/// Last dot-separated component of a full Lean name.
+fn last_component(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// Full Lean type name → its declaration, for the module being rendered.
+type TypeTable<'m> = BTreeMap<&'m str, &'m TypeDecl>;
+
+fn type_table(types: &[TypeDecl]) -> Result<TypeTable<'_>, Error> {
+    let mut by_full: TypeTable = BTreeMap::new();
+    let mut short_seen: BTreeMap<&str, &str> = BTreeMap::new();
+    for decl in types {
+        let short = last_component(&decl.name);
+        if let Some(previous) = short_seen.insert(short, &decl.name) {
+            if previous != decl.name {
+                return Err(Error::DuplicateTypeName(String::from(short)));
+            }
+        }
+        by_full.insert(decl.name.as_str(), decl);
+    }
+    Ok(by_full)
+}
+
+/// Render one type declaration: a struct if it has exactly one constructor,
+/// otherwise an enum with named-field variants.
+///
+/// Every generated type is `Copy`, which is what keeps it inside the
+/// allocation-free tier: a type is eligible only if every field is a scalar, a
+/// tuple of eligible types, or another eligible generated type.
+fn generate_type_decl(decl: &TypeDecl, table: &TypeTable) -> Result<String, Error> {
+    // The exporter reached this type but could not describe it. It is declared
+    // anyway so that the rejection names a reason instead of an unknown type.
+    if let Some(reason) = &decl.unsupported {
+        return Err(match reason.as_str() {
+            "type parameters" => Error::PolymorphicType(decl.name.clone()),
+            "recursive" => Error::RecursiveType(decl.name.clone()),
+            other => Error::OpaqueType(format!("{} ({})", decl.name, other)),
+        });
+    }
+    for ctor in &decl.ctors {
+        for (_, ty) in &ctor.fields {
+            check_field_type(ty, &decl.name, table)?;
+        }
+    }
+
+    let mut out = String::from("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
+    let short = last_component(&decl.name);
+
+    if decl.ctors.len() == 1 {
+        let ctor = &decl.ctors[0];
+        out.push_str(&format!("pub struct {} {{\n", rust_ident(short)));
+        for (name, ty) in &ctor.fields {
+            out.push_str(&format!(
+                "    pub {}: {},\n",
+                rust_ident(name),
+                type_to_rust(ty)?
+            ));
+        }
+        out.push_str("}\n");
+        return Ok(out);
+    }
+
+    out.push_str(&format!("pub enum {} {{\n", rust_ident(short)));
+    for ctor in &decl.ctors {
+        let variant = rust_ident(last_component(&ctor.name));
+        if ctor.fields.is_empty() {
+            out.push_str(&format!("    {},\n", variant));
+            continue;
+        }
+        let mut fields = Vec::with_capacity(ctor.fields.len());
+        for (name, ty) in &ctor.fields {
+            fields.push(format!("{}: {}", rust_ident(name), type_to_rust(ty)?));
+        }
+        out.push_str(&format!("    {} {{ {} }},\n", variant, fields.join(", ")));
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+/// A field type must be renderable and must not make the type recursive.
+fn check_field_type(ty: &Type, owner: &str, table: &TypeTable) -> Result<(), Error> {
+    match ty {
+        Type::Named(n) => {
+            if n == owner {
+                return Err(Error::RecursiveType(String::from(owner)));
+            }
+            match table.get(n.as_str()) {
+                // One level of indirection is enough to catch the mutual case
+                // too: B referring back to A makes A reachable from A.
+                Some(other) => {
+                    for ctor in &other.ctors {
+                        for (_, inner) in &ctor.fields {
+                            if let Type::Named(m) = inner {
+                                if m == owner {
+                                    return Err(Error::RecursiveType(String::from(owner)));
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                None => Err(Error::OpaqueType(n.clone())),
+            }
+        }
+        // A sequence field would need owned storage, which the allocation-free
+        // tier does not have. Lists are supported as borrowed parameters and
+        // caller-owned output buffers only, never as owned struct fields.
+        Type::List(_) => Err(Error::UnsupportedFieldType(String::from(
+            "a list field would need owned storage",
+        ))),
+        Type::Vec(_) => Err(Error::UnsupportedFieldType(String::from(
+            "a vector field would need heap storage",
+        ))),
+        Type::Tuple(items) => {
+            for item in items {
+                check_field_type(item, owner, table)?;
+            }
+            Ok(())
+        }
+        Type::Option(inner) => check_field_type(inner, owner, table),
+        _ => Ok(()),
+    }
+}
+
 /// Render a whole module: one `pub fn` per definition.
 pub fn generate_module(module: &Module) -> Result<String, Error> {
+    let table = type_table(&module.types)?;
     let shapes = signatures(&module.definitions);
     let mut out = String::new();
+    for decl in &module.types {
+        out.push_str(&generate_type_decl(decl, &table)?);
+        out.push('\n');
+    }
     for def in &module.definitions {
         out.push_str(&generate_def_in(def, &shapes)?);
         out.push('\n');
@@ -335,7 +503,7 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
         Type::Int => String::from("i64"),
         Type::Bool => String::from("bool"),
         Type::Instance => String::from("crate::Instance"),
-        Type::Named(n) => return Err(Error::UnsupportedNamedType(n.clone())),
+        Type::Named(n) => format!("crate::{}", rust_ident(last_component(n))),
         Type::Option(inner) => format!("Option<{}>", type_to_rust(inner)?),
         Type::Tuple(items) => {
             let mut rendered = Vec::with_capacity(items.len());

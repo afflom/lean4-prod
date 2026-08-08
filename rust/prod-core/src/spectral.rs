@@ -1,7 +1,11 @@
 //! S-10: Spectral operator M = (O+2)I - T·Pi_T - O·Pi_O
 //! Eigenblocks and projectors for the Atlas carrier
+//!
+//! Hand-written analysis support. Unlike everything else in this crate, this
+//! module is NOT downstream of Lean — `SpectralOperator` has no `@[prod]`
+//! counterpart yet. Port it to Lean and delete this file when it does.
 
-use crate::coordinate::Instance;
+use crate::Instance;
 
 /// S-23: M is a separability form.
 /// The four eigenvalues at the canonical instance (q=4, T=3, O=8):

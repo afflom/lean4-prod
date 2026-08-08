@@ -9,7 +9,7 @@
 //! field    ::= "(" ident type ")"
 //! def      ::= "(" "def" ident "(" param* ")" type expr ")"
 //! param    ::= "(" ident type ")"
-//! type     ::= "Nat" | "Int" | "Bool" | "Instance" | "(" "Option" type ")" | "(" "Vec" type ")"
+//! type     ::= "Nat" | "Int" | "Bool" | "(" "Option" type ")" | "(" "Vec" type ")"
 //!            | "(" "List" type ")" | "(" "Tuple" type* ")" | "(" "named" '"' ident '"' ")"
 //!            | "(" "opaque" '"' ident '"' ")"
 //! expr     ::= nat | ident | "(" "param" nat ")" | "(" "field" expr ident ")"
@@ -99,7 +99,6 @@ fn parse_type(input: &str) -> IResult<&str, Type> {
         value(Type::Nat, tag("Nat")),
         value(Type::Int, tag("Int")),
         value(Type::Bool, tag("Bool")),
-        value(Type::Instance, tag("Instance")),
         map(
             delimited(char('('), tuple((tag("Option"), parse_type)), char(')')),
             |(_, t)| Type::Option(Box::new(t)),
@@ -499,7 +498,7 @@ mod tests {
     fn test_parse_class_index() {
         let input = r#"
 (module UorAtlas.Kernel
-  (def classIndex ((h2 Nat) (d Nat) (l Nat) (inst Instance)) Nat
+  (def classIndex ((h2 Nat) (d Nat) (l Nat) (inst (named "UorAtlas.Instance"))) Nat
     (add (mul (field inst "stride") h2)
          (add (mul (field inst "o") d) l)))
 )

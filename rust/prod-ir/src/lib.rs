@@ -30,7 +30,6 @@ pub enum Type {
     Nat,
     Int,
     Bool,
-    Instance,
     /// A type declared in this module's `types` list, by full Lean name.
     /// Renders as a generated Rust struct or enum.
     Named(String),

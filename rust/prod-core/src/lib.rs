@@ -20,11 +20,9 @@
 //! `Result<_, ComputeError>`; every other definition keeps its plain return
 //! type. See [`error`].
 
-pub mod coordinate;
 pub mod error;
 pub mod spectral;
 
-pub use coordinate::Instance;
 pub use error::ComputeError;
 pub use spectral::SpectralOperator;
 

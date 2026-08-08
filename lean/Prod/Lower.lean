@@ -45,8 +45,6 @@ namespace Prod
 
 /-- Static lowering configuration. -/
 structure LowerCtx where
-  /-- Lean type rendered as the IR `Instance` type (e.g. `UorAtlas.Instance`). -/
-  instanceType : Name
   /-- `@[prod]`-tagged names: calls to these are internal, not extern. -/
   tagged : Array Name
 
@@ -202,10 +200,10 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     -- silently. LCNF projection indices are into the *declared* field list
     -- (including `Prop` fields), which is exactly what `getStructureFields`
     -- returns, so no filtering is applied before indexing. No name-keyed
-    -- special cases here, including for the built-in `Instance` type: the
-    -- declared spelling passes through unmodified for every structure, so
-    -- the declaration and the projection can never disagree. The Rust side
-    -- (`prod_core::Instance` in `coordinate.rs`) matches that spelling.
+    -- special cases here, not even for `UorAtlas.Instance`: the declared
+    -- spelling passes through unmodified for every structure, so the
+    -- `(type ...)` declaration and the `(proj ...)` reference can never
+    -- disagree — both are generated from the same `getStructureFields` call.
     let fields := getStructureFields env typeName
     let field := match fields[idx]? with
       | some n => sanitize n
@@ -334,14 +332,14 @@ partial def lowerCode : Code .pure → LowerM String
 
 /-- Lower an LCNF type expression to the IR type grammar. -/
 partial def lowerType (e : Expr) : LowerM String := do
-  let ctx ← read
   match e with
   | .const ``Nat _ => return "Nat"
   | .const ``Bool _ => return "Bool"
   | .const ``Int _ => return "Int"
   | .const n _ =>
-    if n == ctx.instanceType then return "Instance"
-    opaqueType n
+    match (← getEnv).find? n with
+    | some (.inductInfo _) => return s!"(named \"{n}\")"
+    | _ => opaqueType n
   | .app (.app (.const ``Prod _) a) b =>
     return s!"(Tuple {← lowerType a} {← lowerType b})"
   | .app (.const ``List _) a =>
@@ -351,8 +349,9 @@ partial def lowerType (e : Expr) : LowerM String := do
   | _ =>
     match e.getAppFn with
     | .const n _ =>
-      if n == ctx.instanceType then return "Instance"
-      opaqueType n
+      match (← getEnv).find? n with
+      | some (.inductInfo _) => return s!"(named \"{n}\")"
+      | _ => opaqueType n
     | _ => opaqueNode "type-expr"
 
 /-- Strip exactly `n` leading `∀`-binders: the LCNF `Signature.type` is the

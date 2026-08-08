@@ -30,9 +30,6 @@ namespace Prod
 /-- Module tree analyzed/exported by this run of prod-export. -/
 def targetModule : Name := `Example
 
-/-- Structure type rendered as the IR `Instance` type. -/
-def targetInstance : Name := `UorAtlas.Instance
-
 /-- IR module name (kept identical to the legacy fixture for continuity). -/
 def targetIrModule : String := "UorAtlas.Kernel"
 
@@ -86,17 +83,13 @@ def emitKernelIr (ctx : LowerCtx) (irModule : String) (extracted : Array Extract
 /-- The whole export, as a CoreM computation over the imported environment. -/
 def runExport : CoreM (String × String × String × String) := do
   let env ← getEnv
-  let ctx : LowerCtx := {
-    instanceType := targetInstance
-    tagged := (taggedNames env targetModule).toArray }
+  let ctx : LowerCtx := { tagged := (taggedNames env targetModule).toArray }
   let extracted ← extractTagged targetModule
   let (ir, reports) ← emitKernelIr ctx targetIrModule extracted
   let own := ownConstants env targetModule
   let roots := rootsJson (← computeRoots own)
   let coverage ← buildCoverage targetModule own reports
-  let confCtx : LowerCtx := {
-    instanceType := targetInstance
-    tagged := (taggedNames env conformanceModule).toArray }
+  let confCtx : LowerCtx := { tagged := (taggedNames env conformanceModule).toArray }
   let confExtracted ← extractTagged conformanceModule
   let (confIr, _) ← emitKernelIr confCtx conformanceIrModule confExtracted
   return (ir, roots, coverage, confIr)

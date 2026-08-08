@@ -58,8 +58,6 @@
 //!
 //! ## Other lowerings
 //!
-//! - **Instance**: the IR `Instance` type maps to `crate::Instance` (by value;
-//!   it is a small `Copy` struct in `prod-core`).
 //! - **Field access**: `(field e "name")` renders as `e.name`, except for the
 //!   legacy method-field table below, which renders as method calls. This
 //!   table is carried over as-is from `uor-atlas-macros`:
@@ -88,9 +86,9 @@
 //!     is resolved once, in `Lower.lean`, against Lean's own structure info
 //!     — codegen holds no type-keyed lookup table, so there is no second
 //!     copy of the declaration that could disagree with the first and swap
-//!     fields silently. `prod_core::Instance` (`coordinate.rs`) mirrors the
-//!     Lean structure's own field spelling (`q`, `T`, `O`) for exactly this
-//!     reason.
+//!     fields silently. `crate::Instance` is generated like any other type
+//!     and mirrors the Lean structure's own field spelling (`q`, `T`, `O`)
+//!     for exactly this reason.
 //!
 //!   - `Type::Tuple` renders as a Rust tuple type, so
 //!     `(Tuple Nat (Tuple Nat Nat))` becomes `(u64, (u64, u64))`.
@@ -346,85 +344,17 @@ fn check_field_type(ty: &Type, owner: &str, table: &TypeTable) -> Result<(), Err
     }
 }
 
-/// True if `full_name` occurs as a `Type::Named` reference anywhere in the
-/// module: a definition's parameter/return type, or a field of some type
-/// declaration's constructor.
-fn is_named_type_referenced(module: &Module, full_name: &str) -> bool {
-    fn ty_refs(ty: &Type, full_name: &str) -> bool {
-        match ty {
-            Type::Named(n) => n == full_name,
-            Type::Option(inner) | Type::Vec(inner) | Type::List(inner) => ty_refs(inner, full_name),
-            Type::Tuple(items) => items.iter().any(|t| ty_refs(t, full_name)),
-            _ => false,
-        }
-    }
-    let in_defs = module.definitions.iter().any(|def| {
-        def.params.iter().any(|(_, t)| ty_refs(t, full_name)) || ty_refs(&def.ret, full_name)
-    });
-    in_defs
-        || module.types.iter().any(|decl| {
-            decl.ctors
-                .iter()
-                .any(|ctor| ctor.fields.iter().any(|(_, t)| ty_refs(t, full_name)))
-        })
-}
-
-/// True if the legacy `Type::Instance` pseudo-type occurs anywhere in the
-/// module's definitions (parameter or return type). This is the hardcoded
-/// path (`type_to_rust` renders it straight to `crate::Instance`) that keeps
-/// the hand-written `prod_core::coordinate::Instance` alive; once nothing
-/// uses it, the collision the `Instance`-name codegen guard exists to avoid
-/// cannot occur, since there is no longer any competing hardcoded target for
-/// `crate::Instance`.
-fn uses_legacy_instance_type(module: &Module) -> bool {
-    fn ty_uses_instance(ty: &Type) -> bool {
-        match ty {
-            Type::Instance => true,
-            Type::Option(inner) | Type::Vec(inner) | Type::List(inner) => ty_uses_instance(inner),
-            Type::Tuple(items) => items.iter().any(ty_uses_instance),
-            _ => false,
-        }
-    }
-    module.definitions.iter().any(|def| {
-        def.params.iter().any(|(_, t)| ty_uses_instance(t)) || ty_uses_instance(&def.ret)
-    })
-}
-
 /// Render a whole module: one `pub fn` per definition.
 pub fn generate_module(module: &Module) -> Result<String, Error> {
     let table = type_table(&module.types)?;
     let shapes = signatures(&module.definitions);
     let mut out = String::new();
     for decl in &module.types {
-        // `Type::Instance` is still a hardcoded pseudo-type that renders
-        // straight to `crate::Instance` — the hand-written, pre-existing
-        // `prod_core::coordinate::Instance` (fields q/t/o) — because nothing
-        // has been rewired yet to reference declared types via `(named ...)`
-        // (a later phase). A type decl whose short name is "Instance" and
-        // that nothing in the module actually references by name would
-        // collide with that reserved slot if codegen'd here, so it is
-        // skipped while orphaned. The moment something references it via
-        // `(named ...)` — as this crate's own tests do — it renders exactly
-        // as before.
-        //
-        // Self-limiting condition: the collision this guard avoids can only
-        // exist while `Type::Instance` is still live in the module (it is
-        // the only thing pinning `crate::Instance` to the hand-written
-        // struct). Requiring `uses_legacy_instance_type` means this guard is
-        // structurally unreachable — never silently drops anything — once a
-        // later phase deletes `Type::Instance` and switches definitions over
-        // to `(named ...)`, even if the guard itself is never removed.
-        if last_component(&decl.name) == "Instance"
-            && !is_named_type_referenced(module, &decl.name)
-            && uses_legacy_instance_type(module)
-        {
-            continue;
-        }
         out.push_str(&generate_type_decl(decl, &table)?);
         out.push('\n');
     }
     for def in &module.definitions {
-        out.push_str(&generate_def_in(def, &shapes)?);
+        out.push_str(&generate_def_in(def, &shapes, &table)?);
         out.push('\n');
     }
     Ok(out)
@@ -434,10 +364,12 @@ pub fn generate_module(module: &Module) -> Result<String, Error> {
 ///
 /// Calls to definitions outside `def` itself are assumed infallible, since
 /// there is no module to resolve them against; use [`generate_module`] when
-/// cross-definition fallibility matters.
+/// cross-definition fallibility matters. With no module, there is no type
+/// table either, so any `(named ...)` type in `def`'s signature is opaque.
 pub fn generate_def(def: &Definition) -> Result<String, Error> {
     let one = core::slice::from_ref(def);
-    generate_def_in(def, &signatures(one))
+    let table: TypeTable = BTreeMap::new();
+    generate_def_in(def, &signatures(one), &table)
 }
 
 /// Compute every definition's [`Shape`] as a least fixpoint over the call
@@ -486,7 +418,11 @@ fn is_fallible(expr: &Expr, shapes: &Signatures) -> bool {
     here || children(expr).any(|child| is_fallible(child, shapes))
 }
 
-fn generate_def_in<'m>(def: &'m Definition, shapes: &Signatures<'m>) -> Result<String, Error> {
+fn generate_def_in<'m>(
+    def: &'m Definition,
+    shapes: &Signatures<'m>,
+    table: &TypeTable<'m>,
+) -> Result<String, Error> {
     let shape = shapes
         .get(def.name.as_str())
         .copied()
@@ -502,8 +438,9 @@ fn generate_def_in<'m>(def: &'m Definition, shapes: &Signatures<'m>) -> Result<S
         if i > 0 {
             params.push_str(", ");
         }
-        params.push_str(&format!("{}: {}", name, param_type_to_rust(ty)?));
+        params.push_str(&format!("{}: {}", name, param_type_to_rust(ty, table)?));
     }
+    check_named_type(&def.ret, table)?;
 
     match shape {
         Shape::StaticList => {
@@ -565,7 +502,6 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
         Type::Nat => String::from("u64"),
         Type::Int => String::from("i64"),
         Type::Bool => String::from("bool"),
-        Type::Instance => String::from("crate::Instance"),
         Type::Named(n) => format!("crate::{}", rust_ident(last_component(n))),
         Type::Option(inner) => format!("Option<{}>", type_to_rust(inner)?),
         Type::Tuple(items) => {
@@ -594,10 +530,41 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
 }
 
 /// Rust spelling of a parameter type: a top-level list borrows as a slice.
-fn param_type_to_rust(ty: &Type) -> Result<String, Error> {
+///
+/// Checks named types against the module's type table first: parameter and
+/// return types are not fields, so [`check_field_type`] never sees them, and
+/// without this check an undeclared `(named ...)` in a signature would
+/// silently render as `crate::Whatever` instead of being rejected.
+fn param_type_to_rust(ty: &Type, table: &TypeTable) -> Result<String, Error> {
+    check_named_type(ty, table)?;
     match ty {
         Type::List(inner) => Ok(format!("&[{}]", type_to_rust(inner)?)),
         _ => type_to_rust(ty),
+    }
+}
+
+/// A `(named ...)` type occurring in a definition's signature must be
+/// declared in the module's type table, at any depth (inside `Option`,
+/// `List`, `Vec`, or `Tuple`); otherwise it has no known Rust rendering.
+fn check_named_type(ty: &Type, table: &TypeTable) -> Result<(), Error> {
+    match ty {
+        Type::Named(n) => {
+            if table.contains_key(n.as_str()) {
+                Ok(())
+            } else {
+                Err(Error::OpaqueType(n.clone()))
+            }
+        }
+        Type::Option(inner) | Type::Vec(inner) | Type::List(inner) => {
+            check_named_type(inner, table)
+        }
+        Type::Tuple(items) => {
+            for item in items {
+                check_named_type(item, table)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 

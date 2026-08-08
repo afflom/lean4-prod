@@ -966,7 +966,7 @@ pub fn generate_module(module: &Module) -> Result<String, Error> {
 - [ ] **Step 7: Run the tests**
 
 Run: `cd rust && cargo test -p prod-codegen`
-Expected: PASS. If `test_unknown_named_type_is_rejected` fails, that is expected until Task 7 routes parameter types through the table — mark it `#[ignore]` with a comment naming Task 7, and remove the attribute there.
+Expected: PASS, all of them. The parameter-position rejection test lives in Task 7, not here — parameter types only route through the type table once `Type::Instance` is gone.
 
 - [ ] **Step 8: Full gates and commit**
 

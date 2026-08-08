@@ -58,16 +58,10 @@
 //!
 //! ## Other lowerings
 //!
-//! - **Field access**: `(field e "name")` renders as `e.name`, except for the
-//!   legacy method-field table below, which renders as method calls. This
-//!   table is carried over as-is from `uor-atlas-macros`:
-//!
-//!   | IR field      | Rust rendering    |
-//!   |---------------|-------------------|
-//!   | `stride`      | `e.stride()`      |
-//!   | `class_count` | `e.class_count()` |
-//!   | `belt`        | `e.belt()`        |
-//!   | anything else | `e.<name>`        |
+//! - **Field access**: `(field e "name")` renders straight through as
+//!   `e.name` (raw-escaped if `name` is a Rust keyword), the same as `Proj`
+//!   below. `Lower.lean` never emits `(field ...)` — only `(proj ...)` — so
+//!   this node is reachable only from hand-written IR.
 //!
 //! - **LCNF nodes**:
 //!   - `Match` renders as a Rust `match`, with `default` becoming the `_` arm.
@@ -117,10 +111,6 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 use prod_ir::{Alt, Definition, Expr, Module, Type, TypeDecl};
-
-/// Fields rendered as method calls rather than plain field accesses.
-/// Legacy table carried over unchanged from `uor-atlas-macros`.
-const METHOD_FIELDS: &[&str] = &["stride", "class_count", "belt"];
 
 /// Errors that can occur during code generation
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -853,12 +843,7 @@ impl<'m> Renderer<'_, 'm> {
                 .map(|(name, _)| name.clone())
                 .ok_or(Error::ParamOutOfBounds(*index)),
             Expr::Field(obj, field) => {
-                let obj = self.value(obj)?;
-                if METHOD_FIELDS.contains(&field.as_str()) {
-                    Ok(format!("{}.{}()", obj, field))
-                } else {
-                    Ok(format!("{}.{}", obj, field))
-                }
+                Ok(format!("({}).{}", self.value(obj)?, rust_ident(field)))
             }
             Expr::Add(a, b) => self.checked_binop(a, b, "checked_add", "AddOverflow"),
             Expr::Mul(a, b) => self.checked_binop(a, b, "checked_mul", "MulOverflow"),

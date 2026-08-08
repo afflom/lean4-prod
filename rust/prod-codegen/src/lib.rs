@@ -374,6 +374,27 @@ fn is_named_type_referenced(module: &Module, full_name: &str) -> bool {
         })
 }
 
+/// True if the legacy `Type::Instance` pseudo-type occurs anywhere in the
+/// module's definitions (parameter or return type). This is the hardcoded
+/// path (`type_to_rust` renders it straight to `crate::Instance`) that keeps
+/// the hand-written `prod_core::coordinate::Instance` alive; once nothing
+/// uses it, the collision the `Instance`-name codegen guard exists to avoid
+/// cannot occur, since there is no longer any competing hardcoded target for
+/// `crate::Instance`.
+fn uses_legacy_instance_type(module: &Module) -> bool {
+    fn ty_uses_instance(ty: &Type) -> bool {
+        match ty {
+            Type::Instance => true,
+            Type::Option(inner) | Type::Vec(inner) | Type::List(inner) => ty_uses_instance(inner),
+            Type::Tuple(items) => items.iter().any(ty_uses_instance),
+            _ => false,
+        }
+    }
+    module.definitions.iter().any(|def| {
+        def.params.iter().any(|(_, t)| ty_uses_instance(t)) || ty_uses_instance(&def.ret)
+    })
+}
+
 /// Render a whole module: one `pub fn` per definition.
 pub fn generate_module(module: &Module) -> Result<String, Error> {
     let table = type_table(&module.types)?;
@@ -390,7 +411,17 @@ pub fn generate_module(module: &Module) -> Result<String, Error> {
         // skipped while orphaned. The moment something references it via
         // `(named ...)` — as this crate's own tests do — it renders exactly
         // as before.
-        if last_component(&decl.name) == "Instance" && !is_named_type_referenced(module, &decl.name)
+        //
+        // Self-limiting condition: the collision this guard avoids can only
+        // exist while `Type::Instance` is still live in the module (it is
+        // the only thing pinning `crate::Instance` to the hand-written
+        // struct). Requiring `uses_legacy_instance_type` means this guard is
+        // structurally unreachable — never silently drops anything — once a
+        // later phase deletes `Type::Instance` and switches definitions over
+        // to `(named ...)`, even if the guard itself is never removed.
+        if last_component(&decl.name) == "Instance"
+            && !is_named_type_referenced(module, &decl.name)
+            && uses_legacy_instance_type(module)
         {
             continue;
         }

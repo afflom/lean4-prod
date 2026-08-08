@@ -414,12 +414,13 @@ fn test_generate_struct_from_single_ctor_type() {
 }
 
 #[test]
-fn test_orphaned_instance_named_type_decl_is_not_codegenned() {
+fn test_orphaned_instance_named_type_decl_is_not_codegenned_while_legacy_instance_is_live() {
     // A declared type whose short name is "Instance" but that no definition
     // (or other type's field) actually references via `(named ...)` would,
     // if rendered, collide with the hardcoded `Type::Instance` pseudo-type's
-    // own `crate::Instance` target (the hand-written host struct). Until
-    // something in the module references it by name, skip generating it.
+    // own `crate::Instance` target (the hand-written host struct) — but only
+    // while some definition still uses the bare `Instance` type. Here
+    // `stride` does, so the declared type is skipped.
     let ir = r#"
 (module M
   (type "UorAtlas.Instance"
@@ -430,6 +431,27 @@ fn test_orphaned_instance_named_type_decl_is_not_codegenned() {
     let out = generate(ir);
     assert!(!out.contains("pub struct Instance"));
     assert!(out.contains("pub fn stride(i: crate::Instance) -> u64 {"));
+}
+
+#[test]
+fn test_orphaned_instance_named_type_decl_is_codegenned_once_legacy_instance_type_is_unused() {
+    // Same orphaned "Instance"-named declaration as above, but nothing in
+    // the module uses the legacy `Type::Instance` pseudo-type anymore (every
+    // definition here is plain `Nat`). There is then no competing hardcoded
+    // target for `crate::Instance`, so the guard must not suppress this
+    // declaration — proving the guard cannot outlive the removal of
+    // `Type::Instance` even if it is never explicitly deleted.
+    let ir = r#"
+(module M
+  (type "UorAtlas.Instance"
+    (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
+  (def f ((x Nat)) Nat x)
+)
+"#;
+    let out = generate(ir);
+    assert!(out.contains(
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n"
+    ));
 }
 
 #[test]

@@ -23,8 +23,9 @@ corresponding IR nodes. Design decisions:
   constant becomes `(call <last-component> ...)`; if the callee is not itself
   `@[prod]`-tagged it is recorded as an *extern call* for the coverage report.
 - **Constructors** (detected via the environment, e.g. `Prod.mk`) become
-  `(ctor "Full.Name" ...)`; structure projections become
-  `(proj "Full.TypeName" idx x)`.
+  `(ctor "Full.Name" ...)`; structure projections resolve their LCNF index to
+  the declared field name here, where the environment is available, and
+  become `(proj "Full.TypeName" "fieldName" x)`.
 - **Decidable-if rewrite**: `if a < b then T else F` (and the `≤`/`=`
   analogues) compiles to `let c := Nat.decLt/Nat.decLe/Nat.decEq/
   instDecidableEqNat a b` followed by `cases c` over `Decidable.isFalse`/
@@ -194,7 +195,28 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
   | .erased => opaqueNode "erased"
   | .proj typeName idx struct => do
     let s ← lookupFVar struct
-    return s!"(proj \"{typeName}\" {idx} {s})"
+    let env ← getEnv
+    let ctx ← read
+    -- Resolve the index to a field name here, where the environment is
+    -- available. Emitting the index instead would force codegen to keep a
+    -- parallel table, and a disagreement between the two swaps fields
+    -- silently. LCNF projection indices are into the *declared* field list
+    -- (including `Prop` fields), which is exactly what `getStructureFields`
+    -- returns, so no filtering is applied before indexing.
+    let fields := getStructureFields env typeName
+    let field := match fields[idx]? with
+      | some n => sanitize n
+      | none => s!"field_{idx}"
+    -- The built-in `Instance` type (`ctx.instanceType`) is the one case
+    -- where the projected value renders against a hand-written Rust struct
+    -- (`prod_core::Instance` in `coordinate.rs`) instead of a
+    -- codegen-emitted one. That struct has fixed lowercase field names
+    -- (`q`, `t`, `o`) independent of how the Lean structure spells its own
+    -- fields (`q`, `T`, `O`). This is a pre-existing accommodation for that
+    -- one escape hatch, not a reintroduction of the deleted index table:
+    -- every other structure keeps its declared spelling untouched.
+    let field := if typeName == ctx.instanceType then field.toLower else field
+    return s!"(proj \"{typeName}\" \"{field}\" {s})"
   | .const declName _ args => do
     let env ← getEnv
     let args' ← lowerArgs args

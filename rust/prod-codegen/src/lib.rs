@@ -943,13 +943,7 @@ impl<'m> Renderer<'_, 'm> {
                     Ok(format!("{}({})", name, args.join(", ")))
                 }
             }
-            Expr::Proj(ty, idx, e) => {
-                let e = self.value(e)?;
-                match instance_field(ty, *idx) {
-                    Some(field) => Ok(format!("({}).{}", e, field)),
-                    None => Ok(format!("({}).{}", e, idx)),
-                }
-            }
+            Expr::Proj(_, field, e) => Ok(format!("({}).{}", self.value(e)?, rust_ident(field))),
             Expr::Jp { name, body, .. } => {
                 if self.ctx.jmp_count(name) == 0 {
                     // No jump sites: the declaration is just a block.
@@ -1173,25 +1167,6 @@ fn lookup<'m>(env: &[(&'m str, &'m Expr)], name: &str) -> Option<&'m Expr> {
         .rev()
         .find(|(bound, _)| *bound == name)
         .map(|(_, value)| *value)
-}
-
-/// The projection-field table (see the module docs): Lean structure
-/// projection indices → the runtime's named Rust fields. The
-/// `UorAtlas.Instance` row is verified against the field declaration order
-/// `q T O` in `lean/Example/Kernel.lean` (LCNF projection indices follow
-/// declaration order) and `prod_core::Instance { q, t, o }`. Unknown
-/// `(type, idx)` pairs fall back to tuple-style `.idx`.
-fn instance_field(type_name: &str, idx: u64) -> Option<&'static str> {
-    if type_name == "UorAtlas.Instance" || type_name == "Instance" {
-        match idx {
-            0 => Some("q"),
-            1 => Some("t"),
-            2 => Some("o"),
-            _ => None,
-        }
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@
   ;; full: Conformance.c_proj_no_prop
   ;; arity: 2 erased/type args dropped
   (def c_proj_no_prop ((n (opaque "Conformance.NoProp"))) (Tuple Nat Nat)
-    (let _x_1 (proj "Conformance.NoProp" 0 n) (let _x_2 (proj "Conformance.NoProp" 1 n) (let _x_3 (ctor "Prod.mk" _x_1 _x_2) _x_3))))
+    (let _x_1 (proj "Conformance.NoProp" "alpha" n) (let _x_2 (proj "Conformance.NoProp" "beta" n) (let _x_3 (ctor "Prod.mk" _x_1 _x_2) _x_3))))
 
   ;; full: Conformance.c_option
   ;; arity: 2 erased/type args dropped
@@ -42,7 +42,7 @@
   ;; full: Conformance.c_proj_middle_prop
   ;; arity: 4 erased/type args dropped
   (def c_proj_middle_prop ((m (opaque "Conformance.MidProp"))) (Tuple Nat (Tuple Nat Nat))
-    (let _x_1 (proj "Conformance.MidProp" 0 m) (let _x_2 (proj "Conformance.MidProp" 2 m) (let _x_3 (proj "Conformance.MidProp" 3 m) (let _x_4 (ctor "Prod.mk" _x_2 _x_3) (let _x_5 (ctor "Prod.mk" _x_1 _x_4) _x_5))))))
+    (let _x_1 (proj "Conformance.MidProp" "first" m) (let _x_2 (proj "Conformance.MidProp" "second" m) (let _x_3 (proj "Conformance.MidProp" "third" m) (let _x_4 (ctor "Prod.mk" _x_2 _x_3) (let _x_5 (ctor "Prod.mk" _x_1 _x_4) _x_5))))))
 
   ;; full: Conformance.c_bool
   ;; arity: 1 erased/type args dropped

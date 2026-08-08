@@ -83,7 +83,7 @@ fn test_generate_list_builder_resolves_anf_let_bindings() {
     (cases fuel
       (alt "Nat.zero" () (let _x_46 (ctor "List.nil") _x_46))
       (alt "Nat.succ" (n_25)
-        (let _x_47 (proj "UorAtlas.Instance" 2 i)
+        (let _x_47 (proj "UorAtlas.Instance" "o" i)
           (if (lt n _x_47)
             (let _x_55 (ctor "List.nil") (let _x_56 (ctor "List.cons" n _x_55) _x_56))
             (let _x_50 (mod n _x_47)
@@ -239,27 +239,40 @@ fn test_generate_ctor_proj() {
     let ir = r#"
 (module M
   (def f ((x Nat)) Nat
-    (proj "Pair" 0 (ctor "Pair" x 2)))
-)
-"#;
-    let out = generate(ir);
-    assert_eq!(out, "pub fn f(x: u64) -> u64 {\n    (Pair(x, 2)).0\n}\n\n");
-}
-
-#[test]
-fn test_generate_instance_projection_and_prod_tuple() {
-    let ir = r#"
-(module UorAtlas.Kernel
-  (def decode ((i Instance)) (Tuple Nat (Tuple Nat Nat))
-    (ctor "Prod.mk" (proj "UorAtlas.Instance" 0 i)
-      (ctor "Prod.mk" (proj "UorAtlas.Instance" 2 i) 1)))
+    (proj "Pair" "fst" (ctor "Pair" x 2)))
 )
 "#;
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn decode(i: crate::Instance) -> (u64, (u64, u64)) {\n    ((i).q, ((i).o, 1))\n}\n\n"
+        "pub fn f(x: u64) -> u64 {\n    (Pair(x, 2)).fst\n}\n\n"
     );
+}
+
+#[test]
+fn test_generate_projection_uses_field_names() {
+    let ir = r#"
+(module UorAtlas.Kernel
+  (type "UorAtlas.Instance"
+    (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
+  (def decode ((i (named "UorAtlas.Instance"))) (Tuple Nat (Tuple Nat Nat))
+    (ctor "Prod.mk" (proj "UorAtlas.Instance" "q" i)
+      (ctor "Prod.mk" (proj "UorAtlas.Instance" "O" i) 1)))
+)
+"#;
+    let out = generate(ir);
+    assert!(out.contains("((i).q, ((i).O, 1))"));
+}
+
+#[test]
+fn test_projection_of_keyword_field_is_raw_escaped() {
+    let ir = r#"
+(module M
+  (type "M.Rec" (ctor "M.Rec.mk" (type Nat)))
+  (def get ((r (named "M.Rec"))) Nat (proj "M.Rec" "type" r)))
+"#;
+    let out = generate(ir);
+    assert!(out.contains("(r).r#type"));
 }
 
 #[test]
@@ -269,10 +282,10 @@ fn test_generate_kernel_ir_shapes() {
     let ir = r#"
 (module UorAtlas.Kernel
   (def stride ((i Instance)) Nat
-    (let _x_4 (proj "UorAtlas.Instance" 1 i) (let _x_5 (proj "UorAtlas.Instance" 2 i) (let _x_13 (mul _x_4 _x_5) _x_13))))
+    (let _x_4 (proj "UorAtlas.Instance" "t" i) (let _x_5 (proj "UorAtlas.Instance" "o" i) (let _x_13 (mul _x_4 _x_5) _x_13))))
 
   (def classDecode ((idx Nat) (i Instance)) (Tuple Nat (Tuple Nat Nat))
-    (let _x_4 (call stride i) (let h2 (div idx _x_4) (let rem (mod idx _x_4) (let _x_10 (proj "UorAtlas.Instance" 2 i) (let d (div rem _x_10) (let l (mod rem _x_10) (let _x_13 (ctor "Prod.mk" d l) (let _x_14 (ctor "Prod.mk" h2 _x_13) _x_14)))))))))
+    (let _x_4 (call stride i) (let h2 (div idx _x_4) (let rem (mod idx _x_4) (let _x_10 (proj "UorAtlas.Instance" "o" i) (let d (div rem _x_10) (let l (mod rem _x_10) (let _x_13 (ctor "Prod.mk" d l) (let _x_14 (ctor "Prod.mk" h2 _x_13) _x_14)))))))))
 )
 "#;
     let out = generate(ir);
@@ -283,17 +296,20 @@ fn test_generate_kernel_ir_shapes() {
 }
 
 #[test]
-fn test_generate_unknown_projection_falls_back_to_index() {
+fn test_generate_projection_on_unknown_type_uses_given_field_name() {
+    // The type name carried on `proj` is documentation, not a lookup key:
+    // codegen renders whatever field name it is given, regardless of
+    // whether the type is otherwise known to it.
     let ir = r#"
 (module M
   (def f ((x Nat)) Nat
-    (proj "Unknown.Struct" 3 (ctor "Unknown.Struct" x)))
+    (proj "Unknown.Struct" "count" (ctor "Unknown.Struct" x)))
 )
 "#;
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn f(x: u64) -> u64 {\n    (Unknown.Struct(x)).3\n}\n\n"
+        "pub fn f(x: u64) -> u64 {\n    (Unknown.Struct(x)).count\n}\n\n"
     );
 }
 

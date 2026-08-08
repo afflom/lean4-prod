@@ -87,8 +87,13 @@ pub enum Expr {
     },
     /// Constructor application: `(ctor "Name" args...)`
     Ctor(String, Vec<Expr>),
-    /// Structure projection: `(proj "TypeName" <idx> <expr>)`
-    Proj(String, u64, Box<Expr>),
+    /// Structure projection: `(proj "TypeName" "fieldName" <expr>)`.
+    ///
+    /// The field *name*, not an index: the exporter resolves it against Lean's
+    /// own structure info, so the declaration and the projection cannot
+    /// disagree. An index-based form would need a second table in codegen that
+    /// has to be kept in sync, and getting that wrong swaps fields silently.
+    Proj(String, String, Box<Expr>),
     /// LCNF join point declaration: `(jp <name> (params...) <body>)`
     Jp {
         name: String,

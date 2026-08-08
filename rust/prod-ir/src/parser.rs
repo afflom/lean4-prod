@@ -21,7 +21,7 @@
 //!            | "(" "call" ident expr* ")"
 //!            | "(" "cases" expr alt* default? ")"          ; LCNF cases_on
 //!            | "(" "ctor" '"' ident '"' expr* ")"          ; constructor application
-//!            | "(" "proj" '"' ident '"' nat expr ")"       ; structure projection
+//!            | "(" "proj" '"' ident '"' '"' ident '"' expr ")"  ; structure projection
 //!            | "(" "jp" ident "(" ident* ")" expr ")"      ; LCNF join point
 //!            | "(" "jmp" ident expr* ")"                   ; LCNF jump
 //!            | "(" "unreachable" ")"
@@ -289,8 +289,13 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                     |(_, name, args)| Expr::Ctor(name, args),
                 ),
                 map(
-                    tuple((tag("proj"), ws(quoted_ident), ws(parse_u64), ws(parse_expr))),
-                    |(_, ty, idx, e)| Expr::Proj(ty, idx, Box::new(e)),
+                    tuple((
+                        tag("proj"),
+                        ws(quoted_ident),
+                        ws(quoted_ident),
+                        ws(parse_expr),
+                    )),
+                    |(_, ty, field, e)| Expr::Proj(ty, field, Box::new(e)),
                 ),
                 map(
                     tuple((tag("jp"), ws(ident), ws(parse_binders), ws(parse_expr))),
@@ -551,12 +556,12 @@ mod tests {
 
     #[test]
     fn test_parse_proj() {
-        let (rest, expr) = parse_expr(r#"(proj "Pair" 0 (ctor "Pair" 1 2))"#).unwrap();
+        let (rest, expr) = parse_expr(r#"(proj "Pair" "fst" (ctor "Pair" 1 2))"#).unwrap();
         assert!(rest.is_empty());
         match expr {
-            Expr::Proj(ty, idx, e) => {
+            Expr::Proj(ty, field, e) => {
                 assert_eq!(ty, "Pair");
-                assert_eq!(idx, 0);
+                assert_eq!(field, "fst");
                 assert!(matches!(*e, Expr::Ctor(..)));
             }
             _ => panic!("Expected Proj, got {:?}", expr),
@@ -594,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_parse_pow() {
-        let (rest, expr) = parse_expr("(pow 2 (sub (proj \"Instance\" 2 i) 1))").unwrap();
+        let (rest, expr) = parse_expr("(pow 2 (sub (proj \"Instance\" \"o\" i) 1))").unwrap();
         assert!(rest.is_empty());
         match expr {
             Expr::Pow(a, b) => {

@@ -516,3 +516,51 @@ fn test_undeclared_named_type_in_a_signature_is_rejected() {
     let ir = r#"(module M (def f ((x (named "M.Nope"))) Nat 0))"#;
     assert!(matches!(generate_err(ir), Error::OpaqueType(_)));
 }
+
+#[test]
+fn test_undeclared_named_type_in_a_return_position_is_rejected() {
+    let ir = r#"(module M (def f ((x Nat)) (named "M.Nope") x))"#;
+    assert!(matches!(generate_err(ir), Error::OpaqueType(_)));
+}
+
+#[test]
+fn test_generate_named_struct_construction() {
+    let ir = r#"
+(module M
+  (type "UorAtlas.Instance"
+    (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
+  (def mk ((a Nat) (b Nat) (c Nat)) (named "UorAtlas.Instance")
+    (ctor "UorAtlas.Instance.mk" a b c)))
+"#;
+    let out = generate(ir);
+    assert!(out.contains("crate::Instance { q: a, T: b, O: c }"));
+}
+
+#[test]
+fn test_generate_enum_construction_and_patterns() {
+    let ir = r#"
+(module M
+  (type "M.Shape"
+    (ctor "M.Shape.circle" (radius Nat))
+    (ctor "M.Shape.rect" (w Nat) (h Nat)))
+  (def area ((s (named "M.Shape"))) Nat
+    (cases s
+      (alt "M.Shape.circle" (r) r)
+      (alt "M.Shape.rect" (w h) (mul w h))))
+  (def unit ((r Nat)) (named "M.Shape") (ctor "M.Shape.circle" r)))
+"#;
+    let out = generate(ir);
+    assert!(out.contains("crate::Shape::circle { radius: r } => r,"));
+    assert!(out.contains("crate::Shape::rect { w: w, h: h } =>"));
+    assert!(out.contains("crate::Shape::circle { radius: r }"));
+}
+
+#[test]
+fn test_ctor_arity_mismatch_is_an_error() {
+    let ir = r#"
+(module M
+  (type "M.Pair" (ctor "M.Pair.mk" (a Nat) (b Nat)))
+  (def f ((x Nat)) (named "M.Pair") (ctor "M.Pair.mk" x)))
+"#;
+    assert!(matches!(generate_err(ir), Error::UnsupportedFieldType(_)));
+}

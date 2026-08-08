@@ -110,7 +110,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
-use prod_ir::{Alt, Definition, Expr, Module, Type, TypeDecl};
+use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, Type, TypeDecl};
 
 /// Errors that can occur during code generation
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,6 +421,7 @@ fn generate_def_in<'m>(
         shapes,
         params: &def.params,
         ctx: JpContext::collect(&def.body),
+        types: table,
     };
 
     let mut params = String::new();
@@ -704,11 +705,22 @@ struct Renderer<'s, 'm> {
     shapes: &'s Signatures<'m>,
     params: &'m [(String, Type)],
     ctx: JpContext<'m>,
+    types: &'s TypeTable<'m>,
 }
 
 impl<'m> Renderer<'_, 'm> {
     fn value(&self, expr: &'m Expr) -> Result<String, Error> {
         self.render(expr, &Mode::Value)
+    }
+
+    /// The declaration of a constructor, by its full Lean name.
+    fn ctor_decl(&self, name: &str) -> Option<(&'m TypeDecl, &'m CtorDecl)> {
+        self.types.values().find_map(|decl| {
+            decl.ctors
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| (*decl, c))
+        })
     }
 
     fn shape_of(&self, name: &str) -> Option<Shape> {
@@ -884,6 +896,33 @@ impl<'m> Renderer<'_, 'm> {
                     Ok(String::from("None"))
                 } else if name == "Option.some" && args.len() == 1 {
                     Ok(format!("Some({})", args[0]))
+                } else if let Some((decl, cdecl)) = self.ctor_decl(name) {
+                    if args.len() != cdecl.fields.len() {
+                        return Err(Error::UnsupportedFieldType(format!(
+                            "`{}` takes {} field(s) but got {} argument(s)",
+                            name,
+                            cdecl.fields.len(),
+                            args.len()
+                        )));
+                    }
+                    let path = if decl.ctors.len() == 1 {
+                        format!("crate::{}", rust_ident(last_component(&decl.name)))
+                    } else {
+                        format!(
+                            "crate::{}::{}",
+                            rust_ident(last_component(&decl.name)),
+                            rust_ident(last_component(&cdecl.name))
+                        )
+                    };
+                    if cdecl.fields.is_empty() {
+                        Ok(path)
+                    } else {
+                        let mut bound = Vec::with_capacity(args.len());
+                        for ((field, _), arg) in cdecl.fields.iter().zip(args.iter()) {
+                            bound.push(format!("{}: {}", rust_ident(field), arg));
+                        }
+                        Ok(format!("{} {{ {} }}", path, bound.join(", ")))
+                    }
                 } else if args.is_empty() {
                     Ok(name.clone())
                 } else {
@@ -999,13 +1038,38 @@ impl<'m> Renderer<'_, 'm> {
                 ("Bool.false", 0) => format!("        false => {},\n", body),
                 ("Option.none", 0) => format!("        None => {},\n", body),
                 ("Option.some", 1) => format!("        Some({}) => {},\n", alt.binders[0], body),
-                _ if alt.binders.is_empty() => format!("        {} => {},\n", alt.ctor, body),
-                _ => format!(
-                    "        {}({}) => {},\n",
-                    alt.ctor,
-                    alt.binders.join(", "),
-                    body
-                ),
+                _ => match self.ctor_decl(&alt.ctor) {
+                    Some((decl, cdecl)) if alt.binders.len() == cdecl.fields.len() => {
+                        let path = if decl.ctors.len() == 1 {
+                            format!("crate::{}", rust_ident(last_component(&decl.name)))
+                        } else {
+                            format!(
+                                "crate::{}::{}",
+                                rust_ident(last_component(&decl.name)),
+                                rust_ident(last_component(&cdecl.name))
+                            )
+                        };
+                        if cdecl.fields.is_empty() {
+                            format!("        {} => {},\n", path, body)
+                        } else {
+                            let mut bound = Vec::with_capacity(alt.binders.len());
+                            for ((field, _), binder) in cdecl.fields.iter().zip(alt.binders.iter())
+                            {
+                                bound.push(format!("{}: {}", rust_ident(field), binder));
+                            }
+                            format!("        {} {{ {} }} => {},\n", path, bound.join(", "), body)
+                        }
+                    }
+                    _ if alt.binders.is_empty() => {
+                        format!("        {} => {},\n", alt.ctor, body)
+                    }
+                    _ => format!(
+                        "        {}({}) => {},\n",
+                        alt.ctor,
+                        alt.binders.join(", "),
+                        body
+                    ),
+                },
             };
             out.push_str(&arm);
         }

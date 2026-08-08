@@ -185,6 +185,23 @@ fn test_vec_type_is_rejected_as_heap_allocating() {
 }
 
 #[test]
+fn test_named_type_is_not_yet_renderable() {
+    // Transitional: `(named ...)` parses (prod-ir), but codegen doesn't yet
+    // render `Module::types` into Rust structs/enums, so any reference is
+    // rejected precisely rather than silently mishandled. Task 4 replaces
+    // this with real struct/enum rendering, and this test goes with it.
+    let ir = r#"
+(module M
+  (def f ((s (named "M.Shape"))) Nat 0)
+)
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::UnsupportedNamedType("M.Shape".to_string())
+    );
+}
+
+#[test]
 fn test_computed_zero_arg_list_is_a_codegen_error() {
     // A golden whose elements are computed cannot be a promoted static slice.
     let ir = r#"

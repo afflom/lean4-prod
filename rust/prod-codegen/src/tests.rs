@@ -19,18 +19,18 @@ fn test_generate_class_index() {
     (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
 
   (def classIndex ((h2 Nat) (d Nat) (l Nat) (inst (named "UorAtlas.Instance"))) Nat
-    (add (mul (field inst "stride") h2)
-         (add (mul (field inst "O") d) l)))
+    (add (mul (call stride inst) h2)
+         (add (mul (proj "UorAtlas.Instance" "O" inst) d) l)))
 
   (def belt ((inst (named "UorAtlas.Instance"))) Nat
     (mul (call class_count inst)
-         (shl 1 (sub (field inst "O") 1))))
+         (shl 1 (sub (proj "UorAtlas.Instance" "O" inst) 1))))
 )
 "#;
     let out = generate(ir);
     assert_eq!(
         out,
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn classIndex(h2: u64, d: u64, l: u64, inst: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok((((((inst).stride) as u64).checked_mul(h2).ok_or(crate::ComputeError::MulOverflow)?) as u64).checked_add((((((inst).O) as u64).checked_mul(d).ok_or(crate::ComputeError::MulOverflow)?) as u64).checked_add(l).ok_or(crate::ComputeError::AddOverflow)?).ok_or(crate::ComputeError::AddOverflow)?)\n}\n\npub fn belt(inst: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok(((class_count(inst)) as u64).checked_mul(((1) as u64).checked_shl(u32::try_from((((inst).O) as u64).saturating_sub(1)).map_err(|_| crate::ComputeError::ShiftExponentTooLarge)?).ok_or(crate::ComputeError::ShiftOverflow)?).ok_or(crate::ComputeError::MulOverflow)?)\n}\n\n"
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn classIndex(h2: u64, d: u64, l: u64, inst: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok(((((stride(inst)) as u64).checked_mul(h2).ok_or(crate::ComputeError::MulOverflow)?) as u64).checked_add((((((inst).O) as u64).checked_mul(d).ok_or(crate::ComputeError::MulOverflow)?) as u64).checked_add(l).ok_or(crate::ComputeError::AddOverflow)?).ok_or(crate::ComputeError::AddOverflow)?)\n}\n\npub fn belt(inst: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok(((class_count(inst)) as u64).checked_mul(((1) as u64).checked_shl(u32::try_from((((inst).O) as u64).saturating_sub(1)).map_err(|_| crate::ComputeError::ShiftExponentTooLarge)?).ok_or(crate::ComputeError::ShiftOverflow)?).ok_or(crate::ComputeError::MulOverflow)?)\n}\n\n"
     );
 }
 
@@ -305,20 +305,155 @@ fn test_generate_kernel_ir_shapes() {
 }
 
 #[test]
-fn test_generate_projection_on_unknown_type_uses_given_field_name() {
-    // The type name carried on `proj` is documentation, not a lookup key:
-    // codegen renders whatever field name it is given, regardless of
-    // whether the type is otherwise known to it.
+fn test_undeclared_dotted_ctor_is_rejected_not_rendered_as_a_path() {
+    // This used to render `(Unknown.Struct(x)).count` and exit 0. A dotted
+    // Lean name is not a Rust path in expression position — `A.B(x)` parses
+    // as a field access on a value named `A` followed by a call, so even
+    // `syn::parse_str` accepts it and the breakage lands in rustc, far from
+    // the IR that caused it. It is now an `UnresolvedCall` naming the ctor.
     let ir = r#"
 (module M
   (def f ((x Nat)) Nat
     (proj "Unknown.Struct" "count" (ctor "Unknown.Struct" x)))
 )
 "#;
-    let out = generate(ir);
     assert_eq!(
-        out,
-        "pub fn f(x: u64) -> u64 {\n    (Unknown.Struct(x)).count\n}\n\n"
+        generate_err(ir),
+        Error::UnresolvedCall("Unknown.Struct".to_string())
+    );
+}
+
+#[test]
+fn test_undeclared_dot_free_ctor_still_renders_as_a_bare_path() {
+    // The complement of the test above: a dot-free constructor name is at
+    // least a syntactically valid Rust path, so the bare-name fallthrough is
+    // left intact for hosts that supply the type by hand.
+    let ir = r#"
+(module M
+  (def f ((x Nat)) Nat (ctor "Pair" x 2))
+)
+"#;
+    assert!(generate(ir).contains("Pair(x, 2)"));
+}
+
+#[test]
+fn test_ctor_in_a_definition_body_only_is_rejected_when_undeclared() {
+    // The end-to-end shape of the bug: a definition whose body constructs and
+    // projects a type that is not declared in the module. `Lower.lean` now
+    // declares body-reachable types (`declTypeNames`), so this IR is what
+    // reaches codegen only when the declaration really is missing — and then
+    // it must fail, not emit `Conformance.NoProp.mk(n, n)`.
+    let ir = r#"
+(module Conformance
+  (def c_ctor_body_only ((n Nat)) Nat
+    (let _x_1 (ctor "Conformance.NoProp.mk" n n)
+      (let _x_2 (proj "Conformance.NoProp" "alpha" _x_1) _x_2)))
+)
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::UnresolvedCall("Conformance.NoProp.mk".to_string())
+    );
+}
+
+#[test]
+fn test_ctor_in_a_definition_body_only_renders_when_declared() {
+    // The same IR with the declaration `Lower.lean` now emits for it.
+    let ir = r#"
+(module Conformance
+  (type "Conformance.NoProp"
+    (ctor "Conformance.NoProp.mk" (alpha Nat) (beta Nat)))
+  (def c_ctor_body_only ((n Nat)) Nat
+    (let _x_1 (ctor "Conformance.NoProp.mk" n n)
+      (let _x_2 (proj "Conformance.NoProp" "alpha" _x_1) _x_2)))
+)
+"#;
+    let out = generate(ir);
+    assert!(out.contains("pub struct NoProp {"));
+    assert!(out.contains("crate::NoProp { alpha: n, beta: n }"));
+    assert!(out.contains("(_x_1).alpha"));
+}
+
+/// Every `Error` variant must appear in the published rejection table
+/// (`REJECTIONS`, rendered into `specs/lean-for-production.md`). The two are
+/// separate lists that have to agree, and nothing but this test makes them:
+/// a new variant would otherwise vanish from the contract while
+/// `just subset-check` still passed.
+///
+/// The match below is exhaustive on purpose — no wildcard arm — so adding an
+/// `Error` variant is a *compile* error here, not a silently-passing test.
+#[test]
+fn test_every_error_variant_is_published_in_rejections() {
+    let s = || String::from("x");
+    let all = [
+        Error::OpaqueExpr(s()),
+        Error::ParamOutOfBounds(0),
+        Error::UnsupportedList(s()),
+        Error::HeapType(s()),
+        Error::RecursiveType(s()),
+        Error::PolymorphicType(s()),
+        Error::UnsupportedFieldType(s()),
+        Error::DuplicateTypeName(s()),
+        Error::OpaqueType(s()),
+        Error::UnresolvedCall(s()),
+        Error::UnknownField(s(), s()),
+    ];
+
+    for error in &all {
+        let name = match error {
+            Error::OpaqueExpr(_) => "OpaqueExpr",
+            Error::ParamOutOfBounds(_) => "ParamOutOfBounds",
+            Error::UnsupportedList(_) => "UnsupportedList",
+            Error::HeapType(_) => "HeapType",
+            Error::RecursiveType(_) => "RecursiveType",
+            Error::PolymorphicType(_) => "PolymorphicType",
+            Error::UnsupportedFieldType(_) => "UnsupportedFieldType",
+            Error::DuplicateTypeName(_) => "DuplicateTypeName",
+            Error::OpaqueType(_) => "OpaqueType",
+            Error::UnresolvedCall(_) => "UnresolvedCall",
+            Error::UnknownField(..) => "UnknownField",
+        };
+        assert!(
+            REJECTIONS.iter().any(|(variant, _)| *variant == name),
+            "`Error::{}` is not in REJECTIONS, so the published subset contract does not disclose it",
+            name
+        );
+    }
+
+    // ...and no entry in REJECTIONS without a matching variant.
+    assert_eq!(
+        REJECTIONS.len(),
+        all.len(),
+        "REJECTIONS lists {} rejections for {} Error variants",
+        REJECTIONS.len(),
+        all.len()
+    );
+}
+
+#[test]
+fn test_unsupported_field_type_names_the_type_and_the_field() {
+    // The milestone's promise is that a rejection names the Lean constant
+    // responsible; "a list field would need owned storage" alone did not.
+    let ir = r#"
+(module M
+  (type "M.Rec" (ctor "M.Rec.mk" (xs (List Nat)))))
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::UnsupportedFieldType(
+            "`M.Rec.xs`: a list field would need owned storage".to_string()
+        )
+    );
+
+    let ir = r#"
+(module M
+  (type "M.Rec" (ctor "M.Rec.mk" (xs (Vec Nat)))))
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::UnsupportedFieldType(
+            "`M.Rec.xs`: a vector field would need heap storage".to_string()
+        )
     );
 }
 

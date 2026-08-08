@@ -58,11 +58,6 @@
 //!
 //! ## Other lowerings
 //!
-//! - **Field access**: `(field e "name")` renders straight through as
-//!   `e.name` (raw-escaped if `name` is a Rust keyword), the same as `Proj`
-//!   below. `Lower.lean` never emits `(field ...)` — only `(proj ...)` — so
-//!   this node is reachable only from hand-written IR.
-//!
 //! - **LCNF nodes**:
 //!   - `Match` renders as a Rust `match`, with `default` becoming the `_` arm.
 //!     The Nat structural-recursion ctors are special-cased: `Nat.zero` renders
@@ -315,8 +310,8 @@ fn generate_type_decl(decl: &TypeDecl, table: &TypeTable) -> Result<String, Erro
         });
     }
     for ctor in &decl.ctors {
-        for (_, ty) in &ctor.fields {
-            check_field_type(ty, &decl.name, table)?;
+        for (field, ty) in &ctor.fields {
+            check_field_type(ty, &decl.name, field, table)?;
         }
     }
 
@@ -355,7 +350,12 @@ fn generate_type_decl(decl: &TypeDecl, table: &TypeTable) -> Result<String, Erro
 }
 
 /// A field type must be renderable and must not make the type recursive.
-fn check_field_type(ty: &Type, owner: &str, table: &TypeTable) -> Result<(), Error> {
+///
+/// `owner` and `field` are the Lean constant and field name responsible, and
+/// they appear in the rejection message: the point of this milestone is that a
+/// failure names the declaration that caused it, and "a list field would need
+/// owned storage" on its own leaves the reader to grep for which one.
+fn check_field_type(ty: &Type, owner: &str, field: &str, table: &TypeTable) -> Result<(), Error> {
     match ty {
         Type::Named(n) => {
             if n == owner {
@@ -382,19 +382,21 @@ fn check_field_type(ty: &Type, owner: &str, table: &TypeTable) -> Result<(), Err
         // A sequence field would need owned storage, which the allocation-free
         // tier does not have. Lists are supported as borrowed parameters and
         // caller-owned output buffers only, never as owned struct fields.
-        Type::List(_) => Err(Error::UnsupportedFieldType(String::from(
-            "a list field would need owned storage",
+        Type::List(_) => Err(Error::UnsupportedFieldType(format!(
+            "`{}.{}`: a list field would need owned storage",
+            owner, field
         ))),
-        Type::Vec(_) => Err(Error::UnsupportedFieldType(String::from(
-            "a vector field would need heap storage",
+        Type::Vec(_) => Err(Error::UnsupportedFieldType(format!(
+            "`{}.{}`: a vector field would need heap storage",
+            owner, field
         ))),
         Type::Tuple(items) => {
             for item in items {
-                check_field_type(item, owner, table)?;
+                check_field_type(item, owner, field, table)?;
             }
             Ok(())
         }
-        Type::Option(inner) => check_field_type(inner, owner, table),
+        Type::Option(inner) => check_field_type(inner, owner, field, table),
         _ => Ok(()),
     }
 }
@@ -470,7 +472,7 @@ fn is_fallible(expr: &Expr, shapes: &Signatures) -> bool {
         ),
         _ => false,
     };
-    here || children(expr).any(|child| is_fallible(child, shapes))
+    here || expr.children().any(|child| is_fallible(child, shapes))
 }
 
 fn generate_def_in<'m>(
@@ -663,7 +665,7 @@ impl<'a> JpContext<'a> {
             }
             _ => {}
         }
-        for child in children(expr) {
+        for child in expr.children() {
             self.walk(child);
         }
     }
@@ -692,56 +694,7 @@ fn count_jmps(expr: &Expr, name: &str) -> usize {
         Expr::Jmp(n, _) if n == name => 1,
         _ => 0,
     };
-    self_count + children(expr).map(|c| count_jmps(c, name)).sum::<usize>()
-}
-
-/// Iterate over the direct subexpressions of an expression node.
-fn children(expr: &Expr) -> impl Iterator<Item = &Expr> {
-    let mut out: Vec<&Expr> = Vec::new();
-    match expr {
-        Expr::Field(e, _) | Expr::Proj(_, _, e) => out.push(e),
-        Expr::Add(a, b)
-        | Expr::Sub(a, b)
-        | Expr::Mul(a, b)
-        | Expr::Div(a, b)
-        | Expr::Mod(a, b)
-        | Expr::Shl(a, b)
-        | Expr::Shr(a, b)
-        | Expr::Pow(a, b)
-        | Expr::Eq(a, b)
-        | Expr::Lt(a, b)
-        | Expr::Le(a, b)
-        | Expr::Gt(a, b) => {
-            out.push(a);
-            out.push(b);
-        }
-        Expr::If(c, t, f) => {
-            out.push(c);
-            out.push(t);
-            out.push(f);
-        }
-        Expr::Let(_, v, b) => {
-            out.push(v);
-            out.push(b);
-        }
-        Expr::Call(_, args) | Expr::Ctor(_, args) | Expr::Jmp(_, args) | Expr::Extern(_, args) => {
-            out.extend(args.iter());
-        }
-        Expr::Match {
-            scrut,
-            alts,
-            default,
-        } => {
-            out.push(scrut);
-            out.extend(alts.iter().map(|a| &a.body));
-            if let Some(d) = default {
-                out.push(d);
-            }
-        }
-        Expr::Jp { body, .. } => out.push(body),
-        _ => {}
-    }
-    out.into_iter()
+    self_count + expr.children().map(|c| count_jmps(c, name)).sum::<usize>()
 }
 
 /// Where the expression being rendered will land.
@@ -924,9 +877,6 @@ impl<'m> Renderer<'_, 'm> {
                 .get(*index)
                 .map(|(name, _)| name.clone())
                 .ok_or(Error::ParamOutOfBounds(*index)),
-            Expr::Field(obj, field) => {
-                Ok(format!("({}).{}", self.value(obj)?, rust_ident(field)))
-            }
             Expr::Add(a, b) => self.checked_binop(a, b, "checked_add", "AddOverflow"),
             Expr::Mul(a, b) => self.checked_binop(a, b, "checked_mul", "MulOverflow"),
             Expr::Sub(a, b) => {
@@ -1005,6 +955,19 @@ impl<'m> Renderer<'_, 'm> {
                         }
                         Ok(format!("{} {{ {} }}", path, bound.join(", ")))
                     }
+                } else if name.contains('.') {
+                    // No declaration for this constructor, and its Lean name
+                    // is dotted. The tuple-style fallthrough below would emit
+                    // the dots verbatim — `Conformance.NoProp.mk(n, n)` — and
+                    // that is not a Rust path in expression position; it
+                    // parses as field access on a value named `Conformance`,
+                    // so even `syn::parse_str` waves it through and the
+                    // failure surfaces as a rustc error about the generated
+                    // file. Refuse it here, naming the constructor. The
+                    // bare-name form below stays: a dot-free ctor is at least
+                    // a syntactically valid path to a type the host may
+                    // supply by hand.
+                    Err(Error::UnresolvedCall(name.clone()))
                 } else if args.is_empty() {
                     Ok(name.clone())
                 } else {

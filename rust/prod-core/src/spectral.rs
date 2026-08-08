@@ -25,8 +25,19 @@ impl SpectralOperator {
         ]
     }
 
+    /// Saturating, not bare, subtraction. `Instance`'s Lean invariant
+    /// (`q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1`) is a `Prop` field, and `Prop` fields are
+    /// erased on export — the generated Rust struct is a plain data carrier
+    /// that does not enforce it, so `Instance { q: 0, T: 0, O: 0 }` is
+    /// constructible here even though the Lean type forbids it. With `T = 0`,
+    /// `inst.T - 1` underflows: a panic under debug and the
+    /// `release-assertions` lane, a silent wrap in release. This crate denies
+    /// `clippy::panic`, so saturating at zero is the only honest option; the
+    /// caller that needs the invariant must re-check it.
     pub const fn multiplicities(inst: &Instance) -> [u64; 4] {
-        [1, inst.T - 1, inst.O - 1, (inst.T - 1) * (inst.O - 1)]
+        let t = inst.T.saturating_sub(1);
+        let o = inst.O.saturating_sub(1);
+        [1, t, o, t.saturating_mul(o)]
     }
 
     /// Check spectral validity: T = 3 and indefiniteness (negative eigendirection exists)
@@ -36,9 +47,13 @@ impl SpectralOperator {
 
     /// S-23: signature defect = negative_dim - positive_dim = (T-1)(O-1) - (T+O-1)
     /// At canonical instance: 14 - 10 = 4 = scope q
+    ///
+    /// Saturating for the same reason as [`Self::multiplicities`]: the Lean
+    /// `q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1` invariant is an erased `Prop` and the generated
+    /// struct does not enforce it, so `T = O = 0` reaches this arithmetic.
     pub const fn signature_defect(inst: &Instance) -> i64 {
-        let pos = (inst.T + inst.O - 1) as i64;
-        let neg = ((inst.T - 1) * (inst.O - 1)) as i64;
+        let pos = inst.T.saturating_add(inst.O).saturating_sub(1) as i64;
+        let neg = (inst.T.saturating_sub(1)).saturating_mul(inst.O.saturating_sub(1)) as i64;
         neg - pos
     }
 }
@@ -62,6 +77,17 @@ mod tests {
         let inst = Instance { q: 4, T: 3, O: 8 };
         assert_eq!(SpectralOperator::signature_defect(&inst), 4);
         assert_eq!(inst.q as i64, 4);
+    }
+
+    #[test]
+    fn test_degenerate_instance_does_not_underflow() {
+        // The Lean invariant `q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1` is an erased `Prop`, so
+        // the generated struct permits this value. It must not panic here
+        // (debug / release-assertions) nor wrap silently (release).
+        let zero = Instance { q: 0, T: 0, O: 0 };
+        assert_eq!(SpectralOperator::multiplicities(&zero), [1, 0, 0, 0]);
+        assert_eq!(SpectralOperator::signature_defect(&zero), 0);
+        assert!(!SpectralOperator::is_spectrally_valid(&zero));
     }
 
     #[test]

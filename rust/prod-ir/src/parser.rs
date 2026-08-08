@@ -12,7 +12,7 @@
 //! type     ::= "Nat" | "Int" | "Bool" | "(" "Option" type ")" | "(" "Vec" type ")"
 //!            | "(" "List" type ")" | "(" "Tuple" type* ")" | "(" "named" '"' ident '"' ")"
 //!            | "(" "opaque" '"' ident '"' ")"
-//! expr     ::= nat | ident | "(" "param" nat ")" | "(" "field" expr ident ")"
+//! expr     ::= nat | ident | "(" "param" nat ")"
 //!            | "(" "add" expr expr ")" | "(" "sub" expr expr ")" | "(" "mul" expr expr ")"
 //!            | "(" "div" expr expr ")" | "(" "mod" expr expr ")" | "(" "shl" expr expr ")"
 //!            | "(" "shr" expr expr ")"
@@ -203,10 +203,6 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                 map(tuple((tag("param"), ws(parse_u64))), |(_, idx)| {
                     Expr::Param(idx as usize)
                 }),
-                map(
-                    tuple((tag("field"), ws(parse_expr), ws(quoted_ident))),
-                    |(_, e, f)| Expr::Field(Box::new(e), f),
-                ),
                 map(
                     tuple((tag("add"), ws(parse_expr), ws(parse_expr))),
                     |(_, a, b)| Expr::Add(Box::new(a), Box::new(b)),
@@ -495,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_parse_expr_add() {
-        let input = r#"(add (mul (param 0) (field (param 1) "o")) (param 2))"#;
+        let input = r#"(add (mul (param 0) (proj "UorAtlas.Instance" "O" (param 1))) (param 2))"#;
         let (rest, expr) = parse_expr(input).unwrap();
         assert!(rest.is_empty());
         match expr {
@@ -509,8 +505,8 @@ mod tests {
         let input = r#"
 (module UorAtlas.Kernel
   (def classIndex ((h2 Nat) (d Nat) (l Nat) (inst (named "UorAtlas.Instance"))) Nat
-    (add (mul (field inst "stride") h2)
-         (add (mul (field inst "o") d) l)))
+    (add (mul (call stride inst) h2)
+         (add (mul (proj "UorAtlas.Instance" "O" inst) d) l)))
 )
 "#;
         let (rest, module) = parse_module(input).unwrap();

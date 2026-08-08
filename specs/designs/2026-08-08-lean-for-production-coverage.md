@@ -90,6 +90,8 @@ Written down so that scope creep is a decision rather than a drift.
   scheduled** and may never be. Tier 1+ exists as a concept; its mechanism is
   only built when something earns it.
 - **No polymorphism** in this milestone (S5).
+- **No data-parallel output in this milestone.** It is scheduled as S8 (see
+  below), not built here.
 - `roots.json` and the proof-graph analysis are untouched.
 - No change to the *generated-code* error contract (`ComputeError`) or the
   memory profile established by
@@ -112,9 +114,40 @@ S0 and S1 only.
 | S5 | Polymorphism: monomorphize at export | 0 | generic definitions |
 | S6 | Closures: `Code.fun` | 0/1 | not scheduled |
 | S7 | Recursive inductives and general recursion | 1+ | not scheduled |
+| S8 | Proof-carrying data parallelism | 0 | parallel generated output |
 
 S2 is the most likely next milestone: it is what real kernels hit first and it
 is entirely inside tier 0.
+
+### S8 — proof-carrying data parallelism (scheduled, after S1)
+
+Promoted from "principles recorded only" to scheduled work. It cannot come
+before S1: parallel output needs somewhere to write results, the only heapless
+answer is the caller-owned `&mut [T]` discipline the list lowering already
+established, and that is only worth more than `u64`-sized work once element
+types exist.
+
+The design commitment that makes this defensible rather than a heuristic: the
+generator does not *infer* that a traversal is parallelisable. Lean **proves**
+the elementwise independence or the associativity of the fold, and that proof
+is the licence to emit the chunked form. The proof obligation is discharged on
+the Lean side and recorded in `roots.json` like any other root, so the parallel
+lowering inherits the project's existing evidence story.
+
+The runtime shape stays inside tier 0 and follows the standard's parallelism
+rules directly:
+
+- Input `&[T]`, output `&mut [U]`, split with `split_at_mut` into disjoint
+  chunks. No allocation: chunks are sub-slices.
+- Bounded worker count fixed at the call site. No unbounded queues.
+- Each worker writes only its own index range, so the output is bit-identical
+  regardless of scheduling — canonical bytes never depend on thread interleaving.
+
+Open questions for that spec, not this one: which Lean surface signals the
+intent (an `@[prod parallel]` attribute carrying the independence proof is the
+current favourite over inferring map/fold shapes from LCNF), whether the
+threading primitive is generated or supplied by the caller, and how it composes
+with S5's monomorphisation.
 
 ## S0 — The honest boundary
 

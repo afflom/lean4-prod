@@ -73,11 +73,18 @@ fn parse_u64(input: &str) -> IResult<&str, u64> {
 }
 
 fn parse_i64(input: &str) -> IResult<&str, i64> {
+    // Parse the magnitude in `i128` and apply the sign before narrowing:
+    // `"9223372036854775808"` is not a valid `i64` on its own, yet
+    // `-9223372036854775808` is `i64::MIN`. Parsing the digits as `i64` and
+    // negating afterwards would reject that literal (and, before the digits
+    // widened, panicked on the `unwrap`). Out-of-range values fail the parser
+    // rather than wrapping or aborting.
     map_res(
         tuple((opt(char('-')), digit1)),
         |(neg, digits): (Option<char>, &str)| {
-            let n = digits.parse::<i64>().unwrap();
-            Ok::<_, core::num::ParseIntError>(if neg.is_some() { -n } else { n })
+            let magnitude = digits.parse::<i128>().map_err(|_| ())?;
+            let signed = if neg.is_some() { -magnitude } else { magnitude };
+            i64::try_from(signed).map_err(|_| ())
         },
     )(input)
 }
@@ -226,7 +233,11 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                     // `le` must be delimiter-terminated: bare `tag("le")`
                     // prefix-matches the `let` keyword and derails the
                     // enclosing alt (no backtracking reaches `let`).
-                    tuple((terminated(tag("le"), multispace1), ws(parse_expr), ws(parse_expr))),
+                    tuple((
+                        terminated(tag("le"), multispace1),
+                        ws(parse_expr),
+                        ws(parse_expr),
+                    )),
                     |(_, a, b)| Expr::Le(Box::new(a), Box::new(b)),
                 ),
             )),
@@ -362,6 +373,28 @@ mod tests {
         let (rest, expr) = parse_expr("(let x 1 x)").unwrap();
         assert!(rest.is_empty());
         assert!(matches!(expr, Expr::Let(_, _, _)));
+    }
+
+    #[test]
+    fn test_parse_i64_extremes_do_not_panic() {
+        // Regression: parsing the magnitude as `i64` and negating afterwards
+        // panicked on `i64::MIN`'s digit string.
+        assert_eq!(
+            parse_expr("-9223372036854775808"),
+            Ok(("", Expr::Int(i64::MIN)))
+        );
+        assert_eq!(parse_expr("-1"), Ok(("", Expr::Int(-1))));
+        // Non-negative literals still parse as `Nat` (the `u64` branch wins).
+        assert_eq!(
+            parse_expr("9223372036854775807"),
+            Ok(("", Expr::Nat(i64::MAX as u64)))
+        );
+    }
+
+    #[test]
+    fn test_parse_i64_out_of_range_is_rejected_not_wrapped() {
+        // One past `i64::MIN`: the magnitude fits `i128` but not `i64`.
+        assert!(parse_i64("-9223372036854775809").is_err());
     }
 
     #[test]

@@ -7,13 +7,57 @@
 //!
 //! # Code generation policy
 //!
-//! - **Nat policy**: Lean `Nat` maps to bounded `u64` and Lean `Int` to `i64`.
-//!   The current generated arithmetic is Nat-focused and makes the semantic
-//!   boundary explicit: addition, multiplication, shifts, and powers panic on
-//!   `u64` overflow; subtraction saturates at zero (Lean Nat subtraction);
-//!   division and modulo by zero return zero (Lean Nat's total operations).
-//!   There is no bignum fallback, so this is exact only while values fit in
-//!   `u64`. Typed Int arithmetic remains a separate lowering task.
+//! The generated code targets the project's production standard: it must not
+//! panic on caller-controlled input, and it must not allocate. Those two rules
+//! drive everything below.
+//!
+//! ## Memory profile: no heap, ever
+//!
+//! Nothing rendered here can allocate. Lean `List α` is the only type that
+//! would naïvely need a heap, so its lowering is position-dependent:
+//!
+//! - **Parameter position** → `&[α]`. `List.nil` match arms render as the
+//!   slice pattern `[]` and `List.cons (h t)` as `[h, t @ ..]`, so structural
+//!   recursion passes the tail sub-slice directly — no rebinding, no copying.
+//! - **Return position** → a caller-owned output buffer. The signature gains a
+//!   trailing `output: &mut [α]` and returns `Result<usize, ComputeError>`,
+//!   the length of the initialized prefix. The body is rendered in *builder
+//!   mode*: `List.nil` becomes `Ok(0)`; `List.cons h t` splits one element off
+//!   the front of the buffer (`split_first_mut`, so exhaustion is an `Err`,
+//!   never an index panic), writes the head, recurses the tail into the
+//!   remainder, and returns `1 +` the tail's length. `if`/`let`/`cases`
+//!   recurse into builder mode; `let`-bound list values (LCNF emits lists in
+//!   A-normal form) are resolved through a scoped environment rather than
+//!   materialized.
+//! - **Zero-argument definitions returning a list** (the golden values) →
+//!   `&'static [α]` built from a promoted array literal.
+//!
+//! A list value that reaches any other position — an intermediate value used
+//! as something other than a builder tail, or a list nested inside another
+//! type — is an [`Error::UnsupportedList`]: an honest codegen failure rather
+//! than a silently allocating fallback. `Type::Vec` is rejected outright as
+//! [`Error::HeapType`].
+//!
+//! ## Error contract: fallibility is precise, not uniform
+//!
+//! Lean `Nat` maps to bounded `u64` and Lean `Int` to `i64`. The partial
+//! operations report failure instead of panicking: addition, multiplication,
+//! shifts, and powers render as `checked_*(..).ok_or(crate::ComputeError::X)?`
+//! (with the shift/power exponent narrowed through
+//! `u32::try_from(..).map_err(..)?`). Subtraction saturates at zero (Lean Nat
+//! subtraction) and division/modulo by zero return zero (Lean Nat's total
+//! operations), so neither is fallible. There is no bignum fallback, so this
+//! is exact only while values fit in `u64`.
+//!
+//! A definition returns `Result<T, crate::ComputeError>` **only if it needs
+//! to**: if its body contains a checked operation, or calls a definition that
+//! is itself fallible, or builds a list into a caller buffer. That is a least
+//! fixpoint over the module's call graph ([`Shape`]), so leaf definitions and
+//! the zero-argument goldens keep their plain return types. Calls to fallible
+//! definitions render as `f(args)?`.
+//!
+//! ## Other lowerings
+//!
 //! - **Instance**: the IR `Instance` type maps to `crate::Instance` (by value;
 //!   it is a small `Copy` struct in `prod-core`).
 //! - **Field access**: `(field e "name")` renders as `e.name`, except for the
@@ -32,17 +76,13 @@
 //!     The Nat structural-recursion ctors are special-cased: `Nat.zero` renders
 //!     as the literal pattern `0`, and `Nat.succ k` as the `_` arm with
 //!     `k` bound to `(scrut).saturating_sub(1)` (exact, since the zero arm
-//!     matches first). The List ctors are special-cased too: `List.nil` →
-//!     `crate::List::Nil`, `List.cons (h, t)` → `crate::List::Cons(h, t)` with
-//!     `t` rebound unboxed in the arm body (the pattern binds `Box<List<_>>`).
-//!     `Bool.true`/`Bool.false` → `true`/`false` patterns, and
-//!     `Option.none`/`Option.some v` → `None`/`Some(v)` patterns.
+//!     matches first). `Bool.true`/`Bool.false` → `true`/`false` patterns, and
+//!     `Option.none`/`Option.some v` → `None`/`Some(v)` patterns. The List
+//!     ctors use the slice patterns described above.
 //!   - `Ctor` renders as tuple-style construction `Name(args...)` (bare `Name`
 //!     when there are no args), except `Prod.mk`, which renders as a Rust
-//!     tuple `(a, b)` — nested for right-nested pairs — the List ctors,
-//!     which render as `crate::List::Nil` / `crate::List::Cons(h, Box::new(t))`,
-//!     and the Bool/Option ctors, which render as `true`/`false` and
-//!     `None`/`Some(x)`.
+//!     tuple `(a, b)` — nested for right-nested pairs — and the Bool/Option
+//!     ctors, which render as `true`/`false` and `None`/`Some(x)`.
 //!   - `Proj` renders through the projection-field table below for known
 //!     structure types, and tuple-style `.idx` for unknown `(type, idx)`
 //!     pairs. The table maps Lean structure projection indices to the
@@ -67,6 +107,12 @@
 //!     else (cyclic or multi-caller join points) renders as a `loop {}`
 //!     skeleton with a `manual port required` comment — deliberately not
 //!     over-engineered.
+//!
+//! ## Recursion
+//!
+//! Generated recursion is structurally bounded by a fuel or data argument (the
+//! Lean side must already be terminating for LCNF to emit it), so stack depth
+//! is a function of the caller's inputs, not of unbounded search.
 
 #![no_std]
 
@@ -74,10 +120,10 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
-use prod_ir::{Definition, Expr, Module, Type};
+use prod_ir::{Alt, Definition, Expr, Module, Type};
 
 /// Fields rendered as method calls rather than plain field accesses.
 /// Legacy table carried over unchanged from `uor-atlas-macros`.
@@ -90,6 +136,12 @@ pub enum Error {
     OpaqueExpr(String),
     /// `(param n)` refers to a parameter index outside the definition's list
     ParamOutOfBounds(usize),
+    /// A list value appears somewhere the allocation-free lowering cannot
+    /// render it: nested inside another type, or used as an intermediate
+    /// value rather than flowing into the output buffer.
+    UnsupportedList(String),
+    /// A type that would require a heap allocation in generated code.
+    HeapType(String),
 }
 
 impl fmt::Display for Error {
@@ -97,57 +149,225 @@ impl fmt::Display for Error {
         match self {
             Error::OpaqueExpr(s) => write!(f, "cannot generate code for opaque expression: {}", s),
             Error::ParamOutOfBounds(i) => write!(f, "parameter index {} is out of bounds", i),
+            Error::UnsupportedList(s) => {
+                write!(f, "list value cannot be rendered without allocating: {}", s)
+            }
+            Error::HeapType(s) => write!(
+                f,
+                "type would require a heap allocation in generated code: {}",
+                s
+            ),
         }
     }
 }
 
+/// How a generated definition presents itself to its callers.
+///
+/// Computed for the whole module up front, because a call site cannot know
+/// whether to append `?` until the callee's shape is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// Plain value: `fn f(..) -> T`.
+    Value,
+    /// Fallible: `fn f(..) -> Result<T, ComputeError>`; call sites append `?`.
+    Fallible,
+    /// List builder: `fn f(.., output: &mut [E]) -> Result<usize, ComputeError>`.
+    Buffer,
+    /// Zero-argument list golden: `fn f() -> &'static [E]`.
+    StaticList,
+}
+
+/// Definition name → [`Shape`], for one module.
+type Signatures<'m> = BTreeMap<&'m str, Shape>;
+
 /// Render a whole module: one `pub fn` per definition.
 pub fn generate_module(module: &Module) -> Result<String, Error> {
+    let shapes = signatures(&module.definitions);
     let mut out = String::new();
     for def in &module.definitions {
-        out.push_str(&generate_def(def)?);
+        out.push_str(&generate_def_in(def, &shapes)?);
         out.push('\n');
     }
     Ok(out)
 }
 
 /// Render a single definition as a `pub fn`.
+///
+/// Calls to definitions outside `def` itself are assumed infallible, since
+/// there is no module to resolve them against; use [`generate_module`] when
+/// cross-definition fallibility matters.
 pub fn generate_def(def: &Definition) -> Result<String, Error> {
-    let ctx = JpContext::collect(&def.body);
+    let one = core::slice::from_ref(def);
+    generate_def_in(def, &signatures(one))
+}
+
+/// Compute every definition's [`Shape`] as a least fixpoint over the call
+/// graph: seed everything infallible, then promote until nothing changes.
+/// Monotone (shapes only ever move `Value` → `Fallible`), so it terminates.
+fn signatures<'m>(defs: &'m [Definition]) -> Signatures<'m> {
+    let mut shapes: Signatures<'m> = defs
+        .iter()
+        .map(|def| {
+            let shape = match &def.ret {
+                Type::List(_) if def.params.is_empty() => Shape::StaticList,
+                Type::List(_) => Shape::Buffer,
+                _ => Shape::Value,
+            };
+            (def.name.as_str(), shape)
+        })
+        .collect();
+
+    loop {
+        let mut changed = false;
+        for def in defs {
+            if shapes.get(def.name.as_str()) != Some(&Shape::Value) {
+                continue;
+            }
+            if is_fallible(&def.body, &shapes) {
+                shapes.insert(def.name.as_str(), Shape::Fallible);
+                changed = true;
+            }
+        }
+        if !changed {
+            return shapes;
+        }
+    }
+}
+
+/// Does this expression perform, or reach, an operation that can fail?
+fn is_fallible(expr: &Expr, shapes: &Signatures) -> bool {
+    let here = match expr {
+        Expr::Add(..) | Expr::Mul(..) | Expr::Shl(..) | Expr::Pow(..) => true,
+        Expr::Call(name, _) => matches!(
+            shapes.get(name.as_str()),
+            Some(Shape::Fallible) | Some(Shape::Buffer)
+        ),
+        _ => false,
+    };
+    here || children(expr).any(|child| is_fallible(child, shapes))
+}
+
+fn generate_def_in<'m>(def: &'m Definition, shapes: &Signatures<'m>) -> Result<String, Error> {
+    let shape = shapes
+        .get(def.name.as_str())
+        .copied()
+        .unwrap_or(Shape::Value);
+    let renderer = Renderer {
+        shapes,
+        params: &def.params,
+        ctx: JpContext::collect(&def.body),
+    };
 
     let mut params = String::new();
     for (i, (name, ty)) in def.params.iter().enumerate() {
         if i > 0 {
             params.push_str(", ");
         }
-        params.push_str(&format!("{}: {}", name, type_to_rust(ty)));
+        params.push_str(&format!("{}: {}", name, param_type_to_rust(ty)?));
     }
 
-    let body = expr_to_rust(&def.body, &def.params, &ctx)?;
-
-    Ok(format!(
-        "pub fn {}({}) -> {} {{\n    {}\n}}\n",
-        def.name,
-        params,
-        type_to_rust(&def.ret),
-        body
-    ))
+    match shape {
+        Shape::StaticList => {
+            let elem = list_element(&def.ret)?;
+            if is_fallible(&def.body, shapes) {
+                return Err(Error::UnsupportedList(format!(
+                    "`{}` computes its list elements, so it cannot be a promoted &'static slice",
+                    def.name
+                )));
+            }
+            let mut items = Vec::new();
+            renderer.static_list(&def.body, &[], &mut items)?;
+            Ok(format!(
+                "pub fn {}() -> &'static [{}] {{\n    &[{}]\n}}\n",
+                def.name,
+                type_to_rust(elem)?,
+                items.join(", ")
+            ))
+        }
+        Shape::Buffer => {
+            let elem = list_element(&def.ret)?;
+            if !params.is_empty() {
+                params.push_str(", ");
+            }
+            params.push_str(&format!("output: &mut [{}]", type_to_rust(elem)?));
+            let body = renderer.render(
+                &def.body,
+                &Mode::Builder {
+                    out: "output",
+                    env: &[],
+                    depth: 0,
+                },
+            )?;
+            Ok(format!(
+                "pub fn {}({}) -> Result<usize, crate::ComputeError> {{\n    {}\n}}\n",
+                def.name, params, body
+            ))
+        }
+        Shape::Fallible => Ok(format!(
+            "pub fn {}({}) -> Result<{}, crate::ComputeError> {{\n    Ok({})\n}}\n",
+            def.name,
+            params,
+            type_to_rust(&def.ret)?,
+            renderer.value(&def.body)?
+        )),
+        Shape::Value => Ok(format!(
+            "pub fn {}({}) -> {} {{\n    {}\n}}\n",
+            def.name,
+            params,
+            type_to_rust(&def.ret)?,
+            renderer.value(&def.body)?
+        )),
+    }
 }
 
-fn type_to_rust(ty: &Type) -> String {
-    match ty {
+/// Rust spelling of a type in an ordinary (owned, by-value) position.
+fn type_to_rust(ty: &Type) -> Result<String, Error> {
+    Ok(match ty {
         Type::Nat => String::from("u64"),
         Type::Int => String::from("i64"),
         Type::Bool => String::from("bool"),
         Type::Instance => String::from("crate::Instance"),
-        Type::Option(inner) => format!("Option<{}>", type_to_rust(inner)),
-        Type::Vec(inner) => format!("Vec<{}>", type_to_rust(inner)),
-        Type::List(inner) => format!("crate::List<{}>", type_to_rust(inner)),
+        Type::Option(inner) => format!("Option<{}>", type_to_rust(inner)?),
         Type::Tuple(items) => {
-            let types: Vec<String> = items.iter().map(type_to_rust).collect();
-            format!("({})", types.join(", "))
+            let mut rendered = Vec::with_capacity(items.len());
+            for item in items {
+                rendered.push(type_to_rust(item)?);
+            }
+            format!("({})", rendered.join(", "))
         }
         Type::Opaque(s) => s.clone(),
+        // Lists are only renderable at the top level of a parameter or return
+        // type, where the caller supplies the storage.
+        Type::List(inner) => {
+            return Err(Error::UnsupportedList(format!(
+                "(List {}) is only supported directly as a parameter or return type",
+                type_to_rust(inner).unwrap_or_else(|_| String::from("_"))
+            )))
+        }
+        Type::Vec(inner) => {
+            return Err(Error::HeapType(format!(
+                "(Vec {})",
+                type_to_rust(inner).unwrap_or_else(|_| String::from("_"))
+            )))
+        }
+    })
+}
+
+/// Rust spelling of a parameter type: a top-level list borrows as a slice.
+fn param_type_to_rust(ty: &Type) -> Result<String, Error> {
+    match ty {
+        Type::List(inner) => Ok(format!("&[{}]", type_to_rust(inner)?)),
+        _ => type_to_rust(ty),
+    }
+}
+
+/// The element type of a list return type.
+fn list_element(ty: &Type) -> Result<&Type, Error> {
+    match ty {
+        Type::List(inner) => Ok(inner),
+        _ => Err(Error::UnsupportedList(
+            "expected a list return type".to_string(),
+        )),
     }
 }
 
@@ -226,6 +446,7 @@ fn children(expr: &Expr) -> impl Iterator<Item = &Expr> {
         | Expr::Pow(a, b)
         | Expr::Eq(a, b)
         | Expr::Lt(a, b)
+        | Expr::Le(a, b)
         | Expr::Gt(a, b) => {
             out.push(a);
             out.push(b);
@@ -259,288 +480,454 @@ fn children(expr: &Expr) -> impl Iterator<Item = &Expr> {
     out.into_iter()
 }
 
-fn expr_to_rust(
-    expr: &Expr,
-    params: &[(String, Type)],
-    ctx: &JpContext,
-) -> Result<String, Error> {
-    match expr {
-        Expr::Nat(n) => Ok(format!("{}", n)),
-        Expr::Int(n) => Ok(format!("{}", n)),
-        Expr::Bool(b) => Ok(format!("{}", b)),
-        Expr::Var(name) => Ok(name.clone()),
-        Expr::Param(index) => params
-            .get(*index)
-            .map(|(name, _)| name.clone())
-            .ok_or(Error::ParamOutOfBounds(*index)),
-        Expr::Field(obj, field) => {
-            let obj = expr_to_rust(obj, params, ctx)?;
-            if METHOD_FIELDS.contains(&field.as_str()) {
-                Ok(format!("{}.{}()", obj, field))
-            } else {
-                Ok(format!("{}.{}", obj, field))
+/// Where the expression being rendered will land.
+///
+/// The two modes share one traversal: control flow (`if`, `let`, `cases`)
+/// is rendered identically and simply propagates the mode into its branches,
+/// while the leaves differ.
+enum Mode<'x, 'm> {
+    /// Ordinary value position. The rendered text has the expression's own
+    /// Rust type, with `?` embedded wherever an operation can fail.
+    Value,
+    /// List builder position. The rendered text has type
+    /// `Result<usize, crate::ComputeError>` and fills `out`.
+    Builder {
+        /// The `&mut [T]` expression this list is written into.
+        out: &'x str,
+        /// `let`-bound list values in scope, innermost last. LCNF emits lists
+        /// in A-normal form, so cons cells arrive as chains of `let`s rather
+        /// than as one nested expression.
+        env: &'x [(&'m str, &'m Expr)],
+        /// Nesting depth, used to keep generated temporaries unique.
+        depth: usize,
+    },
+}
+
+struct Renderer<'s, 'm> {
+    shapes: &'s Signatures<'m>,
+    params: &'m [(String, Type)],
+    ctx: JpContext<'m>,
+}
+
+impl<'m> Renderer<'_, 'm> {
+    fn value(&self, expr: &'m Expr) -> Result<String, Error> {
+        self.render(expr, &Mode::Value)
+    }
+
+    fn shape_of(&self, name: &str) -> Option<Shape> {
+        self.shapes.get(name).copied()
+    }
+
+    /// Is this expression a list value (and therefore only renderable in
+    /// builder position or as a `let` binding resolved through `env`)?
+    fn is_list_valued(&self, expr: &Expr, env: &[(&'m str, &'m Expr)]) -> bool {
+        match expr {
+            Expr::Ctor(name, _) => name == "List.nil" || name == "List.cons",
+            Expr::Call(name, _) => matches!(
+                self.shape_of(name),
+                Some(Shape::Buffer) | Some(Shape::StaticList)
+            ),
+            Expr::Var(name) => lookup(env, name).is_some(),
+            _ => false,
+        }
+    }
+
+    fn render(&self, expr: &'m Expr, mode: &Mode<'_, 'm>) -> Result<String, Error> {
+        match expr {
+            // ---- control flow: identical in both modes ----
+            Expr::If(cond, t, f) => Ok(format!(
+                "if {} {{ {} }} else {{ {} }}",
+                self.value(cond)?,
+                self.render(t, mode)?,
+                self.render(f, mode)?
+            )),
+            Expr::Let(name, val, body) => match mode {
+                Mode::Builder { out, env, depth } if self.is_list_valued(val, env) => {
+                    // A list binding has no runtime representation to emit;
+                    // record it and resolve uses through the environment.
+                    let mut extended = env.to_vec();
+                    extended.push((name.as_str(), val));
+                    self.render(
+                        body,
+                        &Mode::Builder {
+                            out,
+                            env: &extended,
+                            depth: *depth,
+                        },
+                    )
+                }
+                _ => Ok(format!(
+                    "{{ let {} = {}; {} }}",
+                    name,
+                    self.value(val)?,
+                    self.render(body, mode)?
+                )),
+            },
+            Expr::Match {
+                scrut,
+                alts,
+                default,
+            } => self.render_match(scrut, alts, default.as_deref(), mode),
+
+            // ---- list-shaped leaves ----
+            Expr::Ctor(name, args) if name == "List.nil" && args.is_empty() => match mode {
+                // Turbofished: an empty list is the one builder leaf that
+                // constrains neither type parameter on its own, and it can
+                // appear under a `?` (as the tail of a cons).
+                Mode::Builder { .. } => Ok(String::from("Ok::<usize, crate::ComputeError>(0)")),
+                Mode::Value => Err(Error::UnsupportedList(
+                    "`List.nil` outside a list return position".to_string(),
+                )),
+            },
+            Expr::Ctor(name, args) if name == "List.cons" && args.len() == 2 => match mode {
+                Mode::Builder { out, env, depth } => {
+                    self.render_cons(&args[0], &args[1], out, env, *depth)
+                }
+                Mode::Value => Err(Error::UnsupportedList(
+                    "`List.cons` outside a list return position".to_string(),
+                )),
+            },
+
+            // ---- everything else ----
+            Expr::Var(name) => match mode {
+                Mode::Builder { env, .. } => match lookup(env, name) {
+                    Some(bound) => self.render(bound, mode),
+                    None => Err(Error::UnsupportedList(format!(
+                        "`{}` is not a list built in this definition",
+                        name
+                    ))),
+                },
+                Mode::Value => Ok(name.clone()),
+            },
+            Expr::Call(name, args) => {
+                let rendered = self.render_args(args)?;
+                match (mode, self.shape_of(name)) {
+                    (Mode::Builder { out, .. }, Some(Shape::Buffer)) => {
+                        // The callee writes straight into our remaining buffer
+                        // and reports how much of it it used.
+                        let mut all = rendered;
+                        all.push((*out).to_string());
+                        Ok(format!("{}({})", name, all.join(", ")))
+                    }
+                    (Mode::Builder { .. }, _) => Err(Error::UnsupportedList(format!(
+                        "`{}` does not build its list into a caller buffer",
+                        name
+                    ))),
+                    (Mode::Value, Some(Shape::Buffer)) => Err(Error::UnsupportedList(format!(
+                        "`{}` returns a list; its result cannot be used as an intermediate value",
+                        name
+                    ))),
+                    (Mode::Value, Some(Shape::Fallible)) => {
+                        Ok(format!("{}({})?", name, rendered.join(", ")))
+                    }
+                    (Mode::Value, _) => Ok(format!("{}({})", name, rendered.join(", "))),
+                }
+            }
+
+            // Remaining nodes are value-typed; reaching them in builder mode
+            // means the IR put a non-list where a list was declared.
+            _ => match mode {
+                Mode::Builder { .. } => Err(Error::UnsupportedList(
+                    "expression does not build a list".to_string(),
+                )),
+                Mode::Value => self.render_value_leaf(expr),
+            },
+        }
+    }
+
+    fn render_value_leaf(&self, expr: &'m Expr) -> Result<String, Error> {
+        match expr {
+            Expr::Nat(n) => Ok(format!("{}", n)),
+            Expr::Int(n) => Ok(format!("{}", n)),
+            Expr::Bool(b) => Ok(format!("{}", b)),
+            Expr::Param(index) => self
+                .params
+                .get(*index)
+                .map(|(name, _)| name.clone())
+                .ok_or(Error::ParamOutOfBounds(*index)),
+            Expr::Field(obj, field) => {
+                let obj = self.value(obj)?;
+                if METHOD_FIELDS.contains(&field.as_str()) {
+                    Ok(format!("{}.{}()", obj, field))
+                } else {
+                    Ok(format!("{}.{}", obj, field))
+                }
+            }
+            Expr::Add(a, b) => self.checked_binop(a, b, "checked_add", "AddOverflow"),
+            Expr::Mul(a, b) => self.checked_binop(a, b, "checked_mul", "MulOverflow"),
+            Expr::Sub(a, b) => {
+                // Lean Nat subtraction truncates at zero, so it is total.
+                // See `checked_binop` for the `as u64` receiver pin.
+                Ok(format!(
+                    "(({}) as u64).saturating_sub({})",
+                    self.value(a)?,
+                    self.value(b)?
+                ))
+            }
+            Expr::Div(a, b) => self.total_binop(a, b, "/"),
+            Expr::Mod(a, b) => self.total_binop(a, b, "%"),
+            Expr::Shl(a, b) => self.checked_exponent_op(
+                a,
+                b,
+                "checked_shl",
+                "ShiftExponentTooLarge",
+                "ShiftOverflow",
+            ),
+            Expr::Pow(a, b) => {
+                self.checked_exponent_op(a, b, "checked_pow", "PowExponentTooLarge", "PowOverflow")
+            }
+            Expr::Eq(a, b) => self.binop(a, b, "=="),
+            Expr::Lt(a, b) => self.binop(a, b, "<"),
+            Expr::Le(a, b) => self.binop(a, b, "<="),
+            Expr::Gt(a, b) => self.binop(a, b, ">"),
+            Expr::Ctor(name, args) => {
+                let args = self.render_args(args)?;
+                if name == "Prod.mk" {
+                    Ok(format!("({})", args.join(", ")))
+                } else if name == "Bool.true" && args.is_empty() {
+                    Ok(String::from("true"))
+                } else if name == "Bool.false" && args.is_empty() {
+                    Ok(String::from("false"))
+                } else if name == "Option.none" && args.is_empty() {
+                    Ok(String::from("None"))
+                } else if name == "Option.some" && args.len() == 1 {
+                    Ok(format!("Some({})", args[0]))
+                } else if args.is_empty() {
+                    Ok(name.clone())
+                } else {
+                    Ok(format!("{}({})", name, args.join(", ")))
+                }
+            }
+            Expr::Proj(ty, idx, e) => {
+                let e = self.value(e)?;
+                match instance_field(ty, *idx) {
+                    Some(field) => Ok(format!("({}).{}", e, field)),
+                    None => Ok(format!("({}).{}", e, idx)),
+                }
+            }
+            Expr::Jp { name, body, .. } => {
+                if self.ctx.jmp_count(name) == 0 {
+                    // No jump sites: the declaration is just a block.
+                    Ok(format!(
+                        "{{ /* jp \"{}\": no jump sites */ {} }}",
+                        name,
+                        self.value(body)?
+                    ))
+                } else if self.ctx.is_inlineable(name) {
+                    // Inlined at its single jump site; nothing to emit here.
+                    Ok(format!("/* jp \"{}\" inlined at its jump site */ ()", name))
+                } else {
+                    // Cyclic or multi-caller: emit a skeleton, not a full lowering.
+                    Ok(format!(
+                        "loop {{\n        /* jp \"{}\": cyclic or multi-caller join point — manual port required */\n        {};\n        break;\n    }}",
+                        name,
+                        self.value(body)?
+                    ))
+                }
+            }
+            Expr::Jmp(name, args) => match self.ctx.decls.get(name.as_str()) {
+                Some((jp_params, body)) if self.ctx.is_inlineable(name) => {
+                    let mut out = String::from("{ ");
+                    for (p, a) in jp_params.iter().zip(args.iter()) {
+                        out.push_str(&format!("let {} = {}; ", p, self.value(a)?));
+                    }
+                    out.push_str(&self.value(body)?);
+                    out.push_str(" }");
+                    Ok(out)
+                }
+                Some(_) => Ok(format!(
+                    "loop {{ /* jmp \"{}\": cyclic or multi-caller join point — manual port required */ break; }}",
+                    name
+                )),
+                None => Ok(format!("/* jmp \"{}\": no matching jp declaration */ ()", name)),
+            },
+            Expr::Unreachable => Ok(String::from("unreachable!()")),
+            Expr::Opaque(s) => Err(Error::OpaqueExpr(s.clone())),
+            // Handled by `render` before it delegates here.
+            Expr::If(..) | Expr::Let(..) | Expr::Match { .. } | Expr::Var(_) | Expr::Call(..) => {
+                unreachable!("control-flow nodes are rendered by `render`")
             }
         }
-        Expr::Add(a, b) => checked_binop(
-            a,
-            b,
-            "checked_add",
-            "Lean Nat addition overflow",
-            params,
-            ctx,
-        ),
-        Expr::Sub(a, b) => saturating_binop(a, b, "saturating_sub", params, ctx),
-        Expr::Mul(a, b) => checked_binop(
-            a,
-            b,
-            "checked_mul",
-            "Lean Nat multiplication overflow",
-            params,
-            ctx,
-        ),
-        Expr::Div(a, b) => total_binop(a, b, "/", params, ctx),
-        Expr::Mod(a, b) => total_binop(a, b, "%", params, ctx),
-        Expr::Shl(a, b) => checked_shift(a, b, params, ctx),
-        Expr::Pow(a, b) => {
-            let a = expr_to_rust(a, params, ctx)?;
-            let b = expr_to_rust(b, params, ctx)?;
-            Ok(format!(
-                "(({}) as u64).checked_pow(u32::try_from({}).expect(\"Lean Nat power exponent exceeds u32\")).expect(\"Lean Nat power overflow\")",
-                a, b
-            ))
-        }
-        Expr::Eq(a, b) => binop(a, b, "==", params, ctx),
-        Expr::Lt(a, b) => binop(a, b, "<", params, ctx),
-        Expr::Le(a, b) => binop(a, b, "<=", params, ctx),
-        Expr::Gt(a, b) => binop(a, b, ">", params, ctx),
-        Expr::If(cond, t, f) => {
-            let cond = expr_to_rust(cond, params, ctx)?;
-            let t = expr_to_rust(t, params, ctx)?;
-            let f = expr_to_rust(f, params, ctx)?;
-            Ok(format!("if {} {{ {} }} else {{ {} }}", cond, t, f))
-        }
-        Expr::Let(name, val, body) => {
-            let val = expr_to_rust(val, params, ctx)?;
-            let body = expr_to_rust(body, params, ctx)?;
-            Ok(format!("{{ let {} = {}; {} }}", name, val, body))
-        }
-        Expr::Call(name, args) => {
-            let args = render_args(args, params, ctx)?;
-            Ok(format!("{}({})", name, args.join(", ")))
-        }
-        Expr::Match {
-            scrut,
-            alts,
-            default,
-        } => {
-            let scrut = expr_to_rust(scrut, params, ctx)?;
-            let mut out = format!("match {} {{\n", scrut);
-            for alt in alts {
-                let body = expr_to_rust(&alt.body, params, ctx)?;
+    }
+
+    /// `List.cons head tail` in builder position: take one element off the
+    /// front of the buffer, write the head, and recurse the tail into what is
+    /// left. `split_first_mut` makes exhaustion an `Err` rather than an index
+    /// panic, so the generated code has no bounds-check panic path at all.
+    fn render_cons(
+        &self,
+        head: &'m Expr,
+        tail: &'m Expr,
+        out: &str,
+        env: &[(&'m str, &'m Expr)],
+        depth: usize,
+    ) -> Result<String, Error> {
+        let head = self.value(head)?;
+        let (slot, rest_buf) = (format!("__head{}", depth), format!("__rest{}", depth));
+        let rest = self.render(
+            tail,
+            &Mode::Builder {
+                out: &rest_buf,
+                env,
+                depth: depth + 1,
+            },
+        )?;
+        Ok(format!(
+            "match ({}).split_first_mut() {{ None => Err(crate::ComputeError::OutputTooSmall), Some(({}, {})) => {{ *{} = {}; let __len{} = {}?; Ok(__len{} + 1) }} }}",
+            out, slot, rest_buf, slot, head, depth, rest, depth
+        ))
+    }
+
+    fn render_match(
+        &self,
+        scrut: &'m Expr,
+        alts: &'m [Alt],
+        default: Option<&'m Expr>,
+        mode: &Mode<'_, 'm>,
+    ) -> Result<String, Error> {
+        let scrut = self.value(scrut)?;
+        let mut out = format!("match {} {{\n", scrut);
+        for alt in alts {
+            let body = self.render(&alt.body, mode)?;
+            let arm = match (alt.ctor.as_str(), alt.binders.len()) {
                 // LCNF structural recursion on Nat cases: `Nat.zero` is the
                 // literal `0`; `Nat.succ k` binds the predecessor. Since the
                 // zero arm matches first, the succ arm's scrutinee is ≥ 1 and
                 // `saturating_sub(1)` is the exact predecessor (and stays
                 // within the crate's bounded-Nat policy).
-                if alt.ctor == "Nat.zero" && alt.binders.is_empty() {
-                    out.push_str(&format!("        0 => {},\n", body));
-                } else if alt.ctor == "Nat.succ" && alt.binders.len() == 1 {
-                    out.push_str(&format!(
-                        "        _ => {{ let {} = ({}).saturating_sub(1); {} }},\n",
-                        alt.binders[0], scrut, body
-                    ));
-                } else if alt.ctor == "List.nil" && alt.binders.is_empty() {
-                    out.push_str(&format!("        crate::List::Nil => {},\n", body));
-                } else if alt.ctor == "List.cons" && alt.binders.len() == 2 {
-                    // The tail binds as `Box<List<_>>`; rebind it unboxed so
-                    // recursive calls and reconstruction sites see a plain
-                    // `List` (the runtime's linked-list representation).
-                    out.push_str(&format!(
-                        "        crate::List::Cons({}, {}) => {{ let {} = *{}; {} }},\n",
-                        alt.binders[0], alt.binders[1], alt.binders[1], alt.binders[1], body
-                    ));
-                } else if alt.ctor == "Bool.true" && alt.binders.is_empty() {
-                    out.push_str(&format!("        true => {},\n", body));
-                } else if alt.ctor == "Bool.false" && alt.binders.is_empty() {
-                    out.push_str(&format!("        false => {},\n", body));
-                } else if alt.ctor == "Option.none" && alt.binders.is_empty() {
-                    out.push_str(&format!("        None => {},\n", body));
-                } else if alt.ctor == "Option.some" && alt.binders.len() == 1 {
-                    out.push_str(&format!("        Some({}) => {},\n", alt.binders[0], body));
-                } else {
-                    let pat = if alt.binders.is_empty() {
-                        alt.ctor.clone()
-                    } else {
-                        format!("{}({})", alt.ctor, alt.binders.join(", "))
-                    };
-                    out.push_str(&format!("        {} => {},\n", pat, body));
-                }
-            }
-            if let Some(d) = default {
-                let body = expr_to_rust(d, params, ctx)?;
-                out.push_str(&format!("        _ => {},\n", body));
-            }
-            out.push_str("    }");
-            Ok(out)
+                ("Nat.zero", 0) => format!("        0 => {},\n", body),
+                ("Nat.succ", 1) => format!(
+                    "        _ => {{ let {} = ({}).saturating_sub(1); {} }},\n",
+                    alt.binders[0], scrut, body
+                ),
+                // Lists are slices: the empty and non-empty slice patterns are
+                // exhaustive, and the tail binds as a sub-slice at no cost.
+                // Match ergonomics bind the head by reference; rebind it by
+                // value so arithmetic on it needs no dereference syntax.
+                ("List.nil", 0) => format!("        [] => {},\n", body),
+                ("List.cons", 2) => format!(
+                    "        [{}, {} @ ..] => {{ let {} = *{}; {} }},\n",
+                    alt.binders[0], alt.binders[1], alt.binders[0], alt.binders[0], body
+                ),
+                ("Bool.true", 0) => format!("        true => {},\n", body),
+                ("Bool.false", 0) => format!("        false => {},\n", body),
+                ("Option.none", 0) => format!("        None => {},\n", body),
+                ("Option.some", 1) => format!("        Some({}) => {},\n", alt.binders[0], body),
+                _ if alt.binders.is_empty() => format!("        {} => {},\n", alt.ctor, body),
+                _ => format!(
+                    "        {}({}) => {},\n",
+                    alt.ctor,
+                    alt.binders.join(", "),
+                    body
+                ),
+            };
+            out.push_str(&arm);
         }
-        Expr::Ctor(name, args) => {
-            let args = render_args(args, params, ctx)?;
-            if name == "Prod.mk" {
-                Ok(format!("({})", args.join(", ")))
-            } else if name == "List.nil" && args.is_empty() {
-                Ok(String::from("crate::List::Nil"))
-            } else if name == "List.cons" && args.len() == 2 {
-                Ok(format!(
-                    "crate::List::Cons({}, Box::new({}))",
-                    args[0], args[1]
-                ))
-            } else if name == "Bool.true" && args.is_empty() {
-                Ok(String::from("true"))
-            } else if name == "Bool.false" && args.is_empty() {
-                Ok(String::from("false"))
-            } else if name == "Option.none" && args.is_empty() {
-                Ok(String::from("None"))
-            } else if name == "Option.some" && args.len() == 1 {
-                Ok(format!("Some({})", args[0]))
-            } else if args.is_empty() {
-                Ok(name.clone())
-            } else {
-                Ok(format!("{}({})", name, args.join(", ")))
-            }
+        if let Some(d) = default {
+            out.push_str(&format!("        _ => {},\n", self.render(d, mode)?));
         }
-        Expr::Proj(ty, idx, e) => {
-            let e = expr_to_rust(e, params, ctx)?;
-            if let Some(field) = instance_field(ty, *idx) {
-                Ok(format!("({}).{}", e, field))
-            } else {
-                Ok(format!("({}).{}", e, idx))
-            }
-        }
-        Expr::Jp { name, body, .. } => {
-            if ctx.jmp_count(name) == 0 {
-                // No jump sites: the declaration is just a block.
-                let body = expr_to_rust(body, params, ctx)?;
-                Ok(format!(
-                    "{{ /* jp \"{}\": no jump sites */ {} }}",
-                    name, body
-                ))
-            } else if ctx.is_inlineable(name) {
-                // Inlined at its single jump site; nothing to emit here.
-                Ok(format!(
-                    "/* jp \"{}\" inlined at its jump site */ ()",
+        out.push_str("    }");
+        Ok(out)
+    }
+
+    /// Flatten a constant `List.cons`/`List.nil` chain into array elements for
+    /// a promoted `&'static [T]`. Only `let`-bound list values are followed;
+    /// anything computed belongs in builder mode instead.
+    fn static_list(
+        &self,
+        expr: &'m Expr,
+        env: &[(&'m str, &'m Expr)],
+        items: &mut Vec<String>,
+    ) -> Result<(), Error> {
+        match expr {
+            Expr::Var(name) => match lookup(env, name) {
+                Some(bound) => self.static_list(bound, env, items),
+                None => Err(Error::UnsupportedList(format!(
+                    "`{}` is not a constant list",
                     name
-                ))
-            } else {
-                // Cyclic or multi-caller: emit a skeleton, not a full lowering.
-                let body = expr_to_rust(body, params, ctx)?;
-                Ok(format!(
-                    "loop {{\n        /* jp \"{}\": cyclic or multi-caller join point — manual port required */\n        {};\n        break;\n    }}",
-                    name, body
-                ))
+                ))),
+            },
+            Expr::Let(name, val, body) if self.is_list_valued(val, env) => {
+                let mut extended = env.to_vec();
+                extended.push((name.as_str(), val));
+                self.static_list(body, &extended, items)
             }
+            Expr::Ctor(name, args) if name == "List.nil" && args.is_empty() => Ok(()),
+            Expr::Ctor(name, args) if name == "List.cons" && args.len() == 2 => {
+                items.push(self.value(&args[0])?);
+                self.static_list(&args[1], env, items)
+            }
+            _ => Err(Error::UnsupportedList(
+                "zero-argument list definitions must be constant cons chains".to_string(),
+            )),
         }
-        Expr::Jmp(name, args) => match ctx.decls.get(name.as_str()) {
-            Some((jp_params, body)) if ctx.is_inlineable(name) => {
-                let mut out = String::from("{ ");
-                for (p, a) in jp_params.iter().zip(args.iter()) {
-                    let a = expr_to_rust(a, params, ctx)?;
-                    out.push_str(&format!("let {} = {}; ", p, a));
-                }
-                let body = expr_to_rust(body, params, ctx)?;
-                out.push_str(&body);
-                out.push_str(" }");
-                Ok(out)
-            }
-            Some(_) => Ok(format!(
-                "loop {{ /* jmp \"{}\": cyclic or multi-caller join point — manual port required */ break; }}",
-                name
-            )),
-            None => Ok(format!(
-                "/* jmp \"{}\": no matching jp declaration */ ()",
-                name
-            )),
-        },
-        Expr::Unreachable => Ok(String::from("unreachable!()")),
-        Expr::Opaque(s) => Err(Error::OpaqueExpr(s.clone())),
+    }
+
+    fn render_args(&self, args: &'m [Expr]) -> Result<Vec<String>, Error> {
+        args.iter().map(|a| self.value(a)).collect()
+    }
+
+    fn binop(&self, a: &'m Expr, b: &'m Expr, op: &str) -> Result<String, Error> {
+        Ok(format!("({} {} {})", self.value(a)?, op, self.value(b)?))
+    }
+
+    /// `checked_add`/`checked_mul`: report overflow instead of panicking.
+    ///
+    /// `as u64` pins the receiver: method calls on an inferred `{integer}`
+    /// (a let-bound literal, e.g. LCNF's `let _x := 1`) fail method resolution
+    /// (E0689) — a no-op when the receiver is already `u64`.
+    fn checked_binop(
+        &self,
+        a: &'m Expr,
+        b: &'m Expr,
+        method: &str,
+        error: &str,
+    ) -> Result<String, Error> {
+        Ok(format!(
+            "(({}) as u64).{}({}).ok_or(crate::ComputeError::{})?",
+            self.value(a)?,
+            method,
+            self.value(b)?,
+            error
+        ))
+    }
+
+    /// `checked_shl`/`checked_pow`: the exponent must also narrow to `u32`,
+    /// which is a second, distinct failure mode.
+    fn checked_exponent_op(
+        &self,
+        a: &'m Expr,
+        b: &'m Expr,
+        method: &str,
+        exponent_error: &str,
+        overflow_error: &str,
+    ) -> Result<String, Error> {
+        Ok(format!(
+            "(({}) as u64).{}(u32::try_from({}).map_err(|_| crate::ComputeError::{})?).ok_or(crate::ComputeError::{})?",
+            self.value(a)?,
+            method,
+            self.value(b)?,
+            exponent_error,
+            overflow_error
+        ))
+    }
+
+    /// Lean Nat division and modulo are total: `x / 0 = x % 0 = 0`.
+    fn total_binop(&self, a: &'m Expr, b: &'m Expr, op: &str) -> Result<String, Error> {
+        let (a, b) = (self.value(a)?, self.value(b)?);
+        Ok(format!(
+            "if ({}) == 0 {{ 0 }} else {{ ({}) {} ({}) }}",
+            b, a, op, b
+        ))
     }
 }
 
-fn binop(
-    a: &Expr,
-    b: &Expr,
-    op: &str,
-    params: &[(String, Type)],
-    ctx: &JpContext,
-) -> Result<String, Error> {
-    let a = expr_to_rust(a, params, ctx)?;
-    let b = expr_to_rust(b, params, ctx)?;
-    Ok(format!("({} {} {})", a, op, b))
-}
-
-fn checked_binop(
-    a: &Expr,
-    b: &Expr,
-    method: &str,
-    message: &str,
-    params: &[(String, Type)],
-    ctx: &JpContext,
-) -> Result<String, Error> {
-    let a = expr_to_rust(a, params, ctx)?;
-    let b = expr_to_rust(b, params, ctx)?;
-    // `as u64` pins the receiver: method calls on an inferred `{integer}`
-    // (a let-bound literal, e.g. LCNF's `let _x := 1`) fail method resolution
-    // (E0689) — no-op when the receiver is already u64. Same trick as `Pow`.
-    Ok(format!(
-        "(({}) as u64).{}({}).expect(\"{}\")",
-        a, method, b, message
-    ))
-}
-
-fn saturating_binop(
-    a: &Expr,
-    b: &Expr,
-    method: &str,
-    params: &[(String, Type)],
-    ctx: &JpContext,
-) -> Result<String, Error> {
-    let a = expr_to_rust(a, params, ctx)?;
-    let b = expr_to_rust(b, params, ctx)?;
-    // See checked_binop: `as u64` pins the receiver for method resolution.
-    Ok(format!("(({}) as u64).{}({})", a, method, b))
-}
-
-fn total_binop(
-    a: &Expr,
-    b: &Expr,
-    op: &str,
-    params: &[(String, Type)],
-    ctx: &JpContext,
-) -> Result<String, Error> {
-    let a = expr_to_rust(a, params, ctx)?;
-    let b = expr_to_rust(b, params, ctx)?;
-    Ok(format!("if ({}) == 0 {{ 0 }} else {{ ({}) {} ({}) }}", b, a, op, b))
-}
-
-fn checked_shift(
-    a: &Expr,
-    b: &Expr,
-    params: &[(String, Type)],
-    ctx: &JpContext,
-) -> Result<String, Error> {
-    let a = expr_to_rust(a, params, ctx)?;
-    let b = expr_to_rust(b, params, ctx)?;
-    Ok(format!(
-        "({}).checked_shl(u32::try_from({}).expect(\"Lean Nat shift amount exceeds u32\")).expect(\"Lean Nat shift overflow\")",
-        a, b
-    ))
-}
-
-fn render_args(
-    args: &[Expr],
-    params: &[(String, Type)],
-    ctx: &JpContext,
-) -> Result<Vec<String>, Error> {
-    args.iter().map(|a| expr_to_rust(a, params, ctx)).collect()
+/// Innermost-first lookup in a builder-mode list environment.
+fn lookup<'m>(env: &[(&'m str, &'m Expr)], name: &str) -> Option<&'m Expr> {
+    env.iter()
+        .rev()
+        .find(|(bound, _)| *bound == name)
+        .map(|(_, value)| *value)
 }
 
 /// The projection-field table (see the module docs): Lean structure
@@ -563,275 +950,4 @@ fn instance_field(type_name: &str, idx: u64) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use prod_ir::parser::parse_module;
-
-    fn generate(ir: &str) -> String {
-        let (_, module) = parse_module(ir).unwrap();
-        generate_module(&module).unwrap()
-    }
-
-    #[test]
-    fn test_generate_class_index() {
-        let ir = r#"
-(module UorAtlas.Kernel
-  (def classIndex ((h2 Nat) (d Nat) (l Nat) (inst Instance)) Nat
-    (add (mul (field inst "stride") h2)
-         (add (mul (field inst "o") d) l)))
-
-  (def belt ((inst Instance)) Nat
-    (mul (call class_count inst)
-         (shl 1 (sub (field inst "o") 1))))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn classIndex(h2: u64, d: u64, l: u64, inst: crate::Instance) -> u64 {\n    ((((inst.stride()) as u64).checked_mul(h2).expect(\"Lean Nat multiplication overflow\")) as u64).checked_add(((((inst.o) as u64).checked_mul(d).expect(\"Lean Nat multiplication overflow\")) as u64).checked_add(l).expect(\"Lean Nat addition overflow\")).expect(\"Lean Nat addition overflow\")\n}\n\npub fn belt(inst: crate::Instance) -> u64 {\n    ((class_count(inst)) as u64).checked_mul((1).checked_shl(u32::try_from(((inst.o) as u64).saturating_sub(1)).expect(\"Lean Nat shift amount exceeds u32\")).expect(\"Lean Nat shift overflow\")).expect(\"Lean Nat multiplication overflow\")\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_match() {
-        let ir = r#"
-(module M
-  (def f ((x Nat)) Nat
-    (cases x
-      (alt "Some" (v) v)
-      (default 0)))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn f(x: u64) -> u64 {\n    match x {\n        Some(v) => v,\n        _ => 0,\n    }\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_list_ctors_and_match() {
-        // Lean List ctors/match: `List.nil`/`List.cons` map to the runtime's
-        // linked list; the cons arm's tail rebinds unboxed.
-        let ir = r#"
-(module M
-  (def digitSum ((xs (List Nat))) Nat
-    (cases xs
-      (alt "List.nil" () 0)
-      (alt "List.cons" (h t) (add h (call digitSum t)))))
-  (def digits ((n Nat)) (List Nat)
-    (if (lt n 8)
-        (ctor "List.cons" n (ctor "List.nil"))
-        (ctor "List.cons" (mod n 8) (call digits (div n 8)))))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn digitSum(xs: crate::List<u64>) -> u64 {\n    match xs {\n        crate::List::Nil => 0,\n        crate::List::Cons(h, t) => { let t = *t; ((h) as u64).checked_add(digitSum(t)).expect(\"Lean Nat addition overflow\") },\n    }\n}\n\npub fn digits(n: u64) -> crate::List<u64> {\n    if (n < 8) { crate::List::Cons(n, Box::new(crate::List::Nil)) } else { crate::List::Cons(if (8) == 0 { 0 } else { (n) % (8) }, Box::new(digits(if (8) == 0 { 0 } else { (n) / (8) }))) }\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_option_and_bool() {
-        // Option/Bool ctors and match arms map to Rust's native types.
-        let ir = r#"
-(module M
-  (def tryDecode ((idx Nat)) (Option Nat)
-    (if (le idx 96) (ctor "Option.some" idx) (ctor "Option.none")))
-  (def fromOpt ((x (Option Nat))) Bool
-    (cases x
-      (alt "Option.some" (v) (ctor "Bool.true"))
-      (alt "Option.none" () (ctor "Bool.false"))))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn tryDecode(idx: u64) -> Option<u64> {\n    if (idx <= 96) { Some(idx) } else { None }\n}\n\npub fn fromOpt(x: Option<u64>) -> bool {\n    match x {\n        Some(v) => true,\n        None => false,\n    }\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_nat_cases_recursion() {
-        // LCNF structural recursion on Nat: `Nat.zero` → literal `0` pattern,
-        // `Nat.succ k` → `_` arm with the predecessor bound via saturating_sub.
-        let ir = r#"
-(module M
-  (def digitCount ((fuel Nat) (n Nat)) Nat
-    (cases fuel
-      (alt "Nat.zero" () 0)
-      (alt "Nat.succ" (k) (if (lt n 8) 1 (add 1 (call digitCount k (div n 8)))))))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn digitCount(fuel: u64, n: u64) -> u64 {\n    match fuel {\n        0 => 0,\n        _ => { let k = (fuel).saturating_sub(1); if (n < 8) { 1 } else { ((1) as u64).checked_add(digitCount(k, if (8) == 0 { 0 } else { (n) / (8) })).expect(\"Lean Nat addition overflow\") } },\n    }\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_ctor_proj() {
-        let ir = r#"
-(module M
-  (def f ((x Nat)) Nat
-    (proj "Pair" 0 (ctor "Pair" x 2)))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn f(x: u64) -> u64 {\n    (Pair(x, 2)).0\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_instance_projection_and_prod_tuple() {
-        let ir = r#"
-(module UorAtlas.Kernel
-  (def decode ((i Instance)) (Tuple Nat (Tuple Nat Nat))
-    (ctor "Prod.mk" (proj "UorAtlas.Instance" 0 i)
-      (ctor "Prod.mk" (proj "UorAtlas.Instance" 2 i) 1)))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn decode(i: crate::Instance) -> (u64, (u64, u64)) {\n    ((i).q, ((i).o, 1))\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_kernel_ir_shapes() {
-        // The exact def shapes prod-export emits for stride and classDecode
-        // (see rust/prod-core/kernel.ir).
-        let ir = r#"
-(module UorAtlas.Kernel
-  (def stride ((i Instance)) Nat
-    (let _x_4 (proj "UorAtlas.Instance" 1 i) (let _x_5 (proj "UorAtlas.Instance" 2 i) (let _x_13 (mul _x_4 _x_5) _x_13))))
-
-  (def classDecode ((idx Nat) (i Instance)) (Tuple Nat (Tuple Nat Nat))
-    (let _x_4 (call stride i) (let h2 (div idx _x_4) (let rem (mod idx _x_4) (let _x_10 (proj "UorAtlas.Instance" 2 i) (let d (div rem _x_10) (let l (mod rem _x_10) (let _x_13 (ctor "Prod.mk" d l) (let _x_14 (ctor "Prod.mk" h2 _x_13) _x_14)))))))))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn stride(i: crate::Instance) -> u64 {\n    { let _x_4 = (i).t; { let _x_5 = (i).o; { let _x_13 = ((_x_4) as u64).checked_mul(_x_5).expect(\"Lean Nat multiplication overflow\"); _x_13 } } }\n}\n\npub fn classDecode(idx: u64, i: crate::Instance) -> (u64, (u64, u64)) {\n    { let _x_4 = stride(i); { let h2 = if (_x_4) == 0 { 0 } else { (idx) / (_x_4) }; { let rem = if (_x_4) == 0 { 0 } else { (idx) % (_x_4) }; { let _x_10 = (i).o; { let d = if (_x_10) == 0 { 0 } else { (rem) / (_x_10) }; { let l = if (_x_10) == 0 { 0 } else { (rem) % (_x_10) }; { let _x_13 = (d, l); { let _x_14 = (h2, _x_13); _x_14 } } } } } } } }\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_unknown_projection_falls_back_to_index() {
-        let ir = r#"
-(module M
-  (def f ((x Nat)) Nat
-    (proj "Unknown.Struct" 3 (ctor "Unknown.Struct" x)))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn f(x: u64) -> u64 {\n    (Unknown.Struct(x)).3\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_zero_param_golden_def() {
-        // The shape prod-export uses for goldens.ir entries.
-        let ir = r#"
-(module UorAtlas.Goldens
-  (def golden_stride_canonical () Nat 24)
-
-  (def golden_classDecode_43_canonical () (Tuple Nat (Tuple Nat Nat))
-    (ctor "Prod.mk" 1 (ctor "Prod.mk" 2 3)))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn golden_stride_canonical() -> u64 {\n    24\n}\n\npub fn golden_classDecode_43_canonical() -> (u64, (u64, u64)) {\n    (1, (2, 3))\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_jp_jmp_inlined() {
-        let ir = r#"
-(module M
-  (def f ((x Nat)) Nat
-    (let g (jp g (a) (add a 1)) (jmp g x)))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn f(x: u64) -> u64 {\n    { let g = /* jp \"g\" inlined at its jump site */ (); { let a = x; ((a) as u64).checked_add(1).expect(\"Lean Nat addition overflow\") } }\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_cyclic_jp_skeleton() {
-        let ir = r#"
-(module M
-  (def f ((x Nat)) Nat
-    (jp loop (i) (if (lt i 10) (jmp loop (add i 1)) i)))
-)
-"#;
-        let out = generate(ir);
-        assert!(out.contains("loop {"));
-        assert!(out.contains("manual port required"));
-    }
-
-    #[test]
-    fn test_generate_pow() {
-        let ir = r#"
-(module M
-  (def belt ((i Nat)) Nat
-    (pow 2 (sub i 1)))
-)
-"#;
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn belt(i: u64) -> u64 {\n    ((2) as u64).checked_pow(u32::try_from(((i) as u64).saturating_sub(1)).expect(\"Lean Nat power exponent exceeds u32\")).expect(\"Lean Nat power overflow\")\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_generate_nat_arithmetic_policy() {
-        let ir = r#"
-(module M
-  (def add ((x Nat) (y Nat)) Nat (add x y))
-  (def sub ((x Nat) (y Nat)) Nat (sub x y))
-  (def div ((x Nat) (y Nat)) Nat (div x y))
-  (def modu ((x Nat) (y Nat)) Nat (mod x y))
-  (def shl ((x Nat) (y Nat)) Nat (shl x y))
-  (def pow ((x Nat) (y Nat)) Nat (pow x y))
-)
-"#;
-        let out = generate(ir);
-        assert!(out.contains("checked_add(y).expect(\"Lean Nat addition overflow\")"));
-        assert!(out.contains("saturating_sub(y)"));
-        assert!(out.contains("if (y) == 0 { 0 } else { (x) / (y) }"));
-        assert!(out.contains("if (y) == 0 { 0 } else { (x) % (y) }"));
-        assert!(out.contains("checked_shl(u32::try_from(y).expect(\"Lean Nat shift amount exceeds u32\")).expect(\"Lean Nat shift overflow\")"));
-        assert!(out.contains("checked_pow(u32::try_from(y).expect(\"Lean Nat power exponent exceeds u32\")).expect(\"Lean Nat power overflow\")"));
-    }
-
-    #[test]
-    fn test_generate_unreachable() {        let ir = "(module M (def f ((x Nat)) Nat (unreachable)))";
-        let out = generate(ir);
-        assert_eq!(
-            out,
-            "pub fn f(x: u64) -> u64 {\n    unreachable!()\n}\n\n"
-        );
-    }
-
-    #[test]
-    fn test_param_out_of_bounds_is_an_error() {
-        let ir = "(module M (def f ((x Nat)) Nat (param 5)))";
-        let (_, module) = parse_module(ir).unwrap();
-        assert_eq!(generate_module(&module), Err(Error::ParamOutOfBounds(5)));
-    }
-}
+mod tests;

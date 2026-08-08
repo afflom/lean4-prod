@@ -183,17 +183,21 @@ def lowerArgs (args : Array (Arg .pure)) : LowerM (Array String) := do
 private def spaced (xs : Array String) : String :=
   if xs.isEmpty then "" else " " ++ String.intercalate " " xs.toList
 
+/-- `.const` operator whitelist as an (LCNF constant name, IR binary op)
+    association list. Single source of truth for both `opWhitelist` (what the
+    lowerer accepts) and `subsetJson` (the published contract, `Prod.Emit`) —
+    extracted so the two cannot drift apart. `pow` was added to prod-ir in M3
+    for `belt`; `shiftRight` maps to `shr`, a total/infallible IR node
+    distinct from `shl` — `a >>> b = 0` for `b ≥ 64` since `Nat` is unbounded,
+    so there is no overflow case to report. -/
+def natOpNames : List (Name × String) :=
+  [ (`Nat.add, "add"), (`Nat.sub, "sub"), (`Nat.mul, "mul"), (`Nat.div, "div"),
+    (`Nat.mod, "mod"), (`Nat.shiftLeft, "shl"), (`Nat.shiftRight, "shr"),
+    (`Nat.pow, "pow") ]
+
 /-- `.const` operator whitelist: Lean kernel Nat ops → IR binary ops. -/
-def opWhitelist : Name → Option String
-  | `Nat.add => some "add"
-  | `Nat.sub => some "sub"
-  | `Nat.mul => some "mul"
-  | `Nat.div => some "div"
-  | `Nat.mod => some "mod"
-  | `Nat.shiftLeft => some "shl"
-  | `Nat.shiftRight => some "shr"
-  | `Nat.pow => some "pow"
-  | _ => none
+def opWhitelist (n : Name) : Option String :=
+  (natOpNames.find? (fun p => p.1 == n)).map (·.2)
 
 private def isCtorName (env : Environment) (n : Name) : Bool :=
   match env.find? n with
@@ -255,15 +259,20 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     | none => return s!"(call {nm}{spaced args'})"
   | _ => opaqueNode "letvalue"  -- impure-phase-only constructors
 
+/-- The decider constants recognized by `decidableIf?`/`decideOf?`, paired
+    with their IR comparison operator. Single source of truth for both
+    `deciderOp` and `subsetJson` (`Prod.Emit`), so the published contract
+    cannot list a decider the lowerer does not actually accept, or omit one
+    it does. `instDecidableEqNat` appears in LCNF when the instance wrapper
+    is not unfolded (unlike the arithmetic dictionaries). -/
+def deciderNames : List (Name × String) :=
+  [ (``Nat.decLt, "lt"), (``Nat.decLe, "le"), (``Nat.decEq, "eq"),
+    (``instDecidableEqNat, "eq") ]
+
 /-- The decider constants recognized by `decidableIf?`, mapped to their IR
-    comparison operator. `instDecidableEqNat` appears in LCNF when the
-    instance wrapper is not unfolded (unlike the arithmetic dictionaries). -/
-def deciderOp : Name → Option String
-  | ``Nat.decLt => some "lt"
-  | ``Nat.decLe => some "le"
-  | ``Nat.decEq => some "eq"
-  | ``instDecidableEqNat => some "eq"
-  | _ => none
+    comparison operator. -/
+def deciderOp (n : Name) : Option String :=
+  (deciderNames.find? (fun p => p.1 == n)).map (·.2)
 
 /-- Recognize the LCNF shape of `if a < b then T else F` (and the `≤`/`=`
     analogues): `let c := <decider> a b` immediately followed by `cases c`

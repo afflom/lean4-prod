@@ -39,6 +39,36 @@ def conformanceModule : Name := `Conformance
 /-- IR module name for the conformance export. -/
 def conformanceIrModule : String := "Conformance"
 
+/-! ## Published subset contract
+
+Machine-readable description of the Lean-side lowering surface, consumed by
+`prod subset` to render `specs/lean-for-production.md`. Hand-rolled JSON, no
+dependencies, matching how `rootsJson` is built. The operator and decider
+lists are derived from `natOpNames`/`deciderNames` (`Prod.Lower`) — the same
+association lists `opWhitelist`/`deciderOp` consume to decide what actually
+lowers — so the published contract cannot describe more, or less, than the
+lowerer accepts. -/
+
+/-- Machine-readable description of what `Lower.lean` can lower: operators,
+    decidable guards, and the supported type shapes. Consumed by `prod
+    subset` (`prod-cli`), which merges it with codegen's rejection list to
+    render the published contract. -/
+def subsetJson : String :=
+  let ops := natOpNames.map fun p => toString p.1
+  let deciders := deciderNames.map fun p => toString p.1
+  -- `Nat`/`Bool`/`Int`/`Prod`/`List`/`Option` are built into the IR type
+  -- grammar (`lowerType`); anything else is a user inductive, and
+  -- `lowerTypeDecl` supports exactly parameterless, non-recursive,
+  -- single-block inductives with a single constructor (`Prop` fields
+  -- erased) — the only shape the conformance suite exercises
+  -- (`Conformance.MidProp`, `Conformance.NoProp`, `UorAtlas.Instance`).
+  let types := ["Nat", "Bool", "Int", "Prod", "List", "Option",
+                "parameterless, non-recursive, single-constructor structures (Prop fields erased)"]
+  let quoted (xs : List String) : String :=
+    String.intercalate ", " (xs.map fun s => "\"" ++ jsonEscape s ++ "\"")
+  "{\n  \"operators\": [" ++ quoted ops ++ "],\n  \"deciders\": [" ++ quoted deciders ++
+    "],\n  \"types\": [" ++ quoted types ++ "]\n}\n"
+
 /-- Rendered `(type ...)` declarations for every inductive reachable from the
     extracted definitions' signatures, deduplicated and in sorted order. -/
 def collectTypeDecls (ctx : LowerCtx) (extracted : Array ExtractedDef)
@@ -196,16 +226,17 @@ unsafe def main (args : List String) : IO Unit := do
     | Except.ok (Except.ok outputs, _st) => pure outputs
     | Except.ok (Except.error msg, _st) => throw (IO.userError s!"prod-export failed: {msg}")
     | Except.error _ => throw (IO.userError "prod-export failed: uncaught exception")
-  let (irPath, rootsPath, covPath, goldensPath, confPath) := match parseOutDir args with
+  let (irPath, rootsPath, covPath, goldensPath, confPath, subsetPath) := match parseOutDir args with
     | some dir =>
       (dir / "kernel.ir", dir / "roots.json", dir / "coverage.md", dir / "goldens.ir",
-       dir / "conformance-golden.ir")
+       dir / "conformance-golden.ir", dir / "subset.json")
     | none =>
       ("../rust/prod-core/kernel.ir", "../roots.json", "../coverage.md",
-       "../rust/prod-core/goldens.ir", "Conformance/golden.ir")
+       "../rust/prod-core/goldens.ir", "Conformance/golden.ir", "../subset.json")
   IO.FS.writeFile irPath ir
   IO.FS.writeFile rootsPath roots
   IO.FS.writeFile covPath coverage
   IO.FS.writeFile goldensPath Prod.emitGoldensIr
   IO.FS.writeFile confPath confIr
-  IO.println s!"prod-export: wrote {irPath}, {rootsPath}, {covPath}, {goldensPath}, {confPath}"
+  IO.FS.writeFile subsetPath Prod.subsetJson
+  IO.println s!"prod-export: wrote {irPath}, {rootsPath}, {covPath}, {goldensPath}, {confPath}, {subsetPath}"

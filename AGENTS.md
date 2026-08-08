@@ -50,7 +50,14 @@ What that means in practice, and what you must not regress:
 - NO mathlib. Pure Lean 4 core/Init; `decide`/`omega`/`rfl` discipline.
 - NO `sorry`, NO `axiom` in anything claimed as proved.
 - Nothing hand-written downstream of Lean: kernel.ir/goldens.ir/roots.json/
-  coverage.md are generated artifacts (gitignored). Never edit them by hand.
+  coverage.md/subset.json are generated artifacts (gitignored). Never edit
+  them by hand. Two generated artifacts ARE committed, precisely so a
+  drifted regeneration shows up as a reviewable diff instead of silently not
+  existing: `lean/Conformance/golden.ir` (pinned by `just conformance`,
+  rewritten and accepted with `just conformance-bless` — review the diff
+  first) and `specs/lean-for-production.md` (pinned by `just subset-check`,
+  part of `just prod`; there is no bless step, just rerun `just subset` and
+  review+commit the diff). Never hand-edit either.
 - The old repo at `~/work/rust/mine/lean-four-prod/` is READ-ONLY reference.
 - No `git add`/`git commit`/other git mutations without the user's explicit go-ahead.
 - Verify gates below must actually pass before claiming a milestone done.
@@ -146,6 +153,41 @@ What that means in practice, and what you must not regress:
     and it can sit under a `?`.
   - `prod-ir`'s `parse_i64` parses the magnitude as `i128` before narrowing;
     the old `digits.parse::<i64>().unwrap()` panicked on `i64::MIN`.
+
+- S0/S1 (coverage roadmap, `specs/designs/2026-08-08-lean-for-production-coverage.md`)
+  DONE: the honest boundary and generated types. What changed since M0–M6
+  above:
+  - `UorAtlas.Instance` is no longer a special-cased IR type; it is an
+    ordinary generated type like `Conformance.MidProp`/`NoProp`. `coordinate.rs`
+    (the old hand-written `Instance` struct) is deleted; the struct comes
+    entirely from `(type ...)` declarations in `kernel.ir`.
+  - Structure projections carry the field name (`(proj "Full.TypeName"
+    "fieldName" x)`), not a bare index — `Lower.lean` resolves the LCNF
+    projection index to the declared field name once, where `getStructureFields`
+    is available, so codegen never keeps a second, potentially-disagreeing
+    index table.
+  - Unresolved calls (`Error::UnresolvedCall`) and opaque types
+    (`Error::OpaqueType`) are hard codegen errors now, not silently rendered
+    as best-effort calls/opaque markers. A callee that is neither
+    `@[prod]`-tagged nor a whitelisted operator, or a type codegen cannot
+    describe, fails the build instead of shipping something unreviewed.
+  - `Nat.shiftRight` lowers to a real, total/infallible `shr` IR node (not an
+    expansion to div/pow); see `Lower.lean`'s module doc comment for why it
+    never overflows.
+  - The published subset contract (`specs/lean-for-production.md`, generated
+    by `just subset` from `subset.json` + `prod_codegen::REJECTIONS`) and the
+    conformance golden (`lean/Conformance/golden.ir`) are the project's two
+    committed generated artifacts — see the "Rules (hard)" section above for
+    their bless/regenerate workflows. The operator whitelist
+    (`Prod.natOpNames`) and decider list (`Prod.deciderNames`) in `Lower.lean`
+    are each a single association list consumed by both the lowerer
+    (`opWhitelist`/`deciderOp`) and the exporter (`subsetJson`), so the
+    contract cannot list an operator/decider the lowerer does not actually
+    accept, or omit one it does.
+  - One documented, deliberate gap: `Prop` fields (e.g. `Instance.valid : q
+    ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1`) are erased on export, so the generated Rust struct
+    does not enforce the invariant its Lean source states — see the "Erased
+    invariants" note in `specs/lean-for-production.md`.
 
 Known remaining limitations: typed Lean `Int` semantics is NOT implemented
 (generated Nat is u64 with the bounded policy: checked add/mul/shl/pow,

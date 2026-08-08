@@ -184,6 +184,58 @@ impl fmt::Display for Error {
     }
 }
 
+/// The rejections the generator makes, for the published subset contract
+/// (`prod subset`, `specs/lean-for-production.md`). One entry per `Error`
+/// variant, in declaration order; keep in step with `Error` above — the
+/// contract is rendered from this list, so a variant missing here is a
+/// rejection the published contract silently fails to disclose.
+pub const REJECTIONS: &[(&str, &str)] = &[
+    (
+        "OpaqueExpr",
+        "an expression with no Rust rendering",
+    ),
+    (
+        "ParamOutOfBounds",
+        "a parameter index outside the definition's parameter list",
+    ),
+    (
+        "UnsupportedList",
+        "a list value outside a supported position: nested inside another type, or used as an intermediate value rather than a slice parameter/output buffer",
+    ),
+    (
+        "HeapType",
+        "a type that would require a heap allocation in generated code",
+    ),
+    (
+        "RecursiveType",
+        "an inductive refers to itself (directly, or through one level of indirection); needs the tier-1 memory profile",
+    ),
+    (
+        "PolymorphicType",
+        "an inductive has type parameters; monomorphization is not implemented",
+    ),
+    (
+        "UnsupportedFieldType",
+        "a field type not allowed in an allocation-free generated type (e.g. a list or vector field, which would need owned storage)",
+    ),
+    (
+        "DuplicateTypeName",
+        "two Lean types share a last name component, so they would collide in Rust",
+    ),
+    (
+        "OpaqueType",
+        "a type reached codegen with no Rust rendering",
+    ),
+    (
+        "UnresolvedCall",
+        "the callee is neither @[prod]-tagged nor a whitelisted operator, so there is nothing to call",
+    ),
+    (
+        "UnknownField",
+        "a projection names a field the declared type does not have",
+    ),
+];
+
 /// How a generated definition presents itself to its callers.
 ///
 /// Computed for the whole module up front, because a call site cannot know

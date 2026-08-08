@@ -13,6 +13,13 @@ namespace Conformance
 @[prod] def c_nat_div (a b : Nat) : Nat := a / b
 @[prod] def c_nat_mod (a b : Nat) : Nat := a % b
 @[prod] def c_nat_pow (a b : Nat) : Nat := a ^ b
+-- `shiftRight` also reaches lowering via `c_nat_rec`/`c_list_build`'s `n / 2`
+-- peephole below, but that is an indirect witness; these two are the direct
+-- `<<</>>>` analogue of the six ops above, so the published subset contract
+-- (`specs/lean-for-production.md`) can claim both operators on the strength
+-- of a dedicated conformance case, not just the operator whitelist.
+@[prod] def c_nat_shl (a b : Nat) : Nat := a <<< b
+@[prod] def c_nat_shr (a b : Nat) : Nat := a >>> b
 
 @[prod] def c_guard_lt (a b : Nat) : Nat := if a < b then 1 else 0
 @[prod] def c_guard_le (a b : Nat) : Nat := if a ≤ b then 1 else 0

@@ -5,6 +5,10 @@
 
   (type "Conformance.NoProp" (ctor "Conformance.NoProp.mk" (alpha Nat) (beta Nat)))
 
+  ;; full: Conformance.c_nat_shl
+  (def c_nat_shl ((a Nat) (b Nat)) Nat
+    (let _x_11 (shl a b) _x_11))
+
   ;; full: Conformance.c_guard_le
   (def c_guard_le ((a Nat) (b Nat)) Nat
     (if (le a b) (let _x_7 1 _x_7) (let _x_3 0 _x_3)))
@@ -77,4 +81,8 @@
   ;; full: Conformance.c_guard_eq
   (def c_guard_eq ((a Nat) (b Nat)) Nat
     (if (eq a b) (let _x_7 1 _x_7) (let _x_3 0 _x_3)))
+
+  ;; full: Conformance.c_nat_shr
+  (def c_nat_shr ((a Nat) (b Nat)) Nat
+    (let _x_11 (shr a b) _x_11))
 )

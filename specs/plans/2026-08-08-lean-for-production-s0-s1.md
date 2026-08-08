@@ -1531,8 +1531,27 @@ In `render_value_leaf`'s `Expr::Ctor` arm, check the table *before* the existing
 In `render_match`, before the final fallback arms, add a table-driven case. The alt's binders are positional, so zip them against the declared field names:
 
 ```rust
+                // A declared constructor whose binder count disagrees with its
+                // declared field count is an error, symmetric with the
+                // construction side. Amended mid-execution: this originally
+                // fell through to the positional fallback, which emits
+                // `M.Shape.circle(r, extra)` — a dotted name used as a Rust
+                // path, which does not compile. A milestone whose thesis is
+                // "reject precisely rather than emit code that cannot compile"
+                // cannot keep a path that does exactly that. An UNDECLARED
+                // constructor still falls through untouched: that is how
+                // `Nat.succ`, the List slice patterns, and the Bool/Option
+                // arms continue to work.
                 _ => match self.ctor_decl(&alt.ctor) {
-                    Some((decl, cdecl)) if alt.binders.len() == cdecl.fields.len() => {
+                    Some((_, cdecl)) if alt.binders.len() != cdecl.fields.len() => {
+                        return Err(Error::UnsupportedFieldType(format!(
+                            "`{}` declares {} field(s) but the match arm binds {}",
+                            alt.ctor,
+                            cdecl.fields.len(),
+                            alt.binders.len()
+                        )))
+                    }
+                    Some((decl, cdecl)) => {
                         let path = if decl.ctors.len() == 1 {
                             format!("crate::{}", rust_ident(last_component(&decl.name)))
                         } else {

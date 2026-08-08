@@ -645,3 +645,38 @@ fn test_cases_alt_on_an_undeclared_ctor_still_falls_through() {
     let out = generate(ir);
     assert!(out.contains("Foo.Bar(a, b) => "));
 }
+
+#[test]
+fn test_opaque_type_is_rejected_not_injected() {
+    // Previously rendered the raw Lean name as a Rust type, which exploded
+    // inside syn::parse_str with an error pointing nowhere near the cause.
+    let ir = r#"(module M (def f ((x (opaque "Foo.Bar"))) Nat 0))"#;
+    assert_eq!(generate_err(ir), Error::OpaqueType("Foo.Bar".to_string()));
+}
+
+#[test]
+fn test_projection_of_an_undeclared_field_is_rejected() {
+    // A projection must name a field its type actually declares. Without this,
+    // a declaration and a projection can disagree inside one IR file and still
+    // compile, as long as something else supplies a type with the other
+    // spelling.
+    let ir = r#"
+(module M
+  (type "M.Rec" (ctor "M.Rec.mk" (alpha Nat)))
+  (def f ((r (named "M.Rec"))) Nat (proj "M.Rec" "beta" r)))
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::UnknownField("M.Rec".to_string(), "beta".to_string())
+    );
+}
+
+#[test]
+fn test_projection_of_a_declared_field_still_renders() {
+    let ir = r#"
+(module M
+  (type "M.Rec" (ctor "M.Rec.mk" (alpha Nat)))
+  (def f ((r (named "M.Rec"))) Nat (proj "M.Rec" "alpha" r)))
+"#;
+    assert!(generate(ir).contains("(r).alpha"));
+}

@@ -137,6 +137,9 @@ pub enum Error {
     OpaqueType(String),
     /// The exporter could not resolve a callee to a generated definition.
     UnresolvedCall(String),
+    /// A projection names a field the declared type does not have. Catches a
+    /// declaration and a projection disagreeing within one IR file.
+    UnknownField(String, String),
 }
 
 impl fmt::Display for Error {
@@ -174,6 +177,9 @@ impl fmt::Display for Error {
                 "`{}` is neither @[prod]-tagged nor a whitelisted operator, so there is nothing to call",
                 s
             ),
+            Error::UnknownField(ty, field) => {
+                write!(f, "type `{}` declares no field `{}`", ty, field)
+            }
         }
     }
 }
@@ -509,7 +515,7 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
             }
             format!("({})", rendered.join(", "))
         }
-        Type::Opaque(s) => s.clone(),
+        Type::Opaque(s) => return Err(Error::OpaqueType(s.clone())),
         // Lists are only renderable at the top level of a parameter or return
         // type, where the caller supplies the storage.
         Type::List(inner) => {
@@ -953,7 +959,18 @@ impl<'m> Renderer<'_, 'm> {
                     Ok(format!("{}({})", name, args.join(", ")))
                 }
             }
-            Expr::Proj(_, field, e) => Ok(format!("({}).{}", self.value(e)?, rust_ident(field))),
+            Expr::Proj(ty, field, e) => {
+                if let Some(decl) = self.types.get(ty.as_str()) {
+                    let declared = decl
+                        .ctors
+                        .iter()
+                        .any(|c| c.fields.iter().any(|(name, _)| name == field));
+                    if !declared {
+                        return Err(Error::UnknownField(ty.clone(), field.clone()));
+                    }
+                }
+                Ok(format!("({}).{}", self.value(e)?, rust_ident(field)))
+            }
             Expr::Jp { name, body, .. } => {
                 if self.ctx.jmp_count(name) == 0 {
                     // No jump sites: the declaration is just a block.

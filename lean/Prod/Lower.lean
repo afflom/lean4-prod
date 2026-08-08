@@ -18,23 +18,22 @@ corresponding IR nodes. Design decisions:
   counted in `LowerState.dropped` so the caller can emit an arity note.
   `let` bindings with `LetValue.erased` values (proofs) register their binder
   name but emit no binding and no opaque marker — proofs are erased by design.
-- **Operator whitelist**: `Nat.add/sub/mul/div/mod/shiftLeft/pow` map to the
-  IR binary ops (`pow` was added to prod-ir in M3 for `belt`). `Nat.shiftRight`
-  is handled separately (see below): LCNF rewrites `n / 2` into it before
-  lowering ever sees a whitelistable name. Any other constant becomes an
-  *unresolved call*: if the callee is `@[prod]`-tagged it is `(call
-  <last-component> ...)`, otherwise it is recorded for the coverage report
-  and emitted as `(extern "Full.Name" ...)` — a node codegen refuses, rather
-  than a `call` to a function nobody generated.
+- **Operator whitelist**: `Nat.add/sub/mul/div/mod/shiftLeft/shiftRight/pow`
+  map to the IR binary ops (`pow` was added to prod-ir in M3 for `belt`;
+  `shiftRight` maps to `shr`, a total/infallible IR node distinct from `shl`
+  — `a >>> b = 0` for `b ≥ 64` since `Nat` is unbounded, so there is no
+  overflow case to report). `Nat.shiftRight` reaches lowering both from `>>>`
+  written directly and from LCNF's `n / 2` peephole (division by a
+  power-of-two literal); either way it is just another whitelisted name by
+  the time lowering sees it. Any other constant becomes an *unresolved
+  call*: if the callee is `@[prod]`-tagged it is `(call <last-component>
+  ...)`, otherwise it is recorded for the coverage report and emitted as
+  `(extern "Full.Name" ...)` — a node codegen refuses, rather than a `call`
+  to a function nobody generated.
 - **Constructors** (detected via the environment, e.g. `Prod.mk`) become
   `(ctor "Full.Name" ...)`; structure projections resolve their LCNF index to
   the declared field name here, where the environment is available, and
   become `(proj "Full.TypeName" "fieldName" x)`.
-- **`Nat.shiftRight`**: has no source-level spelling (it only appears via the
-  `n / 2` peephole rewrite above), so it cannot be whitelisted by name in the
-  usual sense; instead `a >>> b = a / 2 ^ b` is expanded directly into the
-  already-supported `(div a (pow 2 b))`, rather than adding a dedicated
-  shift-right IR primitive to name one rewrite.
 - **Decidable-if rewrite**: `if a < b then T else F` (and the `≤`/`=`
   analogues) compiles to `let c := Nat.decLt/Nat.decLe/Nat.decEq/
   instDecidableEqNat a b` followed by `cases c` over `Decidable.isFalse`/
@@ -192,6 +191,7 @@ def opWhitelist : Name → Option String
   | `Nat.div => some "div"
   | `Nat.mod => some "mod"
   | `Nat.shiftLeft => some "shl"
+  | `Nat.shiftRight => some "shr"
   | `Nat.pow => some "pow"
   | _ => none
 
@@ -228,13 +228,6 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     let args' ← lowerArgs args
     if isCtorName env declName then
       return s!"(ctor \"{declName}\"{spaced args'})"
-    if declName == ``Nat.shiftRight && args'.size == 2 then
-      -- `Nat.shiftRight a b = a / 2 ^ b`. LCNF rewrites `n / 2` (division by a
-      -- power-of-two literal) into this before we ever see it, so there is no
-      -- source-level spelling to whitelist against; expressed with the
-      -- already-supported `div`/`pow` IR nodes instead of adding a dedicated
-      -- shift-right primitive purely to name this one rewrite.
-      return s!"(div {args'[0]!} (pow 2 {args'[1]!}))"
     match opWhitelist declName with
     | some op =>
       if args'.size == 2 then

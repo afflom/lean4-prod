@@ -384,6 +384,43 @@ fn test_generate_pow() {
 }
 
 #[test]
+fn test_generate_shr() {
+    // `Nat.shiftRight` is total and infallible (Lean's `Nat` is unbounded, so
+    // `a >>> b = 0` once `b >= 64` and `a` fits `u64`): no `ComputeError`
+    // variant, no `?`, just `checked_shr(..).unwrap_or(0)`.
+    let ir = r#"
+(module M
+  (def half ((n Nat) (k Nat)) Nat
+    (shr n k))
+)
+"#;
+    let out = generate(ir);
+    assert_eq!(
+        out,
+        "pub fn half(n: u64, k: u64) -> u64 {\n    ((n) as u64).checked_shr(u32::try_from(k).unwrap_or(u32::MAX)).unwrap_or(0)\n}\n\n"
+    );
+}
+
+#[test]
+fn test_generate_decide_unwrapped_comparison_is_a_plain_bool() {
+    // Mirrors the IR shape `lean/Prod/Lower.lean`'s `decideOf?` produces for
+    // `Conformance.c_bool` (`a < b : Bool`, not consumed by an `if`): a
+    // decidable comparison bound directly to a `Bool`-typed `let` renders as
+    // a plain Rust comparison, never round-tripping through `Decidable`.
+    let ir = r#"
+(module M
+  (def c_bool ((a Nat) (b Nat)) Bool
+    (let x (lt a b) x))
+)
+"#;
+    let out = generate(ir);
+    assert_eq!(
+        out,
+        "pub fn c_bool(a: u64, b: u64) -> bool {\n    { let x = (a < b); x }\n}\n\n"
+    );
+}
+
+#[test]
 fn test_generate_nat_arithmetic_policy_never_panics() {
     let ir = r#"
 (module M

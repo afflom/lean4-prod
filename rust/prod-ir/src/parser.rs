@@ -15,6 +15,7 @@
 //! expr     ::= nat | ident | "(" "param" nat ")" | "(" "field" expr ident ")"
 //!            | "(" "add" expr expr ")" | "(" "sub" expr expr ")" | "(" "mul" expr expr ")"
 //!            | "(" "div" expr expr ")" | "(" "mod" expr expr ")" | "(" "shl" expr expr ")"
+//!            | "(" "shr" expr expr ")"
 //!            | "(" "pow" expr expr ")" | "(" "opaque" '"' ident '"' ")"
 //!            | "(" "eq" expr expr ")" | "(" "lt" expr expr ")" | "(" "le" expr expr ")"
 //!            | "(" "gt" expr expr ")" | "(" "if" expr expr expr ")" | "(" "let" ident expr expr ")"
@@ -229,6 +230,10 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                 map(
                     tuple((tag("shl"), ws(parse_expr), ws(parse_expr))),
                     |(_, a, b)| Expr::Shl(Box::new(a), Box::new(b)),
+                ),
+                map(
+                    tuple((tag("shr"), ws(parse_expr), ws(parse_expr))),
+                    |(_, a, b)| Expr::Shr(Box::new(a), Box::new(b)),
                 ),
                 map(
                     tuple((tag("pow"), ws(parse_expr), ws(parse_expr))),
@@ -592,6 +597,13 @@ mod tests {
         let (rest, expr) = parse_expr("(unreachable)").unwrap();
         assert!(rest.is_empty());
         assert_eq!(expr, Expr::Unreachable);
+    }
+
+    #[test]
+    fn test_parse_shr() {
+        let (rest, expr) = parse_expr("(shr n 1)").unwrap();
+        assert!(rest.is_empty());
+        assert!(matches!(expr, Expr::Shr(..)));
     }
 
     #[test]

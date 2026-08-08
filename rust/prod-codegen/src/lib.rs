@@ -648,6 +648,7 @@ fn children(expr: &Expr) -> impl Iterator<Item = &Expr> {
         | Expr::Div(a, b)
         | Expr::Mod(a, b)
         | Expr::Shl(a, b)
+        | Expr::Shr(a, b)
         | Expr::Pow(a, b)
         | Expr::Eq(a, b)
         | Expr::Lt(a, b)
@@ -888,6 +889,18 @@ impl<'m> Renderer<'_, 'm> {
                 "ShiftExponentTooLarge",
                 "ShiftOverflow",
             ),
+            // Unlike `Shl`, `Nat.shiftRight` is total and infallible: Lean's
+            // `Nat` is unbounded, so `a >>> b = 0` for any `b >= 64` once `a`
+            // fits `u64`. `checked_shr` already returns `None` exactly there
+            // (and for `b >= 2^32`, via the `try_from` fallback to
+            // `u32::MAX`), so `unwrap_or(0)` is the exact answer, not a
+            // fallback for a real error — there is no `ComputeError` variant
+            // for this because none is needed.
+            Expr::Shr(a, b) => Ok(format!(
+                "(({}) as u64).checked_shr(u32::try_from({}).unwrap_or(u32::MAX)).unwrap_or(0)",
+                self.value(a)?,
+                self.value(b)?
+            )),
             Expr::Pow(a, b) => {
                 self.checked_exponent_op(a, b, "checked_pow", "PowExponentTooLarge", "PowOverflow")
             }

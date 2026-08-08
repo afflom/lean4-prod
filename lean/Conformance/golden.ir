@@ -37,7 +37,7 @@
 
   ;; full: Conformance.c_nat_rec
   (def c_nat_rec ((fuel Nat) (n Nat)) Nat
-    (cases fuel (alt "Nat.zero" () (let _x_58 0 _x_58)) (alt "Nat.succ" (n_32) (let _x_59 2 (if (lt n _x_59) (let _x_68 1 _x_68) (let _x_62 1 (let _x_63 1 (let _x_64 (call shiftRight n _x_63) (let _x_65 (call c_nat_rec n_32 _x_64) (let _x_66 (add _x_62 _x_65) _x_66))))))))))
+    (cases fuel (alt "Nat.zero" () (let _x_58 0 _x_58)) (alt "Nat.succ" (n_32) (let _x_59 2 (if (lt n _x_59) (let _x_68 1 _x_68) (let _x_62 1 (let _x_63 1 (let _x_64 (div n (pow 2 _x_63)) (let _x_65 (call c_nat_rec n_32 _x_64) (let _x_66 (add _x_62 _x_65) _x_66))))))))))
 
   ;; full: Conformance.c_proj_middle_prop
   ;; arity: 4 erased/type args dropped
@@ -45,9 +45,8 @@
     (let _x_1 (proj "Conformance.MidProp" "first" m) (let _x_2 (proj "Conformance.MidProp" "second" m) (let _x_3 (proj "Conformance.MidProp" "third" m) (let _x_4 (ctor "Prod.mk" _x_2 _x_3) (let _x_5 (ctor "Prod.mk" _x_1 _x_4) _x_5))))))
 
   ;; full: Conformance.c_bool
-  ;; arity: 1 erased/type args dropped
   (def c_bool ((a Nat) (b Nat)) Bool
-    (let _x_1 (call decLt a b) (let _x_2 (call decide _x_1) _x_2)))
+    (let _x_2 (lt a b) _x_2))
 
   ;; full: Conformance.c_tuple
   ;; arity: 2 erased/type args dropped
@@ -69,7 +68,7 @@
   ;; full: Conformance.c_list_build
   ;; arity: 4 erased/type args dropped
   (def c_list_build ((fuel Nat) (n Nat)) (List Nat)
-    (cases fuel (alt "Nat.zero" () (let _x_50 (ctor "List.nil") _x_50)) (alt "Nat.succ" (n_27) (let _x_51 2 (if (lt n _x_51) (let _x_60 (ctor "List.nil") (let _x_61 (ctor "List.cons" n _x_60) _x_61)) (let _x_54 (mod n _x_51) (let _x_55 1 (let _x_56 (call shiftRight n _x_55) (let _x_57 (call c_list_build n_27 _x_56) (let _x_58 (ctor "List.cons" _x_54 _x_57) _x_58))))))))))
+    (cases fuel (alt "Nat.zero" () (let _x_50 (ctor "List.nil") _x_50)) (alt "Nat.succ" (n_27) (let _x_51 2 (if (lt n _x_51) (let _x_60 (ctor "List.nil") (let _x_61 (ctor "List.cons" n _x_60) _x_61)) (let _x_54 (mod n _x_51) (let _x_55 1 (let _x_56 (div n (pow 2 _x_55)) (let _x_57 (call c_list_build n_27 _x_56) (let _x_58 (ctor "List.cons" _x_54 _x_57) _x_58))))))))))
 
   ;; full: Conformance.c_nat_div
   (def c_nat_div ((a Nat) (b Nat)) Nat

@@ -25,6 +25,7 @@
 //!            | "(" "jp" ident "(" ident* ")" expr ")"      ; LCNF join point
 //!            | "(" "jmp" ident expr* ")"                   ; LCNF jump
 //!            | "(" "unreachable" ")"
+//!            | "(" "extern" '"' ident '"' expr* ")"        ; unresolved callee
 //! alt      ::= "(" "alt" '"' ident '"' "(" ident* ")" expr ")"
 //! default  ::= "(" "default" expr ")"
 //! comment  ::= ";;" ... end-of-line                       ; skipped as whitespace
@@ -312,6 +313,10 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                 map(tuple((tag("opaque"), ws(quoted_ident))), |(_, s)| {
                     Expr::Opaque(s)
                 }),
+                map(
+                    tuple((tag("extern"), ws(quoted_ident), many0(ws(parse_expr)))),
+                    |(_, name, args)| Expr::Extern(name, args),
+                ),
             )),
         ))),
         ws(char(')')),
@@ -672,6 +677,19 @@ mod tests {
         let input = r#"(module M (type "M.Unit" (ctor "M.Unit.mk")))"#;
         let (_, module) = parse_module(input).unwrap();
         assert!(module.types[0].ctors[0].fields.is_empty());
+    }
+
+    #[test]
+    fn test_parse_extern() {
+        let (rest, expr) = parse_expr(r#"(extern "Foo.bar" 1 2)"#).unwrap();
+        assert!(rest.is_empty());
+        match expr {
+            Expr::Extern(name, args) => {
+                assert_eq!(name, "Foo.bar");
+                assert_eq!(args.len(), 2);
+            }
+            _ => panic!("Expected Extern, got {:?}", expr),
+        }
     }
 
     #[test]

@@ -19,13 +19,22 @@ corresponding IR nodes. Design decisions:
   `let` bindings with `LetValue.erased` values (proofs) register their binder
   name but emit no binding and no opaque marker — proofs are erased by design.
 - **Operator whitelist**: `Nat.add/sub/mul/div/mod/shiftLeft/pow` map to the
-  IR binary ops (`pow` was added to prod-ir in M3 for `belt`). Any other
-  constant becomes `(call <last-component> ...)`; if the callee is not itself
-  `@[prod]`-tagged it is recorded as an *extern call* for the coverage report.
+  IR binary ops (`pow` was added to prod-ir in M3 for `belt`). `Nat.shiftRight`
+  is handled separately (see below): LCNF rewrites `n / 2` into it before
+  lowering ever sees a whitelistable name. Any other constant becomes an
+  *unresolved call*: if the callee is `@[prod]`-tagged it is `(call
+  <last-component> ...)`, otherwise it is recorded for the coverage report
+  and emitted as `(extern "Full.Name" ...)` — a node codegen refuses, rather
+  than a `call` to a function nobody generated.
 - **Constructors** (detected via the environment, e.g. `Prod.mk`) become
   `(ctor "Full.Name" ...)`; structure projections resolve their LCNF index to
   the declared field name here, where the environment is available, and
   become `(proj "Full.TypeName" "fieldName" x)`.
+- **`Nat.shiftRight`**: has no source-level spelling (it only appears via the
+  `n / 2` peephole rewrite above), so it cannot be whitelisted by name in the
+  usual sense; instead `a >>> b = a / 2 ^ b` is expanded directly into the
+  already-supported `(div a (pow 2 b))`, rather than adding a dedicated
+  shift-right IR primitive to name one rewrite.
 - **Decidable-if rewrite**: `if a < b then T else F` (and the `≤`/`=`
   analogues) compiles to `let c := Nat.decLt/Nat.decLe/Nat.decEq/
   instDecidableEqNat a b` followed by `cases c` over `Decidable.isFalse`/
@@ -34,6 +43,11 @@ corresponding IR nodes. Design decisions:
   as an extern `decLt` call and `Decidable.*` ctor patterns, neither of which
   has a Rust rendering. Only the immediately-bound shape is recognized;
   anything else still lowers as an extern call.
+- **Decidable-as-Bool rewrite**: `a < b : Bool` (no surrounding `if`) compiles
+  to the same decider call followed by `Decidable.decide c` rather than
+  `cases`. Lowered directly to the IR comparison expression `(lt|le|eq a b)`,
+  which is valid outside an `if` too. Same immediately-bound-shape caveat as
+  above; anything else still lowers as an extern call to `decide`.
 - **Closures** (`Code.fun`) lower to `(opaque "<name>-closure")` plus a
   coverage note — closures are phase-2 work. Impure-phase-only constructors
   never occur at the pure phase; wildcard arms keep the matches total.
@@ -214,19 +228,30 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     let args' ← lowerArgs args
     if isCtorName env declName then
       return s!"(ctor \"{declName}\"{spaced args'})"
+    if declName == ``Nat.shiftRight && args'.size == 2 then
+      -- `Nat.shiftRight a b = a / 2 ^ b`. LCNF rewrites `n / 2` (division by a
+      -- power-of-two literal) into this before we ever see it, so there is no
+      -- source-level spelling to whitelist against; expressed with the
+      -- already-supported `div`/`pow` IR nodes instead of adding a dedicated
+      -- shift-right primitive purely to name this one rewrite.
+      return s!"(div {args'[0]!} (pow 2 {args'[1]!}))"
     match opWhitelist declName with
     | some op =>
       if args'.size == 2 then
         return s!"({op} {args'[0]!} {args'[1]!})"
-      -- partial/unusual application of a whitelisted op: keep it callable
+      -- partial/unusual application of a whitelisted op: not a 2-arg operator
+      -- use, and not necessarily `@[prod]`-tagged either, so it is the same
+      -- kind of unresolved callee as the `none` case below.
       modify fun st => { st with externs := st.externs.push s!"{declName} (unusual application)" }
-      return s!"(call {lastComponent declName}{spaced args'})"
+      return s!"(extern \"{declName}\"{spaced args'})"
     | none =>
       if (← read).tagged.contains declName then
         -- internal call to another @[prod]-tagged definition
         return s!"(call {lastComponent declName}{spaced args'})"
       modify fun st => { st with externs := st.externs.push (toString declName) }
-      return s!"(call {lastComponent declName}{spaced args'})"
+      -- Emit a distinct node rather than a `call`: codegen must refuse this,
+      -- not render a Rust call to a function nobody generated.
+      return s!"(extern \"{declName}\"{spaced args'})"
   | .fvar f args => do
     let nm ← lookupFVar f
     let args' ← lowerArgs args
@@ -270,6 +295,24 @@ def decidableIf? (decl : LetDecl .pure) (k : Code .pure)
     | _ => failure
   return (op, a, b, ← else?, ← then?)
 
+/-- Recognize the LCNF shape of a decidable comparison used as a plain `Bool`
+    value (as opposed to the `if`-consuming shape `decidableIf?` handles):
+    `let c := <decider> a b` immediately followed by `let x := Decidable.decide
+    c`. Binds `x` directly to the IR comparison expression, skipping the
+    intermediate decider binding — `Eq`/`Lt`/`Le`/`Gt` are already valid IR
+    expressions outside an `if`, not just inside one. Returns the operator,
+    the compared fvars, the `decide` binding, and its continuation. Only the
+    immediately-bound shape is recognized; anything else still lowers as an
+    extern call to `decide`. -/
+def decideOf? (decl : LetDecl .pure) (k : Code .pure)
+    : Option (String × FVarId × FVarId × LetDecl .pure × Code .pure) := do
+  let .const decider _ #[.fvar a, .fvar b] := decl.value | failure
+  let op ← deciderOp decider
+  let .let decl2 k2 := k | failure
+  let .const ``Decidable.decide _ #[.erased, .fvar f] := decl2.value | failure
+  guard (f == decl.fvarId)
+  return (op, a, b, decl2, k2)
+
 partial def lowerCode : Code .pure → LowerM String
   | .let decl k => do
     let nm ← registerFVar decl.fvarId decl.binderName
@@ -280,6 +323,14 @@ partial def lowerCode : Code .pure → LowerM String
       let else' ← lowerCode elseCode
       let then' ← lowerCode thenCode
       return s!"(if ({op} {a'} {b'}) {then'} {else'})"
+    | none =>
+    match decideOf? decl k with
+    | some (op, a, b, decl2, k2) =>
+      let nm2 ← registerFVar decl2.fvarId decl2.binderName
+      let a' ← lookupFVar a
+      let b' ← lookupFVar b
+      let body ← lowerCode k2
+      return s!"(let {nm2} ({op} {a'} {b'}) {body})"
     | none =>
     match decl.value with
     | .erased =>

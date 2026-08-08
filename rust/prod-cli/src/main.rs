@@ -72,6 +72,66 @@ enum RootCommands {
     },
 }
 
+/// Collect every unresolved callee name reachable from an expression.
+fn collect_externs(expr: &prod_ir::Expr, out: &mut Vec<String>) {
+    if let prod_ir::Expr::Extern(name, _) = expr {
+        out.push(name.clone());
+    }
+    // `prod_ir` does not expose a child iterator, so match the recursive
+    // shapes this command needs to see through.
+    match expr {
+        prod_ir::Expr::Field(e, _) | prod_ir::Expr::Proj(_, _, e) => {
+            collect_externs(e, out);
+        }
+        prod_ir::Expr::Add(a, b)
+        | prod_ir::Expr::Sub(a, b)
+        | prod_ir::Expr::Mul(a, b)
+        | prod_ir::Expr::Div(a, b)
+        | prod_ir::Expr::Mod(a, b)
+        | prod_ir::Expr::Shl(a, b)
+        | prod_ir::Expr::Pow(a, b)
+        | prod_ir::Expr::Eq(a, b)
+        | prod_ir::Expr::Lt(a, b)
+        | prod_ir::Expr::Le(a, b)
+        | prod_ir::Expr::Gt(a, b) => {
+            collect_externs(a, out);
+            collect_externs(b, out);
+        }
+        prod_ir::Expr::Let(_, v, b) => {
+            collect_externs(v, out);
+            collect_externs(b, out);
+        }
+        prod_ir::Expr::If(c, t, f) => {
+            collect_externs(c, out);
+            collect_externs(t, out);
+            collect_externs(f, out);
+        }
+        prod_ir::Expr::Match {
+            scrut,
+            alts,
+            default,
+        } => {
+            collect_externs(scrut, out);
+            for alt in alts {
+                collect_externs(&alt.body, out);
+            }
+            if let Some(d) = default {
+                collect_externs(d, out);
+            }
+        }
+        prod_ir::Expr::Call(_, args)
+        | prod_ir::Expr::Ctor(_, args)
+        | prod_ir::Expr::Jmp(_, args)
+        | prod_ir::Expr::Extern(_, args) => {
+            for a in args {
+                collect_externs(a, out);
+            }
+        }
+        prod_ir::Expr::Jp { body, .. } => collect_externs(body, out),
+        _ => {}
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -130,6 +190,19 @@ fn main() {
                         .collect();
                     if !opaque.is_empty() {
                         println!("⚠ {} definitions contain opaque expressions", opaque.len());
+                    }
+                    let mut unresolved: Vec<String> = Vec::new();
+                    for def in &module.definitions {
+                        collect_externs(&def.body, &mut unresolved);
+                    }
+                    unresolved.sort();
+                    unresolved.dedup();
+                    if !unresolved.is_empty() {
+                        println!("✗ {} unresolved call(s):", unresolved.len());
+                        for name in &unresolved {
+                            println!("    {}", name);
+                        }
+                        std::process::exit(1);
                     }
                 }
                 Err(e) => {

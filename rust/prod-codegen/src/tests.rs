@@ -423,6 +423,17 @@ fn test_param_out_of_bounds_is_an_error() {
 }
 
 #[test]
+fn test_extern_call_is_rejected_not_emitted() {
+    // Before this, an untagged callee still rendered as a plain Rust call to a
+    // function nobody defined, and the failure surfaced far away in rustc.
+    let ir = r#"(module M (def f ((x Nat)) Nat (extern "Foo.helper" x)))"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::UnresolvedCall("Foo.helper".to_string())
+    );
+}
+
+#[test]
 fn test_generate_struct_from_single_ctor_type() {
     let ir = r#"
 (module M

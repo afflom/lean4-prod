@@ -105,6 +105,11 @@ pub enum Expr {
     Unreachable,
     /// Placeholder for unhandled constructs
     Opaque(String),
+    /// A call the exporter could not resolve: the callee is neither
+    /// `@[prod]`-tagged nor on the operator whitelist. Deliberately distinct
+    /// from `Call` so codegen rejects it instead of emitting a Rust call to a
+    /// function that does not exist.
+    Extern(String, Vec<Expr>),
 }
 
 /// One constructor of a generated type: `(ctor "Full.Name.mk" (field Type)...)`.

@@ -135,6 +135,8 @@ pub enum Error {
     DuplicateTypeName(String),
     /// A type reached codegen with no rendering.
     OpaqueType(String),
+    /// The exporter could not resolve a callee to a generated definition.
+    UnresolvedCall(String),
 }
 
 impl fmt::Display for Error {
@@ -167,6 +169,11 @@ impl fmt::Display for Error {
                 write!(f, "two Lean types share the last name component `{}`", s)
             }
             Error::OpaqueType(s) => write!(f, "no Rust rendering for type: {}", s),
+            Error::UnresolvedCall(s) => write!(
+                f,
+                "`{}` is neither @[prod]-tagged nor a whitelisted operator, so there is nothing to call",
+                s
+            ),
         }
     }
 }
@@ -658,7 +665,7 @@ fn children(expr: &Expr) -> impl Iterator<Item = &Expr> {
             out.push(v);
             out.push(b);
         }
-        Expr::Call(_, args) | Expr::Ctor(_, args) | Expr::Jmp(_, args) => {
+        Expr::Call(_, args) | Expr::Ctor(_, args) | Expr::Jmp(_, args) | Expr::Extern(_, args) => {
             out.extend(args.iter());
         }
         Expr::Match {
@@ -833,6 +840,10 @@ impl<'m> Renderer<'_, 'm> {
                 }
             }
 
+            // An unresolved callee: refuse it outright rather than rendering
+            // a call to a function nobody generated, in either mode.
+            Expr::Extern(name, _) => Err(Error::UnresolvedCall(name.clone())),
+
             // Remaining nodes are value-typed; reaching them in builder mode
             // means the IR put a non-list where a list was declared.
             _ => match mode {
@@ -969,7 +980,12 @@ impl<'m> Renderer<'_, 'm> {
             Expr::Unreachable => Ok(String::from("unreachable!()")),
             Expr::Opaque(s) => Err(Error::OpaqueExpr(s.clone())),
             // Handled by `render` before it delegates here.
-            Expr::If(..) | Expr::Let(..) | Expr::Match { .. } | Expr::Var(_) | Expr::Call(..) => {
+            Expr::If(..)
+            | Expr::Let(..)
+            | Expr::Match { .. }
+            | Expr::Var(_)
+            | Expr::Call(..)
+            | Expr::Extern(..) => {
                 unreachable!("control-flow nodes are rendered by `render`")
             }
         }

@@ -414,6 +414,25 @@ fn test_generate_struct_from_single_ctor_type() {
 }
 
 #[test]
+fn test_orphaned_instance_named_type_decl_is_not_codegenned() {
+    // A declared type whose short name is "Instance" but that no definition
+    // (or other type's field) actually references via `(named ...)` would,
+    // if rendered, collide with the hardcoded `Type::Instance` pseudo-type's
+    // own `crate::Instance` target (the hand-written host struct). Until
+    // something in the module references it by name, skip generating it.
+    let ir = r#"
+(module M
+  (type "UorAtlas.Instance"
+    (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
+  (def stride ((i Instance)) Nat (field i "stride"))
+)
+"#;
+    let out = generate(ir);
+    assert!(!out.contains("pub struct Instance"));
+    assert!(out.contains("pub fn stride(i: crate::Instance) -> u64 {"));
+}
+
+#[test]
 fn test_generate_enum_from_multi_ctor_type() {
     let ir = r#"
 (module M

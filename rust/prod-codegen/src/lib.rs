@@ -351,12 +351,49 @@ fn check_field_type(ty: &Type, owner: &str, table: &TypeTable) -> Result<(), Err
     }
 }
 
+/// True if `full_name` occurs as a `Type::Named` reference anywhere in the
+/// module: a definition's parameter/return type, or a field of some type
+/// declaration's constructor.
+fn is_named_type_referenced(module: &Module, full_name: &str) -> bool {
+    fn ty_refs(ty: &Type, full_name: &str) -> bool {
+        match ty {
+            Type::Named(n) => n == full_name,
+            Type::Option(inner) | Type::Vec(inner) | Type::List(inner) => ty_refs(inner, full_name),
+            Type::Tuple(items) => items.iter().any(|t| ty_refs(t, full_name)),
+            _ => false,
+        }
+    }
+    let in_defs = module.definitions.iter().any(|def| {
+        def.params.iter().any(|(_, t)| ty_refs(t, full_name)) || ty_refs(&def.ret, full_name)
+    });
+    in_defs
+        || module.types.iter().any(|decl| {
+            decl.ctors
+                .iter()
+                .any(|ctor| ctor.fields.iter().any(|(_, t)| ty_refs(t, full_name)))
+        })
+}
+
 /// Render a whole module: one `pub fn` per definition.
 pub fn generate_module(module: &Module) -> Result<String, Error> {
     let table = type_table(&module.types)?;
     let shapes = signatures(&module.definitions);
     let mut out = String::new();
     for decl in &module.types {
+        // `Type::Instance` is still a hardcoded pseudo-type that renders
+        // straight to `crate::Instance` — the hand-written, pre-existing
+        // `prod_core::coordinate::Instance` (fields q/t/o) — because nothing
+        // has been rewired yet to reference declared types via `(named ...)`
+        // (a later phase). A type decl whose short name is "Instance" and
+        // that nothing in the module actually references by name would
+        // collide with that reserved slot if codegen'd here, so it is
+        // skipped while orphaned. The moment something references it via
+        // `(named ...)` — as this crate's own tests do — it renders exactly
+        // as before.
+        if last_component(&decl.name) == "Instance" && !is_named_type_referenced(module, &decl.name)
+        {
+            continue;
+        }
         out.push_str(&generate_type_decl(decl, &table)?);
         out.push('\n');
     }

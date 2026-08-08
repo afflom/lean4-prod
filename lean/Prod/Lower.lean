@@ -367,4 +367,61 @@ def indent (n : Nat) (s : String) : String :=
   let pad := String.ofList (List.replicate n ' ')
   String.intercalate "\n" ((s.splitOn "\n").map (pad ++ ·))
 
+/-- Is this expression a `Prop`? Prop-valued structure fields are erased and
+    never reach the IR. Runs in `MetaM` because `isProp` needs the local
+    context machinery. -/
+def isPropType (e : Expr) : LowerM Bool :=
+  liftM (Lean.Meta.MetaM.run' (Lean.Meta.isProp e))
+
+/-- Render one inductive as an IR `(type ...)` declaration, erasing `Prop`
+    fields.
+
+    A type outside the supported fragment is still declared, carrying the
+    reason: codegen then rejects a reference to it by name ("needs
+    monomorphization") instead of reporting a generic unknown type. Returns
+    `none` only when the constant is not an inductive at all. -/
+def lowerTypeDecl (typeName : Name) : LowerM (Option String) := do
+  let env ← getEnv
+  let some (.inductInfo iv) := env.find? typeName | return none
+  let unsupported? : Option String :=
+    if iv.numParams != 0 then some "type parameters"
+    else if iv.numIndices != 0 then some "type indices"
+    else if iv.all.length != 1 then some "mutual inductive block"
+    else if iv.isRec then some "recursive"
+    else none
+  if let some reason := unsupported? then
+    return some s!"(type \"{typeName}\" (unsupported \"{reason}\"))"
+  let mut ctorSexps : Array String := #[]
+  for ctorName in iv.ctors do
+    let some (.ctorInfo cv) := env.find? ctorName | return none
+    -- Walk the constructor telescope past the (zero) type params to reach the
+    -- value fields, pairing each with its declared name.
+    let fieldNames := getStructureFields env typeName
+    let mut fields : Array String := #[]
+    let mut ty := cv.type
+    let mut i := 0
+    while i < cv.numFields do
+      match ty with
+      | .forallE _ fieldTy rest _ =>
+        if !(← isPropType fieldTy) then
+          let nm := match fieldNames[i]? with
+            | some n => sanitize n
+            | none => s!"field_{i}"
+          fields := fields.push s!"({nm} {← lowerType fieldTy})"
+        ty := rest
+        i := i + 1
+      | _ => i := cv.numFields
+    ctorSexps := ctorSexps.push s!"(ctor \"{ctorName}\"{spaced fields})"
+  return some s!"(type \"{typeName}\"{spaced ctorSexps})"
+
+/-- Every named type mentioned in a declaration's parameter or return types.
+    Only the head constant matters — parameterised types are out of scope. -/
+def declTypeNames (d : Decl .pure) : Array Name := Id.run do
+  let mut out : Array Name := #[]
+  for p in d.params do
+    if let .const n _ := p.type.getAppFn then out := out.push n
+  if let .const n _ := (stripForalls d.params.size d.type).getAppFn then
+    out := out.push n
+  return out
+
 end Prod

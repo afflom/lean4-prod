@@ -3,11 +3,22 @@ default:
     @just --list
 
 # Full pipeline: export from Lean, then verify the Rust build against it.
-prod: prod-export test test-assertions no-alloc roots-check
+prod: prod-export conformance test test-assertions no-alloc roots-check
 
 # Export prod from lean
 prod-export:
     cd lean && lake exe prod-export
+
+# The conformance golden pins Lean-side lowering. `prod-export` rewrites it; this
+# fails if the rewrite changed anything, so lowering changes surface as a diff.
+conformance:
+    cd lean && lake exe prod-export
+    git diff --exit-code lean/Conformance/golden.ir
+
+# Accept the current lowering as the new golden. Review the diff before running.
+conformance-bless:
+    cd lean && lake exe prod-export
+    git add lean/Conformance/golden.ir
 
 # Build rust debug
 build:

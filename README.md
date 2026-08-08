@@ -44,6 +44,41 @@ The coverage report (`coverage.md`) classifies every constant in the module
 using Lean's own `Lean.Compiler.LCNF.shouldGenerateCode`, so "covered" means
 what Lean means.
 
+### Generated-code contract
+
+The generated code targets a production standard: **no panic on
+caller-controlled input, and no heap allocation.** Concretely:
+
+- **Memory profile — allocation-free.** `prod-core` has no `extern crate
+  alloc`, so an allocating generated type could not compile. Lean `List α`
+  therefore never becomes an owned list: in parameter position it is `&[α]`
+  (matched with the slice patterns `[]` and `[h, t @ ..]`), and in return
+  position the signature gains a caller-owned `output: &mut [α]` and returns
+  the written prefix length. Zero-argument list goldens are promoted
+  `&'static [α]`. A list value anywhere else is a codegen error, not a silently
+  allocating fallback. `rust/prod-core/tests/no_alloc.rs` certifies this
+  empirically with a counting global allocator (`just no-alloc`).
+- **Error contract.** A definition returns `Result<T, ComputeError>` *only if
+  it can fail* — if its body performs a checked `Nat` operation, calls a
+  definition that does, or fills an output buffer. That is a fixpoint over the
+  module's call graph, so leaf definitions and the goldens keep plain return
+  types. `ComputeError` is a `Copy` C-like enum whose `Display` writes straight
+  into the formatter, so even the error path allocates nothing.
+- **Bounded `Nat`.** `Nat` maps to `u64`: addition, multiplication, shifts, and
+  powers report overflow as an error (including shift/power exponents that do
+  not fit `u32`); subtraction truncates at zero and division/modulo by zero
+  return zero, matching Lean's total operations. Arbitrary-precision `Nat` is
+  ruled out *by* the no-heap rule, not merely unimplemented — bounded `u64` is
+  the deliberate policy.
+- **Bounded recursion.** Generated recursion is structurally bounded by a fuel
+  or data argument (Lean must already have proved termination for LCNF to emit
+  it), so stack depth is a function of the caller's inputs.
+- **Guardrails.** `unsafe_code = "forbid"` workspace-wide (except `prod-wasm`,
+  where `#[wasm_bindgen]` expands to unsafe code, and the test-only
+  `prod-alloc-counter`); `prod-core` additionally denies
+  `clippy::{unwrap_used, expect_used, panic}`. `just test-assertions` reruns
+  the suite optimized with `debug-assertions`/`overflow-checks` on.
+
 ### Honest limits
 
 - Proofs/`Prop`s are erased by design — they are metadata (see `roots.json`),
@@ -53,18 +88,17 @@ what Lean means.
   `coverage.md`.
 - We couple to Lean's internal LCNF API. The toolchain is pinned
   (`leanprover/lean4:v4.30.0`) and CI-gated against API drift.
-- Generated `Nat` code uses bounded `u64`: addition, multiplication, shifts,
-  and powers fail explicitly on overflow (including shift/power exponents that
-  do not fit `u32`); subtraction truncates at zero; and division/modulo by zero
-  return zero. Exact arbitrary-precision `Nat` output is future work.
 - Structural recursion on `Nat` works (LCNF `cases` on `Nat.zero`/`Nat.succ`
-  → Rust match with predecessor binding). Lean `List α` maps to a `(List α)`
-  IR type rendered as `prod_core::List<T>` (linked list: `Nil`/`Cons(head,
-  Box<tail>)`), so list recursion pattern-matches without cloning; `Option α`
-  and `Bool` map to Rust `Option`/`bool`. Decidable `if` guards are rewritten
-  for `<`, `≤`, and `=` on Nat (`Nat.decLt`/`decLe`/`decEq` and the
-  `instDecidableEqNat` wrapper); other decidable guards would surface as
-  extern calls in `coverage.md`.
+  → Rust match with predecessor binding); `Option α` and `Bool` map to Rust
+  `Option`/`bool`. Decidable `if` guards are rewritten for `<`, `≤`, and `=`
+  on Nat (`Nat.decLt`/`decLe`/`decEq` and the `instDecidableEqNat` wrapper);
+  other decidable guards would surface as extern calls in `coverage.md`.
+- Lists only flow in the two supported directions described above. Building a
+  list into an intermediate value, or nesting one inside another type, fails
+  codegen rather than allocating.
+- Data-parallel codegen is not implemented. Generated functions are pure and
+  `Send`/`Sync` by construction, so they are safe to call from a parallel
+  driver, but nothing here spawns work.
 - The wasm package houses the portable half (parse + codegen + roots). The
   Lean extractor itself is native-only.
 

@@ -17,10 +17,33 @@ profiles, no panic on recoverable conditions, checked arithmetic, lint/CI
 discipline):
 https://gist.github.com/auser/c3161f55a8393faa8af5ddda68c6befa
 
-Current generated code does NOT yet comply (overflow `expect()` panics,
-`Box`-linked `List`, missing lint/profile guardrails). The alignment plan is
-documented in `specs/plans/2026-08-06-best-practices-alignment.md` —
-implementation deferred at user request; resume from that file.
+The generated code now complies. The alignment work is recorded in
+`specs/plans/2026-08-06-best-practices-alignment.md` (implemented 2026-08-08).
+What that means in practice, and what you must not regress:
+
+- **No heap in generated code.** `prod-core` has no `extern crate alloc`.
+  Lean `List α` is `&[α]` as a parameter and a caller-owned `output: &mut [α]`
+  buffer as a return; zero-arg list goldens are promoted `&'static [α]`. Any
+  other list position is a deliberate codegen error (`Error::UnsupportedList`),
+  and `Type::Vec` is rejected (`Error::HeapType`). Never "fix" one of those by
+  reintroducing an owned list type.
+- **No panic on caller-controlled input.** Checked `Nat` ops render as
+  `.ok_or(crate::ComputeError::X)?`, never `.expect(..)`. `ComputeError` lives
+  in `prod-core/src/error.rs` and is a `Copy` payload-free enum so the error
+  path allocates nothing either.
+- **Fallibility is a fixpoint, not a blanket.** A def gets
+  `Result<_, ComputeError>` only if it can actually fail; see `Shape` in
+  `prod-codegen`. Do not make it uniform — the goldens must stay infallible.
+- **Guardrails.** `unsafe_code = "forbid"` workspace-wide via
+  `[workspace.lints.rust]`. Two crates opt out on purpose and say so in their
+  manifests: `prod-wasm` (`#[wasm_bindgen]` expands to unsafe) and the
+  test-only `prod-alloc-counter` (holds the one `unsafe impl GlobalAlloc`, so
+  that `prod-core` can forbid unsafe in *all* its targets). `prod-core` also
+  denies `clippy::{unwrap_used, expect_used, panic}`.
+- **Parallelism principles** (nothing parallel is implemented yet; generated
+  fns are pure and `Send`/`Sync` by construction): if data-parallel codegen is
+  added, use bounded workers and a deterministic merge order, no unbounded
+  queues, and canonical output bytes must never depend on thread scheduling.
 
 ## Rules (hard)
 
@@ -97,20 +120,40 @@ implementation deferred at user request; resume from that file.
   `None`/`Some(v)`; `lowerType` handles `Option α`.
 - LISTS work end-to-end too (`UorAtlas.digits : … → List Nat`,
   `UorAtlas.digitSum : List Nat → Nat` in Kernel.lean): prod-ir gained a
-  `(List type)` form (`Type::List`), the Lean lowerer maps `List α` to it,
-  and codegen renders `List.nil`/`List.cons` ctors and match arms onto the
-  hand-maintained runtime type `prod_core::List<T>` (`Nil`/`Cons(T,
-  Box<List<T>>)` — same "runtime type + codegen mapping" pattern as
-  `Instance`; the cons-arm tail rebinds unboxed). List goldens
-  (`digits 10 43 canonical = [3,5]`, `digitSum = 8`) roundtrip in
+  `(List type)` form (`Type::List`) and the Lean lowerer maps `List α` to it.
+  Since the best-practices alignment, codegen renders it WITHOUT a heap —
+  `&[α]` in parameter position, a caller-owned `output: &mut [α]` buffer in
+  return position, `&'static [α]` for zero-arg goldens (see below). List
+  goldens (`digits 10 43 canonical = [3,5]`, `digitSum = 8`) roundtrip in
   macro_generation.rs.
+- BEST-PRACTICES ALIGNMENT done (2026-08-08, plan
+  `specs/plans/2026-08-06-best-practices-alignment.md`). Generated code no
+  longer panics or allocates; see "Goal and engineering standard" above for
+  the invariants. Load-bearing details worth knowing before touching
+  `prod-codegen`:
+  - `Shape` (Value / Fallible / Buffer / StaticList) is computed per module as
+    a least fixpoint over the call graph; call sites append `?` based on the
+    callee's shape, so `generate_def` alone cannot see cross-def fallibility
+    (it analyzes a one-def module).
+  - Builder mode threads an `out` slice expression and a scoped environment of
+    `let`-bound list values. That environment is NOT optional: LCNF emits
+    lists in A-normal form, so `digits`'s cons cells arrive as chains of
+    `let`s, and materializing them would need the heap.
+  - Buffer exhaustion uses `split_first_mut`, not indexing — the generated
+    code has no bounds-check panic path at all.
+  - `Ok::<usize, crate::ComputeError>(0)` for `List.nil` is turbofished on
+    purpose: it is the one builder leaf that constrains neither type parameter
+    and it can sit under a `?`.
+  - `prod-ir`'s `parse_i64` parses the magnitude as `i128` before narrowing;
+    the old `digits.parse::<i64>().unwrap()` panicked on `i64::MIN`.
 
-Known remaining limitations: typed Lean `Int` semantics and arbitrary-precision
-Nat are NOT implemented (generated Nat is u64 with the bounded policy:
-checked add/mul/shl/pow, saturating sub, total div/mod-by-zero). Closures
-(`Code.fun`) still lower to opaque. `cases` on user-defined inductive types
-other than Nat/List/Option/Bool still render ctor names as Rust patterns,
-which only compile if a matching runtime enum exists.
+Known remaining limitations: typed Lean `Int` semantics is NOT implemented
+(generated Nat is u64 with the bounded policy: checked add/mul/shl/pow,
+saturating sub, total div/mod-by-zero). Arbitrary-precision Nat is ruled OUT by
+the no-heap directive, not merely unimplemented. Closures (`Code.fun`) still
+lower to opaque. `cases` on user-defined inductive types other than
+Nat/List/Option/Bool still render ctor names as Rust patterns, which only
+compile if a matching runtime enum exists. No data-parallel codegen.
 
 ## M3 spec — the LCNF extractor (the defensible core)
 

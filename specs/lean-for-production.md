@@ -10,7 +10,7 @@ named error rather than silently mis-compiled.
 
 - `Nat`
 - `Bool`
-- `Int`
+- `Int (renders as i64; no Int operators are whitelisted, so Int arithmetic is rejected as UnresolvedCall)`
 - `Prod`
 - `List`
 - `Option`

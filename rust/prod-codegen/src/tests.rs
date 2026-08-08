@@ -564,3 +564,36 @@ fn test_ctor_arity_mismatch_is_an_error() {
 "#;
     assert!(matches!(generate_err(ir), Error::UnsupportedFieldType(_)));
 }
+
+#[test]
+fn test_cases_alt_arity_mismatch_on_a_declared_ctor_is_an_error() {
+    // The alt names a declared two-field constructor but binds only one
+    // binder. Falling through to the positional fallback would render
+    // `M.Pair.mk(x) => ...` — a dotted name as a Rust path with a
+    // positional pattern, which does not compile. This must be rejected,
+    // symmetric with the construction-side arity check.
+    let ir = r#"
+(module M
+  (type "M.Pair" (ctor "M.Pair.mk" (a Nat) (b Nat)))
+  (def f ((p (named "M.Pair"))) Nat
+    (cases p
+      (alt "M.Pair.mk" (x) x))))
+"#;
+    assert!(matches!(generate_err(ir), Error::UnsupportedFieldType(_)));
+}
+
+#[test]
+fn test_cases_alt_on_an_undeclared_ctor_still_falls_through() {
+    // Regression guard: an alt naming a constructor that is NOT in this
+    // module's type table (not even the same arity check applies) must keep
+    // the existing positional-fallback rendering untouched.
+    let ir = r#"
+(module M
+  (def f ((x Nat)) Nat
+    (cases x
+      (alt "Foo.Bar" (a b) (add a b))
+      (default 0))))
+"#;
+    let out = generate(ir);
+    assert!(out.contains("Foo.Bar(a, b) => "));
+}

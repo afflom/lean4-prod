@@ -1060,10 +1060,25 @@ impl<'m> Renderer<'_, 'm> {
                             format!("        {} {{ {} }} => {},\n", path, bound.join(", "), body)
                         }
                     }
-                    _ if alt.binders.is_empty() => {
+                    // Declared, but the alt's binder count does not match the
+                    // constructor's field count: this must be rejected, not
+                    // rendered. Falling through to the positional arms below
+                    // would emit a dotted name used as a Rust path with
+                    // positional fields — e.g. `M.Shape.circle(r, extra)` —
+                    // which does not compile. Symmetric with the arity check
+                    // on the construction side.
+                    Some((_, cdecl)) => {
+                        return Err(Error::UnsupportedFieldType(format!(
+                            "`{}` takes {} field(s) but got {} binder(s)",
+                            alt.ctor,
+                            cdecl.fields.len(),
+                            alt.binders.len()
+                        )));
+                    }
+                    None if alt.binders.is_empty() => {
                         format!("        {} => {},\n", alt.ctor, body)
                     }
-                    _ => format!(
+                    None => format!(
                         "        {}({}) => {},\n",
                         alt.ctor,
                         alt.binders.join(", "),

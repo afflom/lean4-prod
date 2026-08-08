@@ -71,14 +71,16 @@ def subsetJson : String :=
     "],\n  \"types\": [" ++ quoted types ++ "]\n}\n"
 
 /-- Rendered `(type ...)` declarations for every inductive reachable from the
-    extracted definitions' signatures, deduplicated and in sorted order. -/
+    extracted definitions — from their signatures *and* from the constructor
+    applications and projections in their bodies (`declTypeNames`) —
+    deduplicated and in sorted order. -/
 def collectTypeDecls (ctx : LowerCtx) (extracted : Array ExtractedDef)
     : CoreM (Array String) := do
   let env ← getEnv
   let mut wanted : Array Name := #[]
   for ed in extracted do
     if let some decl := ed.decl? then
-      for n in declTypeNames decl do
+      for n in declTypeNames env decl do
         -- Builtins already have IR types; only user inductives need declaring.
         if n != ``Nat && n != ``Bool && n != ``Int && n != ``Prod
             && n != ``List && n != ``Option && !wanted.contains n then

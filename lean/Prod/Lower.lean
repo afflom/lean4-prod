@@ -482,14 +482,53 @@ def lowerTypeDecl (typeName : Name) : LowerM (Option String) := do
     ctorSexps := ctorSexps.push s!"(ctor \"{ctorName}\"{spaced fields})"
   return some s!"(type \"{typeName}\"{spaced ctorSexps})"
 
-/-- Every named type mentioned in a declaration's parameter or return types.
-    Only the head constant matters — parameterised types are out of scope. -/
-def declTypeNames (d : Decl .pure) : Array Name := Id.run do
+/-- Type names a single LCNF `LetValue` mentions: a constructor application
+    names its inductive, a projection names the structure it projects from.
+    These are exactly the two places `lowerLetValue` emits a full Lean type or
+    constructor name into the IR, so they are exactly the places codegen needs
+    a matching `(type ...)` declaration for. -/
+def letValueTypeNames (env : Environment) (v : LetValue .pure) : Array Name :=
+  match v with
+  | .proj typeName _ _ => #[typeName]
+  | .const declName _ _ =>
+    match env.find? declName with
+    | some (.ctorInfo cv) => #[cv.induct]
+    | _ => #[]
+  | _ => #[]
+
+/-- Every type name constructed or projected anywhere in a definition's body. -/
+partial def codeTypeNames (env : Environment) : Code .pure → Array Name
+  | .let decl k => letValueTypeNames env decl.value ++ codeTypeNames env k
+  | .fun (.mk _ _ _ _ v) k => codeTypeNames env v ++ codeTypeNames env k
+  | .jp (.mk _ _ _ _ v) k => codeTypeNames env v ++ codeTypeNames env k
+  | .cases (.mk _ _ _ alts) =>
+    alts.foldl (init := #[]) fun acc a =>
+      match a with
+      | .alt _ _ c => acc ++ codeTypeNames env c
+      | .default c => acc ++ codeTypeNames env c
+  | _ => #[]
+
+/-- Every named type a declaration needs declared: the head constant of each
+    parameter and return type, **plus** every type its body constructs or
+    projects. Only the head constant matters — parameterised types are out of
+    scope.
+
+    The body half is not an optimization. A definition like
+    `def f (n : Nat) := (NoProp.mk n n).alpha` mentions `NoProp` nowhere in its
+    signature, so a signature-only walk never declares it; codegen then has no
+    declaration to resolve `(ctor "Conformance.NoProp.mk" ...)` against and
+    used to fall through to emitting the dotted Lean name as if it were a Rust
+    path. Declaring body-reachable types is what makes that definition
+    generate real Rust. (Codegen refuses the dotted path outright now too —
+    that is the backstop for IR this function did not produce.) -/
+def declTypeNames (env : Environment) (d : Decl .pure) : Array Name := Id.run do
   let mut out : Array Name := #[]
   for p in d.params do
     if let .const n _ := p.type.getAppFn then out := out.push n
   if let .const n _ := (stripForalls d.params.size d.type).getAppFn then
     out := out.push n
-  return out
+  match d.value with
+  | .code c => return out ++ codeTypeNames env c
+  | _ => return out
 
 end Prod

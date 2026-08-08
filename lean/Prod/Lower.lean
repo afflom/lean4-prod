@@ -25,6 +25,14 @@ corresponding IR nodes. Design decisions:
 - **Constructors** (detected via the environment, e.g. `Prod.mk`) become
   `(ctor "Full.Name" ...)`; structure projections become
   `(proj "Full.TypeName" idx x)`.
+- **Decidable-if rewrite**: `if a < b then T else F` (and the `≤`/`=`
+  analogues) compiles to `let c := Nat.decLt/Nat.decLe/Nat.decEq/
+  instDecidableEqNat a b` followed by `cases c` over `Decidable.isFalse`/
+  `isTrue` (with erased proof-hypothesis binders). Lowered directly to the IR
+  `(if (lt|le|eq a b) T F)`; without this rewrite the scrutinee would surface
+  as an extern `decLt` call and `Decidable.*` ctor patterns, neither of which
+  has a Rust rendering. Only the immediately-bound shape is recognized;
+  anything else still lowers as an extern call.
 - **Closures** (`Code.fun`) lower to `(opaque "<name>-closure")` plus a
   coverage note — closures are phase-2 work. Impure-phase-only constructors
   never occur at the pure phase; wildcard arms keep the matches total.
@@ -215,9 +223,50 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     | none => return s!"(call {nm}{spaced args'})"
   | _ => opaqueNode "letvalue"  -- impure-phase-only constructors
 
+/-- The decider constants recognized by `decidableIf?`, mapped to their IR
+    comparison operator. `instDecidableEqNat` appears in LCNF when the
+    instance wrapper is not unfolded (unlike the arithmetic dictionaries). -/
+def deciderOp : Name → Option String
+  | ``Nat.decLt => some "lt"
+  | ``Nat.decLe => some "le"
+  | ``Nat.decEq => some "eq"
+  | ``instDecidableEqNat => some "eq"
+  | _ => none
+
+/-- Recognize the LCNF shape of `if a < b then T else F` (and the `≤`/`=`
+    analogues): `let c := <decider> a b` immediately followed by `cases c`
+    with exactly the `Decidable.isFalse`/`isTrue` alternatives (either
+    order). Returns the IR comparison operator, the compared fvars, and the
+    (else, then) branch codes. The alternatives' proof-hypothesis binders are
+    dropped by the caller — they are proof-irrelevant and never occur in
+    computational code. -/
+def decidableIf? (decl : LetDecl .pure) (k : Code .pure)
+    : Option (String × FVarId × FVarId × Code .pure × Code .pure) := do
+  let .const decider _ #[.fvar a, .fvar b] := decl.value | failure
+  let op ← deciderOp decider
+  let .cases c := k | failure
+  guard (c.discr == decl.fvarId)
+  if c.alts.size != 2 then failure
+  let mut else? : Option (Code .pure) := none
+  let mut then? : Option (Code .pure) := none
+  for alt in c.alts do
+    match alt with
+    | .alt ``Decidable.isFalse _ code => else? := some code
+    | .alt ``Decidable.isTrue _ code => then? := some code
+    | _ => failure
+  return (op, a, b, ← else?, ← then?)
+
 partial def lowerCode : Code .pure → LowerM String
   | .let decl k => do
     let nm ← registerFVar decl.fvarId decl.binderName
+    match decidableIf? decl k with
+    | some (op, a, b, elseCode, thenCode) =>
+      let a' ← lookupFVar a
+      let b' ← lookupFVar b
+      let else' ← lowerCode elseCode
+      let then' ← lowerCode thenCode
+      return s!"(if ({op} {a'} {b'}) {then'} {else'})"
+    | none =>
     match decl.value with
     | .erased =>
       -- proof/irrelevant binding: register the name (it may occur in erased
@@ -279,6 +328,10 @@ partial def lowerType (e : Expr) : LowerM String := do
     opaqueType n
   | .app (.app (.const ``Prod _) a) b =>
     return s!"(Tuple {← lowerType a} {← lowerType b})"
+  | .app (.const ``List _) a =>
+    return s!"(List {← lowerType a})"
+  | .app (.const ``Option _) a =>
+    return s!"(Option {← lowerType a})"
   | _ =>
     match e.getAppFn with
     | .const n _ =>

@@ -18,6 +18,13 @@ pub struct Root {
     pub dependencies: Vec<String>,
     pub proof_term_size: u64,
     pub kernel_depth: u64,
+    /// Wall time (ns) for re-typechecking the proof term with Lean's kernel,
+    /// measured by the exporter (`Lean.Kernel.check`). Machine-dependent;
+    /// used as the third, relative Pareto objective. Missing in older
+    /// `roots.json` files; serde's default treats it as `0` (when uniformly
+    /// absent, dominance reduces to the old two-objective rule).
+    #[serde(default)]
+    pub check_time_ns: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,7 +144,10 @@ pub fn check(roots: &[Root]) -> CheckReport {
 pub fn dominates(a: &Root, b: &Root) -> bool {
     a.proof_term_size <= b.proof_term_size
         && a.kernel_depth <= b.kernel_depth
-        && (a.proof_term_size < b.proof_term_size || a.kernel_depth < b.kernel_depth)
+        && a.check_time_ns <= b.check_time_ns
+        && (a.proof_term_size < b.proof_term_size
+            || a.kernel_depth < b.kernel_depth
+            || a.check_time_ns < b.check_time_ns)
 }
 
 pub fn pareto_front(roots: &[Root]) -> Vec<usize> {
@@ -189,29 +199,30 @@ pub fn bridges(roots: &[Root]) -> Vec<Bridge> {
 mod tests {
     use super::*;
 
-    fn root(id: &str, deps: &[&str], size: u64, depth: u64) -> Root {
+    fn root(id: &str, deps: &[&str], size: u64, depth: u64, check_time_ns: u64) -> Root {
         Root {
             id: id.into(),
             auto: false,
             dependencies: deps.iter().map(|dep| (*dep).into()).collect(),
             proof_term_size: size,
             kernel_depth: depth,
+            check_time_ns,
         }
     }
 
-    fn auto_root(id: &str, deps: &[&str], size: u64, depth: u64) -> Root {
+    fn auto_root(id: &str, deps: &[&str], size: u64, depth: u64, check_time_ns: u64) -> Root {
         Root {
             auto: true,
-            ..root(id, deps, size, depth)
+            ..root(id, deps, size, depth, check_time_ns)
         }
     }
 
     #[test]
     fn check_detects_cycles_and_duplicate_ids() {
         let roots = vec![
-            root("a", &["b"], 1, 1),
-            root("b", &["a"], 2, 2),
-            root("a", &[], 3, 3),
+            root("a", &["b"], 1, 1, 10),
+            root("b", &["a"], 2, 2, 20),
+            root("a", &[], 3, 3, 30),
         ];
         let report = check(&roots);
         assert!(!report.acyclic);
@@ -222,20 +233,25 @@ mod tests {
     #[test]
     fn pareto_front_filters_dominated_roots() {
         let roots = vec![
-            root("small", &[], 2, 2),
-            root("deep", &[], 1, 4),
-            root("dominated", &[], 3, 3),
+            root("small", &[], 2, 2, 100),
+            root("deep", &[], 1, 4, 50),
+            root("dominated", &[], 3, 3, 300),
+            // Same size/depth as `small`, but slower to re-check: dominated
+            // only through the third (check-time) objective.
+            root("slow_check", &[], 2, 2, 150),
         ];
         assert_eq!(pareto_front(&roots), vec![0, 1]);
         assert!(dominates(&roots[0], &roots[2]));
+        assert!(dominates(&roots[0], &roots[3]));
+        assert!(!dominates(&roots[3], &roots[0]));
     }
 
     #[test]
     fn bridges_use_shared_dependencies_and_skip_direct_edges() {
         let roots = vec![
-            root("a", &["shared"], 1, 1),
-            root("b", &["shared"], 2, 2),
-            root("c", &["a", "b", "shared"], 3, 3),
+            root("a", &["shared"], 1, 1, 10),
+            root("b", &["shared"], 2, 2, 20),
+            root("c", &["a", "b", "shared"], 3, 3, 30),
         ];
         assert_eq!(
             bridges(&roots),
@@ -249,21 +265,24 @@ mod tests {
 
     #[test]
     fn missing_auto_field_defaults_to_false() {
-        // Backward compatibility: old roots.json files have no `auto` field.
+        // Backward compatibility: old roots.json files have no `auto` and no
+        // `check_time_ns` field.
         let json = r#"{"roots":[
             {"id":"UorAtlas.foo","dependencies":[],"proof_term_size":1,"kernel_depth":1},
-            {"id":"UorAtlas.foo.eq_1","auto":true,"dependencies":[],"proof_term_size":2,"kernel_depth":2}
+            {"id":"UorAtlas.foo.eq_1","auto":true,"dependencies":[],"proof_term_size":2,"kernel_depth":2,"check_time_ns":42}
         ]}"#;
         let roots = serde_json::from_str::<RootFile>(json).unwrap().roots;
         assert!(!roots[0].auto);
+        assert_eq!(roots[0].check_time_ns, 0);
         assert!(roots[1].auto);
+        assert_eq!(roots[1].check_time_ns, 42);
     }
 
     #[test]
     fn filter_roots_drops_auto_roots_unless_included() {
         let roots = vec![
-            root("UorAtlas.real", &[], 1, 1),
-            auto_root("UorAtlas.f.eq_1", &[], 2, 2),
+            root("UorAtlas.real", &[], 1, 1, 10),
+            auto_root("UorAtlas.f.eq_1", &[], 2, 2, 20),
         ];
         let filtered = filter_roots(roots.clone(), false);
         assert_eq!(filtered, vec![roots[0].clone()]);
@@ -273,8 +292,8 @@ mod tests {
     #[test]
     fn full_name_ids_are_unique_when_short_names_collide() {
         let roots = vec![
-            root("UorAtlas.f.eq_1", &[], 1, 1),
-            root("UorAtlas.g.eq_1", &[], 1, 1),
+            root("UorAtlas.f.eq_1", &[], 1, 1, 10),
+            root("UorAtlas.g.eq_1", &[], 1, 1, 10),
         ];
         assert!(check(&roots).duplicate_ids.is_empty());
         assert_eq!(short_name(&roots[0].id), short_name(&roots[1].id));

@@ -54,7 +54,7 @@ enum RootCommands {
         #[arg(long)]
         all: bool,
     },
-    /// Print roots on the Pareto front of proof size and kernel depth.
+    /// Print roots on the Pareto front of proof size, kernel depth, and check time.
     Pareto {
         path: String,
         /// Include auto-generated roots (default: hand-written roots only)
@@ -168,11 +168,12 @@ fn main() {
                 for idx in front {
                     let root = &roots[idx];
                     println!(
-                        "  {} [{}] (proof_term_size={}, kernel_depth={})",
+                        "  {} [{}] (proof_term_size={}, kernel_depth={}, check_time_ns={})",
                         roots::short_name(&root.id),
                         root.id,
                         root.proof_term_size,
-                        root.kernel_depth
+                        root.kernel_depth,
+                        root.check_time_ns
                     );
                 }
             }

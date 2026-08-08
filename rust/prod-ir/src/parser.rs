@@ -6,13 +6,13 @@
 //! def      ::= "(" "def" ident "(" param* ")" type expr ")"
 //! param    ::= "(" ident type ")"
 //! type     ::= "Nat" | "Int" | "Bool" | "Instance" | "(" "Option" type ")" | "(" "Vec" type ")"
-//!            | "(" "Tuple" type* ")" | "(" "opaque" '"' ident '"' ")"
+//!            | "(" "List" type ")" | "(" "Tuple" type* ")" | "(" "opaque" '"' ident '"' ")"
 //! expr     ::= nat | ident | "(" "param" nat ")" | "(" "field" expr ident ")"
 //!            | "(" "add" expr expr ")" | "(" "sub" expr expr ")" | "(" "mul" expr expr ")"
 //!            | "(" "div" expr expr ")" | "(" "mod" expr expr ")" | "(" "shl" expr expr ")"
 //!            | "(" "pow" expr expr ")" | "(" "opaque" '"' ident '"' ")"
-//!            | "(" "eq" expr expr ")" | "(" "lt" expr expr ")" | "(" "gt" expr expr ")"
-//!            | "(" "if" expr expr expr ")" | "(" "let" ident expr expr ")"
+//!            | "(" "eq" expr expr ")" | "(" "lt" expr expr ")" | "(" "le" expr expr ")"
+//!            | "(" "gt" expr expr ")" | "(" "if" expr expr expr ")" | "(" "let" ident expr expr ")"
 //!            | "(" "call" ident expr* ")"
 //!            | "(" "cases" expr alt* default? ")"          ; LCNF cases_on
 //!            | "(" "ctor" '"' ident '"' expr* ")"          ; constructor application
@@ -35,7 +35,7 @@ use nom::{
     character::complete::{char, digit1, multispace1},
     combinator::{map, map_res, opt, value},
     multi::many0,
-    sequence::{delimited, preceded, tuple},
+    sequence::{delimited, preceded, terminated, tuple},
     IResult,
 };
 
@@ -95,6 +95,10 @@ fn parse_type(input: &str) -> IResult<&str, Type> {
         map(
             delimited(char('('), tuple((tag("Vec"), parse_type)), char(')')),
             |(_, t)| Type::Vec(Box::new(t)),
+        ),
+        map(
+            delimited(char('('), tuple((tag("List"), parse_type)), char(')')),
+            |(_, t)| Type::List(Box::new(t)),
         ),
         map(
             delimited(
@@ -218,6 +222,13 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                     tuple((tag("lt"), ws(parse_expr), ws(parse_expr))),
                     |(_, a, b)| Expr::Lt(Box::new(a), Box::new(b)),
                 ),
+                map(
+                    // `le` must be delimiter-terminated: bare `tag("le")`
+                    // prefix-matches the `let` keyword and derails the
+                    // enclosing alt (no backtracking reaches `let`).
+                    tuple((terminated(tag("le"), multispace1), ws(parse_expr), ws(parse_expr))),
+                    |(_, a, b)| Expr::Le(Box::new(a), Box::new(b)),
+                ),
             )),
             alt((
                 map(
@@ -321,6 +332,36 @@ mod tests {
     #[test]
     fn test_parse_type_nat() {
         assert_eq!(parse_type("Nat"), Ok(("", Type::Nat)));
+    }
+
+    #[test]
+    fn test_parse_type_list() {
+        assert_eq!(
+            parse_type("(List Nat)"),
+            Ok(("", Type::List(Box::new(Type::Nat))))
+        );
+        assert_eq!(
+            parse_type("(List (Tuple Nat Nat))"),
+            Ok((
+                "",
+                Type::List(Box::new(Type::Tuple(alloc::vec![Type::Nat, Type::Nat])))
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_le() {
+        let (rest, expr) = parse_expr("(le (param 0) 10)").unwrap();
+        assert!(rest.is_empty());
+        assert!(matches!(expr, Expr::Le(_, _)));
+    }
+
+    #[test]
+    fn test_parse_le_does_not_eat_let() {
+        // Regression: bare `tag("le")` prefix-matches `let`.
+        let (rest, expr) = parse_expr("(let x 1 x)").unwrap();
+        assert!(rest.is_empty());
+        assert!(matches!(expr, Expr::Let(_, _, _)));
     }
 
     #[test]

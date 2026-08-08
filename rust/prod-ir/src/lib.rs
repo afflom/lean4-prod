@@ -33,6 +33,10 @@ pub enum Type {
     Instance,
     Option(Box<Type>),
     Vec(Box<Type>),
+    /// Lean `List α` — rendered as the runtime's `crate::List<α>` (linked list,
+    /// `Nil`/`Cons(head, Box<tail>)`), which matches Lean's structure exactly
+    /// and supports structural recursion without cloning.
+    List(Box<Type>),
     Tuple(Vec<Type>),
     /// Unmapped or complex type requiring manual handling
     Opaque(String),
@@ -65,6 +69,7 @@ pub enum Expr {
     Pow(Box<Expr>, Box<Expr>),
     Eq(Box<Expr>, Box<Expr>),
     Lt(Box<Expr>, Box<Expr>),
+    Le(Box<Expr>, Box<Expr>),
     Gt(Box<Expr>, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
     Let(String, Box<Expr>, Box<Expr>),

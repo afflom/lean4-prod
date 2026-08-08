@@ -19,8 +19,14 @@ Every theorem defined by the target module is a *root*. For each root we emit:
 - `proof_term_size` — node count of the proof `Expr` (apps, binders, mdata and
   projections count 1 plus their children; atoms count 1);
 - `kernel_depth` — longest dependency chain through module-own constants,
-  computed over the module's own dependency graph (Lean's kernel guarantees
-  acyclicity, so a memoized fold terminates).
+  computed over the module's own dependency graph. Theorem graphs are DAGs,
+  but recursive definitions self-cycle; back edges to a node on the current
+  DFS stack contribute 0 (longest chain over the cycle-condensed graph);
+- `check_time_ns` — wall time (monotonic clock, nanoseconds) for re-typechecking
+  the proof term with the actual kernel (`Lean.Kernel.check`, empty local
+  context), taken as the minimum over 16 repetitions to suppress µs-scale
+  scheduling noise. Machine-dependent; meaningful only as a *relative* cost
+  signal within one export run. This is the third Pareto objective.
 
 JSON is hand-rolled (no external deps) with minimal string escaping.
 -/
@@ -48,17 +54,25 @@ def ownDepMap (own : Array (Name × ConstantInfo)) : Std.HashMap Name (Array Nam
     | some v => m.insert n (v.getUsedConstants.filter ownNames.contains)
     | none => m.insert n #[]
 
-/-- Longest dependency chain starting at `n`, memoized in `m`.
-    The graph is a DAG (Lean forbids circular definitions). -/
+/-- Longest dependency chain starting at `n`, memoized in `m`, with `visiting`
+    holding the current DFS stack. The graph is a DAG for theorems (Lean proofs
+    cannot self-reference), but recursive DEFINITIONS (e.g. `digitCount`) have
+    self-cycles; a back edge to a node already on the stack contributes 0 —
+    the recursive call is one node in the chain, not infinitely many. This is
+    longest-chain semantics over the cycle-condensed graph. -/
 partial def depthOf (deps : Std.HashMap Name (Array Name)) (m : Std.HashMap Name Nat)
-    (n : Name) : Std.HashMap Name Nat × Nat :=
+    (visiting : Std.HashSet Name) (n : Name)
+    : Std.HashMap Name Nat × Std.HashSet Name × Nat :=
   match m[n]? with
-  | some d => (m, d)
+  | some d => (m, visiting, d)
   | none =>
-    let (m', best) := (deps.getD n #[]).foldl (init := (m, 0)) fun (m, best) d =>
-      let (m', dd) := depthOf deps m d
-      (m', max best (dd + 1))
-    (m'.insert n best, best)
+    if visiting.contains n then (m, visiting, 0)
+    else
+      let (m', visiting', best) := (deps.getD n #[]).foldl
+        (init := (m, visiting.insert n, 0)) fun (m, vis, best) d =>
+          let (m', vis', dd) := depthOf deps m vis d
+          (m', vis', max best (dd + 1))
+      (m'.insert n best, visiting'.erase n, best)
 
 /-- One proof root. -/
 structure RootInfo where
@@ -67,6 +81,7 @@ structure RootInfo where
   dependencies : Array Name
   size : Nat
   depth : Nat
+  checkTimeNs : Nat
 
 /-- String components of a name (numeric components skipped; order irrelevant
     for the checks below). -/
@@ -99,8 +114,31 @@ def isAutoRoot (inductives : Std.HashSet Name) (n : Name) : Bool :=
     (c.length > 3 && c.startsWith "eq_" && (c.drop 3).all Char.isDigit)) ||
   inductives.contains n.getPrefix
 
+/-- Kernel re-check wall time of one proof term, in nanoseconds: the MINIMUM
+    over `reps` repetitions of `Lean.Kernel.check` on the value in an empty
+    local context. Single-shot timings at this granularity (µs) are dominated
+    by scheduling/GC noise and flipped root orderings between runs; taking the
+    minimum (standard micro-benchmarking practice — best case = least
+    interference) makes the ordering reproducible enough to serve as the third
+    Pareto objective. Each `match` forces the `Except` (and with it the extern
+    kernel call) before the clock is read again. Failing to re-check a term
+    the kernel has already accepted is an exporter bug, so we throw. -/
+def kernelCheckTimeNs (env : Environment) (v : Expr) (reps : Nat := 16) : CoreM Nat := do
+  let mut best := 0
+  for _ in [:reps] do
+    let t0 ← liftM (m := IO) (IO.monoNanosNow : BaseIO Nat)
+    match Kernel.check env {} v with
+    | .ok _ => pure ()
+    | .error _ => throwError "kernel re-check failed for a previously accepted proof term"
+    let t1 ← liftM (m := IO) (IO.monoNanosNow : BaseIO Nat)
+    let dt := t1 - t0
+    if best == 0 || dt < best then
+      best := dt
+  return best
+
 /-- Extract every theorem of the target module as a proof root. -/
-def computeRoots (own : Array (Name × ConstantInfo)) : Array RootInfo := Id.run do
+def computeRoots (own : Array (Name × ConstantInfo)) : CoreM (Array RootInfo) := do
+  let env ← getEnv
   let depMap := ownDepMap own
   let inductives : Std.HashSet Name := own.foldl (init := {}) fun s (n, ci) =>
     match ci with
@@ -108,17 +146,19 @@ def computeRoots (own : Array (Name × ConstantInfo)) : Array RootInfo := Id.run
     | _ => s
   let mut depths : Std.HashMap Name Nat := {}
   for (n, _) in own do
-    depths := (depthOf depMap depths n).1
+    depths := (depthOf depMap depths {} n).1
   let mut roots := #[]
   for (n, ci) in own do
     if ci.isTheorem then
       if let some v := ci.value? (allowOpaque := true) then
+        let checkTimeNs ← kernelCheckTimeNs env v
         roots := roots.push {
           id := toString n
           auto := isAutoRoot inductives n
           dependencies := v.getUsedConstants.qsort (Name.quickCmp · · == .lt)
           size := termSize v
-          depth := depths.getD n 0 }
+          depth := depths.getD n 0
+          checkTimeNs }
   return roots
 
 /-- Escape a string for JSON (quotes and backslashes; names never contain
@@ -130,14 +170,15 @@ def jsonEscape (s : String) : String :=
     | c => [c]
 
 /-- Render roots as JSON:
-    `{"roots":[{"id":...,"auto":B,"dependencies":[...],"proof_term_size":N,"kernel_depth":K},...]}` -/
+    `{"roots":[{"id":...,"auto":B,"dependencies":[...],"proof_term_size":N,"kernel_depth":K,"check_time_ns":T},...]}` -/
 def rootsJson (roots : Array RootInfo) : String :=
   let entries := roots.toList.map fun r =>
     let deps := r.dependencies.toList.map fun d => s!"\"{jsonEscape (toString d)}\""
     "    {\"id\":\"" ++ jsonEscape r.id ++ "\",\"auto\":" ++
     (if r.auto then "true" else "false") ++ ",\"dependencies\":[" ++
     String.intercalate "," deps ++ "],\"proof_term_size\":" ++ toString r.size ++
-    ",\"kernel_depth\":" ++ toString r.depth ++ "}"
+    ",\"kernel_depth\":" ++ toString r.depth ++
+    ",\"check_time_ns\":" ++ toString r.checkTimeNs ++ "}"
   let body := if entries.isEmpty then "" else "\n" ++ String.intercalate ",\n" entries ++ "\n  "
   "{\n  \"roots\": [" ++ body ++ "]\n}\n"
 

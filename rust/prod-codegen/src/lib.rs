@@ -29,9 +29,20 @@
 //!
 //! - **LCNF nodes**:
 //!   - `Match` renders as a Rust `match`, with `default` becoming the `_` arm.
+//!     The Nat structural-recursion ctors are special-cased: `Nat.zero` renders
+//!     as the literal pattern `0`, and `Nat.succ k` as the `_` arm with
+//!     `k` bound to `(scrut).saturating_sub(1)` (exact, since the zero arm
+//!     matches first). The List ctors are special-cased too: `List.nil` →
+//!     `crate::List::Nil`, `List.cons (h, t)` → `crate::List::Cons(h, t)` with
+//!     `t` rebound unboxed in the arm body (the pattern binds `Box<List<_>>`).
+//!     `Bool.true`/`Bool.false` → `true`/`false` patterns, and
+//!     `Option.none`/`Option.some v` → `None`/`Some(v)` patterns.
 //!   - `Ctor` renders as tuple-style construction `Name(args...)` (bare `Name`
 //!     when there are no args), except `Prod.mk`, which renders as a Rust
-//!     tuple `(a, b)` — nested for right-nested pairs.
+//!     tuple `(a, b)` — nested for right-nested pairs — the List ctors,
+//!     which render as `crate::List::Nil` / `crate::List::Cons(h, Box::new(t))`,
+//!     and the Bool/Option ctors, which render as `true`/`false` and
+//!     `None`/`Some(x)`.
 //!   - `Proj` renders through the projection-field table below for known
 //!     structure types, and tuple-style `.idx` for unknown `(type, idx)`
 //!     pairs. The table maps Lean structure projection indices to the
@@ -131,6 +142,7 @@ fn type_to_rust(ty: &Type) -> String {
         Type::Instance => String::from("crate::Instance"),
         Type::Option(inner) => format!("Option<{}>", type_to_rust(inner)),
         Type::Vec(inner) => format!("Vec<{}>", type_to_rust(inner)),
+        Type::List(inner) => format!("crate::List<{}>", type_to_rust(inner)),
         Type::Tuple(items) => {
             let types: Vec<String> = items.iter().map(type_to_rust).collect();
             format!("({})", types.join(", "))
@@ -299,6 +311,7 @@ fn expr_to_rust(
         }
         Expr::Eq(a, b) => binop(a, b, "==", params, ctx),
         Expr::Lt(a, b) => binop(a, b, "<", params, ctx),
+        Expr::Le(a, b) => binop(a, b, "<=", params, ctx),
         Expr::Gt(a, b) => binop(a, b, ">", params, ctx),
         Expr::If(cond, t, f) => {
             let cond = expr_to_rust(cond, params, ctx)?;
@@ -323,13 +336,45 @@ fn expr_to_rust(
             let scrut = expr_to_rust(scrut, params, ctx)?;
             let mut out = format!("match {} {{\n", scrut);
             for alt in alts {
-                let pat = if alt.binders.is_empty() {
-                    alt.ctor.clone()
-                } else {
-                    format!("{}({})", alt.ctor, alt.binders.join(", "))
-                };
                 let body = expr_to_rust(&alt.body, params, ctx)?;
-                out.push_str(&format!("        {} => {},\n", pat, body));
+                // LCNF structural recursion on Nat cases: `Nat.zero` is the
+                // literal `0`; `Nat.succ k` binds the predecessor. Since the
+                // zero arm matches first, the succ arm's scrutinee is ≥ 1 and
+                // `saturating_sub(1)` is the exact predecessor (and stays
+                // within the crate's bounded-Nat policy).
+                if alt.ctor == "Nat.zero" && alt.binders.is_empty() {
+                    out.push_str(&format!("        0 => {},\n", body));
+                } else if alt.ctor == "Nat.succ" && alt.binders.len() == 1 {
+                    out.push_str(&format!(
+                        "        _ => {{ let {} = ({}).saturating_sub(1); {} }},\n",
+                        alt.binders[0], scrut, body
+                    ));
+                } else if alt.ctor == "List.nil" && alt.binders.is_empty() {
+                    out.push_str(&format!("        crate::List::Nil => {},\n", body));
+                } else if alt.ctor == "List.cons" && alt.binders.len() == 2 {
+                    // The tail binds as `Box<List<_>>`; rebind it unboxed so
+                    // recursive calls and reconstruction sites see a plain
+                    // `List` (the runtime's linked-list representation).
+                    out.push_str(&format!(
+                        "        crate::List::Cons({}, {}) => {{ let {} = *{}; {} }},\n",
+                        alt.binders[0], alt.binders[1], alt.binders[1], alt.binders[1], body
+                    ));
+                } else if alt.ctor == "Bool.true" && alt.binders.is_empty() {
+                    out.push_str(&format!("        true => {},\n", body));
+                } else if alt.ctor == "Bool.false" && alt.binders.is_empty() {
+                    out.push_str(&format!("        false => {},\n", body));
+                } else if alt.ctor == "Option.none" && alt.binders.is_empty() {
+                    out.push_str(&format!("        None => {},\n", body));
+                } else if alt.ctor == "Option.some" && alt.binders.len() == 1 {
+                    out.push_str(&format!("        Some({}) => {},\n", alt.binders[0], body));
+                } else {
+                    let pat = if alt.binders.is_empty() {
+                        alt.ctor.clone()
+                    } else {
+                        format!("{}({})", alt.ctor, alt.binders.join(", "))
+                    };
+                    out.push_str(&format!("        {} => {},\n", pat, body));
+                }
             }
             if let Some(d) = default {
                 let body = expr_to_rust(d, params, ctx)?;
@@ -342,6 +387,21 @@ fn expr_to_rust(
             let args = render_args(args, params, ctx)?;
             if name == "Prod.mk" {
                 Ok(format!("({})", args.join(", ")))
+            } else if name == "List.nil" && args.is_empty() {
+                Ok(String::from("crate::List::Nil"))
+            } else if name == "List.cons" && args.len() == 2 {
+                Ok(format!(
+                    "crate::List::Cons({}, Box::new({}))",
+                    args[0], args[1]
+                ))
+            } else if name == "Bool.true" && args.is_empty() {
+                Ok(String::from("true"))
+            } else if name == "Bool.false" && args.is_empty() {
+                Ok(String::from("false"))
+            } else if name == "Option.none" && args.is_empty() {
+                Ok(String::from("None"))
+            } else if name == "Option.some" && args.len() == 1 {
+                Ok(format!("Some({})", args[0]))
             } else if args.is_empty() {
                 Ok(name.clone())
             } else {
@@ -427,8 +487,11 @@ fn checked_binop(
 ) -> Result<String, Error> {
     let a = expr_to_rust(a, params, ctx)?;
     let b = expr_to_rust(b, params, ctx)?;
+    // `as u64` pins the receiver: method calls on an inferred `{integer}`
+    // (a let-bound literal, e.g. LCNF's `let _x := 1`) fail method resolution
+    // (E0689) — no-op when the receiver is already u64. Same trick as `Pow`.
     Ok(format!(
-        "({}).{}({}).expect(\"{}\")",
+        "(({}) as u64).{}({}).expect(\"{}\")",
         a, method, b, message
     ))
 }
@@ -442,7 +505,8 @@ fn saturating_binop(
 ) -> Result<String, Error> {
     let a = expr_to_rust(a, params, ctx)?;
     let b = expr_to_rust(b, params, ctx)?;
-    Ok(format!("({}).{}({})", a, method, b))
+    // See checked_binop: `as u64` pins the receiver for method resolution.
+    Ok(format!("(({}) as u64).{}({})", a, method, b))
 }
 
 fn total_binop(
@@ -524,7 +588,7 @@ mod tests {
         let out = generate(ir);
         assert_eq!(
             out,
-            "pub fn classIndex(h2: u64, d: u64, l: u64, inst: crate::Instance) -> u64 {\n    ((inst.stride()).checked_mul(h2).expect(\"Lean Nat multiplication overflow\")).checked_add(((inst.o).checked_mul(d).expect(\"Lean Nat multiplication overflow\")).checked_add(l).expect(\"Lean Nat addition overflow\")).expect(\"Lean Nat addition overflow\")\n}\n\npub fn belt(inst: crate::Instance) -> u64 {\n    (class_count(inst)).checked_mul((1).checked_shl(u32::try_from((inst.o).saturating_sub(1)).expect(\"Lean Nat shift amount exceeds u32\")).expect(\"Lean Nat shift overflow\")).expect(\"Lean Nat multiplication overflow\")\n}\n\n"
+            "pub fn classIndex(h2: u64, d: u64, l: u64, inst: crate::Instance) -> u64 {\n    ((((inst.stride()) as u64).checked_mul(h2).expect(\"Lean Nat multiplication overflow\")) as u64).checked_add(((((inst.o) as u64).checked_mul(d).expect(\"Lean Nat multiplication overflow\")) as u64).checked_add(l).expect(\"Lean Nat addition overflow\")).expect(\"Lean Nat addition overflow\")\n}\n\npub fn belt(inst: crate::Instance) -> u64 {\n    ((class_count(inst)) as u64).checked_mul((1).checked_shl(u32::try_from(((inst.o) as u64).saturating_sub(1)).expect(\"Lean Nat shift amount exceeds u32\")).expect(\"Lean Nat shift overflow\")).expect(\"Lean Nat multiplication overflow\")\n}\n\n"
         );
     }
 
@@ -542,6 +606,68 @@ mod tests {
         assert_eq!(
             out,
             "pub fn f(x: u64) -> u64 {\n    match x {\n        Some(v) => v,\n        _ => 0,\n    }\n}\n\n"
+        );
+    }
+
+    #[test]
+    fn test_generate_list_ctors_and_match() {
+        // Lean List ctors/match: `List.nil`/`List.cons` map to the runtime's
+        // linked list; the cons arm's tail rebinds unboxed.
+        let ir = r#"
+(module M
+  (def digitSum ((xs (List Nat))) Nat
+    (cases xs
+      (alt "List.nil" () 0)
+      (alt "List.cons" (h t) (add h (call digitSum t)))))
+  (def digits ((n Nat)) (List Nat)
+    (if (lt n 8)
+        (ctor "List.cons" n (ctor "List.nil"))
+        (ctor "List.cons" (mod n 8) (call digits (div n 8)))))
+)
+"#;
+        let out = generate(ir);
+        assert_eq!(
+            out,
+            "pub fn digitSum(xs: crate::List<u64>) -> u64 {\n    match xs {\n        crate::List::Nil => 0,\n        crate::List::Cons(h, t) => { let t = *t; ((h) as u64).checked_add(digitSum(t)).expect(\"Lean Nat addition overflow\") },\n    }\n}\n\npub fn digits(n: u64) -> crate::List<u64> {\n    if (n < 8) { crate::List::Cons(n, Box::new(crate::List::Nil)) } else { crate::List::Cons(if (8) == 0 { 0 } else { (n) % (8) }, Box::new(digits(if (8) == 0 { 0 } else { (n) / (8) }))) }\n}\n\n"
+        );
+    }
+
+    #[test]
+    fn test_generate_option_and_bool() {
+        // Option/Bool ctors and match arms map to Rust's native types.
+        let ir = r#"
+(module M
+  (def tryDecode ((idx Nat)) (Option Nat)
+    (if (le idx 96) (ctor "Option.some" idx) (ctor "Option.none")))
+  (def fromOpt ((x (Option Nat))) Bool
+    (cases x
+      (alt "Option.some" (v) (ctor "Bool.true"))
+      (alt "Option.none" () (ctor "Bool.false"))))
+)
+"#;
+        let out = generate(ir);
+        assert_eq!(
+            out,
+            "pub fn tryDecode(idx: u64) -> Option<u64> {\n    if (idx <= 96) { Some(idx) } else { None }\n}\n\npub fn fromOpt(x: Option<u64>) -> bool {\n    match x {\n        Some(v) => true,\n        None => false,\n    }\n}\n\n"
+        );
+    }
+
+    #[test]
+    fn test_generate_nat_cases_recursion() {
+        // LCNF structural recursion on Nat: `Nat.zero` → literal `0` pattern,
+        // `Nat.succ k` → `_` arm with the predecessor bound via saturating_sub.
+        let ir = r#"
+(module M
+  (def digitCount ((fuel Nat) (n Nat)) Nat
+    (cases fuel
+      (alt "Nat.zero" () 0)
+      (alt "Nat.succ" (k) (if (lt n 8) 1 (add 1 (call digitCount k (div n 8)))))))
+)
+"#;
+        let out = generate(ir);
+        assert_eq!(
+            out,
+            "pub fn digitCount(fuel: u64, n: u64) -> u64 {\n    match fuel {\n        0 => 0,\n        _ => { let k = (fuel).saturating_sub(1); if (n < 8) { 1 } else { ((1) as u64).checked_add(digitCount(k, if (8) == 0 { 0 } else { (n) / (8) })).expect(\"Lean Nat addition overflow\") } },\n    }\n}\n\n"
         );
     }
 
@@ -592,7 +718,7 @@ mod tests {
         let out = generate(ir);
         assert_eq!(
             out,
-            "pub fn stride(i: crate::Instance) -> u64 {\n    { let _x_4 = (i).t; { let _x_5 = (i).o; { let _x_13 = (_x_4).checked_mul(_x_5).expect(\"Lean Nat multiplication overflow\"); _x_13 } } }\n}\n\npub fn classDecode(idx: u64, i: crate::Instance) -> (u64, (u64, u64)) {\n    { let _x_4 = stride(i); { let h2 = if (_x_4) == 0 { 0 } else { (idx) / (_x_4) }; { let rem = if (_x_4) == 0 { 0 } else { (idx) % (_x_4) }; { let _x_10 = (i).o; { let d = if (_x_10) == 0 { 0 } else { (rem) / (_x_10) }; { let l = if (_x_10) == 0 { 0 } else { (rem) % (_x_10) }; { let _x_13 = (d, l); { let _x_14 = (h2, _x_13); _x_14 } } } } } } } }\n}\n\n"
+            "pub fn stride(i: crate::Instance) -> u64 {\n    { let _x_4 = (i).t; { let _x_5 = (i).o; { let _x_13 = ((_x_4) as u64).checked_mul(_x_5).expect(\"Lean Nat multiplication overflow\"); _x_13 } } }\n}\n\npub fn classDecode(idx: u64, i: crate::Instance) -> (u64, (u64, u64)) {\n    { let _x_4 = stride(i); { let h2 = if (_x_4) == 0 { 0 } else { (idx) / (_x_4) }; { let rem = if (_x_4) == 0 { 0 } else { (idx) % (_x_4) }; { let _x_10 = (i).o; { let d = if (_x_10) == 0 { 0 } else { (rem) / (_x_10) }; { let l = if (_x_10) == 0 { 0 } else { (rem) % (_x_10) }; { let _x_13 = (d, l); { let _x_14 = (h2, _x_13); _x_14 } } } } } } } }\n}\n\n"
         );
     }
 
@@ -640,7 +766,7 @@ mod tests {
         let out = generate(ir);
         assert_eq!(
             out,
-            "pub fn f(x: u64) -> u64 {\n    { let g = /* jp \"g\" inlined at its jump site */ (); { let a = x; (a).checked_add(1).expect(\"Lean Nat addition overflow\") } }\n}\n\n"
+            "pub fn f(x: u64) -> u64 {\n    { let g = /* jp \"g\" inlined at its jump site */ (); { let a = x; ((a) as u64).checked_add(1).expect(\"Lean Nat addition overflow\") } }\n}\n\n"
         );
     }
 
@@ -668,7 +794,7 @@ mod tests {
         let out = generate(ir);
         assert_eq!(
             out,
-            "pub fn belt(i: u64) -> u64 {\n    ((2) as u64).checked_pow(u32::try_from((i).saturating_sub(1)).expect(\"Lean Nat power exponent exceeds u32\")).expect(\"Lean Nat power overflow\")\n}\n\n"
+            "pub fn belt(i: u64) -> u64 {\n    ((2) as u64).checked_pow(u32::try_from(((i) as u64).saturating_sub(1)).expect(\"Lean Nat power exponent exceeds u32\")).expect(\"Lean Nat power overflow\")\n}\n\n"
         );
     }
 

@@ -11,6 +11,10 @@ struct Root {
     dependencies: Vec<String>,
     proof_term_size: u64,
     kernel_depth: u64,
+    /// Kernel re-check wall time (ns); third Pareto objective. Missing in
+    /// older `roots.json` files; defaults to `0`.
+    #[serde(default)]
+    check_time_ns: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,7 +30,10 @@ struct ParetoFile {
 fn dominates(a: &Root, b: &Root) -> bool {
     a.proof_term_size <= b.proof_term_size
         && a.kernel_depth <= b.kernel_depth
-        && (a.proof_term_size < b.proof_term_size || a.kernel_depth < b.kernel_depth)
+        && a.check_time_ns <= b.check_time_ns
+        && (a.proof_term_size < b.proof_term_size
+            || a.kernel_depth < b.kernel_depth
+            || a.check_time_ns < b.check_time_ns)
 }
 
 /// Parse exported sexp IR and return generated Rust source.
@@ -38,7 +45,7 @@ pub fn generate(ir: &str) -> Result<String, JsValue> {
         .map_err(|error| JsValue::from_str(&format!("code generation error: {error}")))
 }
 
-/// Return the proof roots on the (proof size, kernel depth) Pareto front.
+/// Return the proof roots on the (proof size, kernel depth, check time) Pareto front.
 #[wasm_bindgen]
 pub fn roots_pareto(json: &str) -> Result<String, JsValue> {
     let file: RootFile = serde_json::from_str(json)
@@ -74,10 +81,13 @@ mod tests {
     #[test]
     fn roots_pareto_returns_only_nondominated_roots() {
         let json = r#"{"roots":[
-          {"id":"a","dependencies":[],"proof_term_size":2,"kernel_depth":2},
-          {"id":"b","dependencies":[],"proof_term_size":3,"kernel_depth":3},
-          {"id":"c","dependencies":[],"proof_term_size":1,"kernel_depth":4}
+          {"id":"a","dependencies":[],"proof_term_size":2,"kernel_depth":2,"check_time_ns":100},
+          {"id":"b","dependencies":[],"proof_term_size":3,"kernel_depth":3,"check_time_ns":300},
+          {"id":"c","dependencies":[],"proof_term_size":1,"kernel_depth":4,"check_time_ns":50},
+          {"id":"d","dependencies":[],"proof_term_size":2,"kernel_depth":2,"check_time_ns":150}
         ]}"#;
+        // `d` matches `a` on size/depth and loses only on check time;
+        // `b` is dominated by `a` on all three objectives.
         let output: RootFile = serde_json::from_str(&roots_pareto(json).unwrap()).unwrap();
         assert_eq!(output.roots.iter().map(|root| root.id.as_str()).collect::<Vec<_>>(), ["a", "c"]);
     }

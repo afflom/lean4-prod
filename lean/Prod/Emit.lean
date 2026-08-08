@@ -61,7 +61,7 @@ def runExport : CoreM (String × String × String) := do
   let extracted ← extractTagged targetModule
   let (ir, reports) ← emitKernelIr ctx extracted
   let own := ownConstants env targetModule
-  let roots := rootsJson (computeRoots own)
+  let roots := rootsJson (← computeRoots own)
   let coverage ← buildCoverage targetModule own reports
   return (ir, roots, coverage)
 
@@ -96,6 +96,17 @@ structure GoldenEntry where
   ret : String := "Nat"
   value : String
 
+/-- Render a `List Nat` value as nested IR ctor sexps (`List.cons`/`List.nil`),
+    matching how the lowerer emits constructor applications. -/
+partial def listCtorSexp : List Nat → String
+  | [] => "(ctor \"List.nil\")"
+  | h :: t => s!"(ctor \"List.cons\" {h} {listCtorSexp t})"
+
+/-- Render an `Option (Nat × Nat × Nat)` value as nested IR ctor sexps. -/
+def optTripleSexp : Option (Nat × Nat × Nat) → String
+  | some (h2, d, l) => s!"(ctor \"Option.some\" (ctor \"Prod.mk\" {h2} (ctor \"Prod.mk\" {d} {l})))"
+  | none => "(ctor \"Option.none\")"
+
 /-- All goldens: `stride`/`class_count`/`belt` on each TF1 instance, plus
     `classIndex 1 2 3` and `classDecode 43` at the canonical instance. -/
 def goldenEntries : Array GoldenEntry := Id.run do
@@ -110,6 +121,17 @@ def goldenEntries : Array GoldenEntry := Id.run do
   let (h2, dl) := UorAtlas.classDecode 43 c
   let (d, l) := dl
   out := out.push { name := "golden_classDecode_43_canonical", ret := "(Tuple Nat (Tuple Nat Nat))", value := s!"(ctor \"Prod.mk\" {h2} (ctor \"Prod.mk\" {d} {l}))" }
+  out := out.push { name := "golden_digitCount_43_canonical", value := toString (UorAtlas.digitCount 10 43 c) }
+  out := out.push { name := "golden_digitCount_511_canonical", value := toString (UorAtlas.digitCount 10 511 c) }
+  out := out.push { name := "golden_digitCount_zero_fuel_canonical", value := toString (UorAtlas.digitCount 0 999 c) }
+  out := out.push { name := "golden_digits_43_canonical", ret := "(List Nat)", value := listCtorSexp (UorAtlas.digits 10 43 c) }
+  out := out.push { name := "golden_digitSum_digits_43_canonical", value := toString (UorAtlas.digitSum (UorAtlas.digits 10 43 c)) }
+  out := out.push { name := "golden_sameClass_43_44_canonical", ret := "Bool", value := toString (UorAtlas.sameClass 43 44 c) }
+  out := out.push { name := "golden_sameClass_43_67_canonical", ret := "Bool", value := toString (UorAtlas.sameClass 43 67 c) }
+  out := out.push { name := "golden_smallEnough_100_canonical", ret := "Bool", value := toString (UorAtlas.smallEnough 100 c) }
+  out := out.push { name := "golden_smallEnough_20000_canonical", ret := "Bool", value := toString (UorAtlas.smallEnough 20000 c) }
+  out := out.push { name := "golden_tryClassDecode_43_canonical", ret := "(Option (Tuple Nat (Tuple Nat Nat)))", value := optTripleSexp (UorAtlas.tryClassDecode 43 c) }
+  out := out.push { name := "golden_tryClassDecode_100_canonical", ret := "(Option (Tuple Nat (Tuple Nat Nat)))", value := optTripleSexp (UorAtlas.tryClassDecode 100 c) }
   return out
 
 /-- Assemble the `goldens.ir` text: one zero-arg def per golden. -/

@@ -57,6 +57,14 @@ what Lean means.
   and powers fail explicitly on overflow (including shift/power exponents that
   do not fit `u32`); subtraction truncates at zero; and division/modulo by zero
   return zero. Exact arbitrary-precision `Nat` output is future work.
+- Structural recursion on `Nat` works (LCNF `cases` on `Nat.zero`/`Nat.succ`
+  → Rust match with predecessor binding). Lean `List α` maps to a `(List α)`
+  IR type rendered as `prod_core::List<T>` (linked list: `Nil`/`Cons(head,
+  Box<tail>)`), so list recursion pattern-matches without cloning; `Option α`
+  and `Bool` map to Rust `Option`/`bool`. Decidable `if` guards are rewritten
+  for `<`, `≤`, and `=` on Nat (`Nat.decLt`/`decLe`/`decEq` and the
+  `instDecidableEqNat` wrapper); other decidable guards would surface as
+  extern calls in `coverage.md`.
 - The wasm package houses the portable half (parse + codegen + roots). The
   Lean extractor itself is native-only.
 
@@ -86,8 +94,8 @@ prod_macros::prod_defs! { ir = "kernel.ir" }   // typed, zero-cost Rust fns
 ## Roots (proof-graph analysis)
 
 Every theorem is a root. `Roots.lean` exports each root's dependency edges,
-proof-term size, and kernel depth to `roots.json`. The CLI computes what the
-registry claims:
+proof-term size, kernel depth, and kernel re-check time to `roots.json`. The
+CLI computes what the registry claims:
 
 ```sh
 prod roots check     # DAG acyclicity + coverage (actually computed)
@@ -104,8 +112,11 @@ cargo run -p prod-cli -- roots pareto ../roots.json
 cargo run -p prod-cli -- roots connect ../roots.json
 ```
 
-The Pareto analysis currently uses proof-term size and kernel depth; the Lean
-export does not yet record check-time measurements. Compact theorem IDs may
+The Pareto analysis uses three objectives: proof-term size, kernel depth, and
+`check_time_ns` — the wall time for re-typechecking the proof term with Lean's
+kernel (`Lean.Kernel.check`), taken as the minimum of 16 repetitions by the
+exporter to suppress µs-scale noise. The times are machine-dependent and only
+meaningful as a relative signal within one export run. Compact theorem IDs may
 repeat when Lean generates private helper theorems, and `roots check` reports
 those as warnings while using the dependency names to resolve graph edges.
 

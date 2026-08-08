@@ -112,7 +112,7 @@ just prod                # lake exe prod-export && cargo test
 Lean side:
 
 ```lean
-@[prod] def stride (inst : Instance) : Nat := inst.t * inst.o
+@[prod] def stride (inst : Instance) : Nat := inst.T * inst.O
 ```
 
 ```sh

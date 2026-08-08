@@ -174,6 +174,21 @@ What that means in practice, and what you must not regress:
   - `Nat.shiftRight` lowers to a real, total/infallible `shr` IR node (not an
     expansion to div/pow); see `Lower.lean`'s module doc comment for why it
     never overflows.
+  - `Prod.declTypeNames` collects types from a definition's **body** (ctor
+    applications and projections) as well as its signature, so a type used
+    only inside a body still gets a `(type ...)` declaration. Pinned by
+    `Conformance.c_ctor_body_only`. Codegen independently refuses to render an
+    undeclared *dotted* constructor name as a Rust path — `A.B.mk(x)` is
+    valid `syn` (field access then call) and invalid Rust, which is exactly
+    how it used to escape.
+  - `prod_ir::Expr::children()` is the single traversal for every consumer
+    (codegen's fallibility fixpoint and jp analysis, `prod-cli`'s extern
+    collection). Its match is exhaustive with no wildcard: a new `Expr`
+    variant is a compile error, not a silently-unvisited subtree. Do not
+    hand-copy it again — the `prod-cli` copy had already drifted past `Shr`.
+  - `Expr::Field` is deleted. `Lower.lean` never emitted it, it rendered
+    identically to `Proj` while bypassing `Proj`'s `UnknownField` check, and
+    its only remaining users were fixtures. Use `(proj "Type" "field" e)`.
   - The published subset contract (`specs/lean-for-production.md`, generated
     by `just subset` from `subset.json` + `prod_codegen::REJECTIONS`) and the
     conformance golden (`lean/Conformance/golden.ir`) are the project's two
@@ -193,9 +208,13 @@ Known remaining limitations: typed Lean `Int` semantics is NOT implemented
 (generated Nat is u64 with the bounded policy: checked add/mul/shl/pow,
 saturating sub, total div/mod-by-zero). Arbitrary-precision Nat is ruled OUT by
 the no-heap directive, not merely unimplemented. Closures (`Code.fun`) still
-lower to opaque. `cases` on user-defined inductive types other than
-Nat/List/Option/Bool still render ctor names as Rust patterns, which only
-compile if a matching runtime enum exists. No data-parallel codegen.
+lower to opaque. User-defined inductives now generate real Rust structs/enums,
+and `ctor`/`cases`/`proj` on them resolve against the module's own `(type ...)`
+declarations — a construction or pattern whose constructor has no declaration
+in the module is rejected (`UnresolvedCall`), not rendered as a dotted Lean
+name pretending to be a Rust path. Monomorphization is still absent, so a
+parameterised inductive is rejected (`PolymorphicType`) rather than lowered.
+No data-parallel codegen.
 
 ## M3 spec — the LCNF extractor (the defensible core)
 
@@ -237,7 +256,8 @@ Verified Lean 4.30.0 API facts (from leanprover/lean4 v4.30.0 sources — trust 
   re-run that conformance case.
 
 Lowerer requirements:
-- Emit sexp matching `rust/prod-ir` grammar EXACTLY — read `rust/sample.ir`,
+- Emit sexp matching `rust/prod-ir` grammar EXACTLY — read
+  `lean/Conformance/golden.ir`,
   `rust/prod-ir/src/lib.rs`, `rust/prod-ir/src/parser.rs` first. Only extend the
   Rust parser if a needed form is missing; if you do, add tests, keep `cargo test` green.
 - Def names: last component (`UorAtlas.stride` → `stride`), full name in a `;;` comment
@@ -246,10 +266,20 @@ Lowerer requirements:
 - Operator whitelist (check parser.rs for exact keywords first):
   `Nat.add/sub/mul/div/mod/shiftLeft/shiftRight/pow/ble/blt` → arith/cmp nodes;
   unmapped consts → `(call name ...)` + counted as extern calls in coverage.
+  *(HISTORICAL — what M3 built. Superseded in S0/S1: an unmapped const lowers
+  to `(extern "Full.Name" ...)`, a distinct IR node that codegen rejects with
+  `Error::UnresolvedCall`. It is still counted in coverage, but it is a hard
+  build failure, not a rendered call.)*
 - `cases`→`cases` node, `proj`→`proj`, `jp/jmp`→`jp`/`jmp`, `return x`→value,
   `unreach`→`unreachable`, `fun`(lambda)→`opaque` + coverage note (closures are phase-2).
 - Type lowering: `Nat/Bool/Int`→same, `UorAtlas.Instance`→`Instance`, else opaque-type
   form per parser.
+  *(HISTORICAL — what M3 built. Superseded in S0/S1: the `UorAtlas.Instance`
+  hard-wiring is deleted. Every user inductive lowers to `(named "Full.Name")`
+  plus a `(type ...)` declaration, and codegen generates the struct/enum from
+  that declaration; `Instance` is now an ordinary generated type with no
+  special case anywhere. Only genuinely undescribable constants reach the
+  opaque-type form, and codegen rejects those with `Error::OpaqueType`.)*
 
 Emit defaults (cwd is `lean/`): `../rust/prod-core/kernel.ir`, `../roots.json`,
 `../coverage.md`; support `--out DIR`. Hand-rolled JSON with escaping (no deps).

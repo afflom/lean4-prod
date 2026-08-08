@@ -5,5 +5,8 @@ edition = "2021"
 authors = ["UOR Foundation"]
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 prod-ir = { path = "../prod-ir" }

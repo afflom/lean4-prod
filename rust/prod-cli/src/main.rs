@@ -98,7 +98,10 @@ fn main() {
                 .unwrap_or_else(|e| panic!("Codegen error: {}", e));
 
             let mut out = String::from("#![allow(dead_code)]\n\n");
-            out.push_str(&format!("// Generated from Lean 4 module: {}\n\n", module.name));
+            out.push_str(&format!(
+                "// Generated from Lean 4 module: {}\n\n",
+                module.name
+            ));
             out.push_str(&body);
 
             match output {
@@ -115,9 +118,14 @@ fn main() {
                 .unwrap_or_else(|e| panic!("Failed to read {}: {}", path, e));
             match prod_ir::parser::parse_module(&content) {
                 Ok((_, module)) => {
-                    println!("✓ Valid IR: {} definitions in module '{}'",
-                        module.definitions.len(), module.name);
-                    let opaque: Vec<_> = module.definitions.iter()
+                    println!(
+                        "✓ Valid IR: {} definitions in module '{}'",
+                        module.definitions.len(),
+                        module.name
+                    );
+                    let opaque: Vec<_> = module
+                        .definitions
+                        .iter()
                         .filter(|d| matches!(d.body, prod_ir::Expr::Opaque(_)))
                         .collect();
                     if !opaque.is_empty() {
@@ -138,7 +146,11 @@ fn main() {
                 println!(
                     "Loaded {} roots{}.",
                     roots.len(),
-                    if all { " (including auto-generated)" } else { "" }
+                    if all {
+                        " (including auto-generated)"
+                    } else {
+                        ""
+                    }
                 );
                 println!(
                     "Checking dependency acyclicity... {}",

@@ -9,6 +9,24 @@ license = "MIT"
 default = ["std"]
 std = []
 
+# Spelled out rather than `[lints] workspace = true`, because Cargo does not
+# allow combining the workspace opt-in with extra tables and this crate needs
+# both: it is the one that ships generated code to callers, so it also bans the
+# panicking escape hatches the generated arithmetic used to rely on.
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
 [dependencies]
 prod-ir = { path = "../prod-ir" }
 prod-macros = { path = "../prod-macros" }
+
+[dev-dependencies]
+# Test-only: quarantines the `unsafe impl GlobalAlloc` this crate's own
+# `forbid(unsafe_code)` would otherwise reject. See `tests/no_alloc.rs`.
+prod-alloc-counter = { path = "../prod-alloc-counter" }

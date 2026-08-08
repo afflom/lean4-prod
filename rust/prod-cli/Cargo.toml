@@ -9,6 +9,9 @@ license = "MIT"
 name = "prod"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 prod-ir = { path = "../prod-ir" }
 prod-codegen = { path = "../prod-codegen" }

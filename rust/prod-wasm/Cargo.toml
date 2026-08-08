@@ -8,6 +8,12 @@ license = "MIT"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Deliberately NOT `[lints] workspace = true`: `#[wasm_bindgen]` expands to
+# `unsafe` code inside this crate, and the workspace's `forbid` cannot be
+# relaxed locally. The rest of the workspace baseline still applies.
+[lints.rust]
+unused_must_use = "deny"
+
 [dependencies]
 prod-ir = { path = "../prod-ir" }
 prod-codegen = { path = "../prod-codegen" }

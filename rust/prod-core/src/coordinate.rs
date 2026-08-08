@@ -4,9 +4,9 @@
 /// Instance parameters: (q, T, O)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Instance {
-    pub q: u64,  // scope
-    pub t: u64,  // modality
-    pub o: u64,  // context
+    pub q: u64, // scope
+    pub t: u64, // modality
+    pub o: u64, // context
 }
 
 impl Instance {

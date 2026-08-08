@@ -14,20 +14,15 @@ impl SpectralOperator {
         let o = inst.o as i64;
         let t = inst.t as i64;
         [
-            o + 2,       // global
-            o + 2 - t,   // modality
-            2,           // context (O+2-O = 2)
-            2 - t,       // interaction
+            o + 2,     // global
+            o + 2 - t, // modality
+            2,         // context (O+2-O = 2)
+            2 - t,     // interaction
         ]
     }
 
     pub const fn multiplicities(inst: &Instance) -> [u64; 4] {
-        [
-            1,
-            inst.t - 1,
-            inst.o - 1,
-            (inst.t - 1) * (inst.o - 1),
-        ]
+        [1, inst.t - 1, inst.o - 1, (inst.t - 1) * (inst.o - 1)]
     }
 
     /// Check spectral validity: T = 3 and indefiniteness (negative eigendirection exists)
@@ -67,7 +62,15 @@ mod tests {
 
     #[test]
     fn test_spectral_validity() {
-        assert!(SpectralOperator::is_spectrally_valid(&Instance { q: 4, t: 3, o: 8 }));
-        assert!(!SpectralOperator::is_spectrally_valid(&Instance { q: 2, t: 2, o: 4 }));
+        assert!(SpectralOperator::is_spectrally_valid(&Instance {
+            q: 4,
+            t: 3,
+            o: 8
+        }));
+        assert!(!SpectralOperator::is_spectrally_valid(&Instance {
+            q: 2,
+            t: 2,
+            o: 4
+        }));
     }
 }

@@ -14,6 +14,8 @@ jobs:
         run: nix develop --command just prod
       - name: Check proof-root graph
         run: nix develop --command just roots-check
+      - name: Check formatting
+        run: nix develop --command just fmt-check
       - name: Run clippy
         run: nix develop --command just lint
       - name: Check wasm32 portability

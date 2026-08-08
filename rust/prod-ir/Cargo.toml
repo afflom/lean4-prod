@@ -5,6 +5,9 @@ edition = "2021"
 authors = ["UOR Foundation"]
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 nom = { workspace = true, features = ["alloc"] }
 serde = { workspace = true }

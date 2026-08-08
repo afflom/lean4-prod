@@ -142,6 +142,9 @@ pub enum Error {
     UnsupportedList(String),
     /// A type that would require a heap allocation in generated code.
     HeapType(String),
+    /// A `(named "...")` reference to a declared type; codegen does not yet
+    /// render generated types from `Module::types`.
+    UnsupportedNamedType(String),
 }
 
 impl fmt::Display for Error {
@@ -155,6 +158,11 @@ impl fmt::Display for Error {
             Error::HeapType(s) => write!(
                 f,
                 "type would require a heap allocation in generated code: {}",
+                s
+            ),
+            Error::UnsupportedNamedType(s) => write!(
+                f,
+                "named type reference not yet supported by codegen: {}",
                 s
             ),
         }
@@ -327,6 +335,7 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
         Type::Int => String::from("i64"),
         Type::Bool => String::from("bool"),
         Type::Instance => String::from("crate::Instance"),
+        Type::Named(n) => return Err(Error::UnsupportedNamedType(n.clone())),
         Type::Option(inner) => format!("Option<{}>", type_to_rust(inner)?),
         Type::Tuple(items) => {
             let mut rendered = Vec::with_capacity(items.len());

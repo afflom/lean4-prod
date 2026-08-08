@@ -31,6 +31,9 @@ pub enum Type {
     Int,
     Bool,
     Instance,
+    /// A type declared in this module's `types` list, by full Lean name.
+    /// Renders as a generated Rust struct or enum.
+    Named(String),
     Option(Box<Type>),
     Vec(Box<Type>),
     /// Lean `List α`. Allocation-free by policy, so the rendering depends on
@@ -100,10 +103,36 @@ pub enum Expr {
     Opaque(String),
 }
 
+/// One constructor of a generated type: `(ctor "Full.Name.mk" (field Type)...)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CtorDecl {
+    /// Full Lean constructor name, e.g. `UorAtlas.Instance.mk`.
+    pub name: String,
+    /// Value fields in declaration order. `Prop` fields are erased by the
+    /// exporter and never appear here.
+    pub fields: Vec<(String, Type)>,
+}
+
+/// A Lean inductive rendered as a Rust type: one ctor means a struct, several
+/// mean an enum with named-field variants.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypeDecl {
+    /// Full Lean type name, e.g. `UorAtlas.Instance`.
+    pub name: String,
+    pub ctors: Vec<CtorDecl>,
+    /// Set when the exporter reached this type but cannot describe it, with
+    /// the reason. The type is still declared so that codegen can reject a
+    /// reference to it *precisely* rather than reporting a generic unknown
+    /// name. `ctors` is empty when this is set.
+    pub unsupported: Option<String>,
+}
+
 /// A module is a collection of definitions
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Module {
     pub name: String,
+    /// Type declarations, emitted before the definitions that use them.
+    pub types: Vec<TypeDecl>,
     pub definitions: Vec<Definition>,
 }
 

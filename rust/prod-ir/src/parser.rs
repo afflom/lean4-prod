@@ -2,11 +2,16 @@
 //!
 //! Grammar (simplified sexp):
 //! ```text
-//! module   ::= "(" "module" ident def* ")"
+//! module   ::= "(" "module" ident type_decl* def* ")"
+//! type_decl ::= "(" "type" '"' ident '"' unsupported? ctor_decl* ")"
+//! unsupported ::= "(" "unsupported" '"' text '"' ")"
+//! ctor_decl ::= "(" "ctor" '"' ident '"' field* ")"
+//! field    ::= "(" ident type ")"
 //! def      ::= "(" "def" ident "(" param* ")" type expr ")"
 //! param    ::= "(" ident type ")"
 //! type     ::= "Nat" | "Int" | "Bool" | "Instance" | "(" "Option" type ")" | "(" "Vec" type ")"
-//!            | "(" "List" type ")" | "(" "Tuple" type* ")" | "(" "opaque" '"' ident '"' ")"
+//!            | "(" "List" type ")" | "(" "Tuple" type* ")" | "(" "named" '"' ident '"' ")"
+//!            | "(" "opaque" '"' ident '"' ")"
 //! expr     ::= nat | ident | "(" "param" nat ")" | "(" "field" expr ident ")"
 //!            | "(" "add" expr expr ")" | "(" "sub" expr expr ")" | "(" "mul" expr expr ")"
 //!            | "(" "div" expr expr ")" | "(" "mod" expr expr ")" | "(" "shl" expr expr ")"
@@ -25,7 +30,7 @@
 //! comment  ::= ";;" ... end-of-line                       ; skipped as whitespace
 //! ```
 
-use super::{Alt, Definition, Expr, Module, Type};
+use super::{Alt, CtorDecl, Definition, Expr, Module, Type, TypeDecl};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -114,6 +119,14 @@ fn parse_type(input: &str) -> IResult<&str, Type> {
                 char(')'),
             ),
             |(_, ts)| Type::Tuple(ts),
+        ),
+        map(
+            delimited(
+                char('('),
+                tuple((tag("named"), ws(quoted_ident))),
+                char(')'),
+            ),
+            |(_, n)| Type::Named(n),
         ),
         map(
             delimited(
@@ -301,6 +314,62 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
     )(input)
 }
 
+/// `(name Type)` — one field of a constructor declaration.
+fn parse_field(input: &str) -> IResult<&str, (String, Type)> {
+    delimited(char('('), tuple((ws(ident), ws(parse_type))), char(')'))(input)
+}
+
+/// `(ctor "Full.Name.mk" (field Type)...)`
+fn parse_ctor_decl(input: &str) -> IResult<&str, CtorDecl> {
+    map(
+        delimited(
+            char('('),
+            tuple((tag("ctor"), ws(quoted_ident), many0(ws(parse_field)))),
+            char(')'),
+        ),
+        |(_, name, fields)| CtorDecl { name, fields },
+    )(input)
+}
+
+/// `(unsupported "reason")` — a type the exporter reached but cannot describe.
+fn parse_unsupported(input: &str) -> IResult<&str, String> {
+    delimited(
+        char('('),
+        map(tuple((tag("unsupported"), ws(quoted_reason))), |(_, r)| r),
+        char(')'),
+    )(input)
+}
+
+/// A double-quoted free-text reason (unlike `quoted_ident`, spaces allowed).
+fn quoted_reason(input: &str) -> IResult<&str, String> {
+    delimited(
+        char('"'),
+        map(take_till(|c| c == '"'), String::from),
+        char('"'),
+    )(input)
+}
+
+/// `(type "Full.Name" (ctor ...)...)` or `(type "Full.Name" (unsupported "why"))`
+fn parse_type_decl(input: &str) -> IResult<&str, TypeDecl> {
+    map(
+        delimited(
+            char('('),
+            tuple((
+                terminated(tag("type"), multispace1),
+                ws(quoted_ident),
+                opt(ws(parse_unsupported)),
+                many0(ws(parse_ctor_decl)),
+            )),
+            char(')'),
+        ),
+        |(_, name, unsupported, ctors)| TypeDecl {
+            name,
+            ctors,
+            unsupported,
+        },
+    )(input)
+}
+
 fn parse_definition(input: &str) -> IResult<&str, Definition> {
     let (rest, (_, name, params, ret, body)) = delimited(
         char('('),
@@ -326,18 +395,31 @@ fn parse_definition(input: &str) -> IResult<&str, Definition> {
 }
 
 pub fn parse_module(input: &str) -> IResult<&str, Module> {
-    let (rest, (_, name, definitions)) = ws(delimited(
+    let (rest, (_, name, types, definitions)) = ws(delimited(
         char('('),
-        tuple((tag("module"), ws(ident), many0(ws(parse_definition)))),
+        tuple((
+            tag("module"),
+            ws(ident),
+            many0(ws(parse_type_decl)),
+            many0(ws(parse_definition)),
+        )),
         char(')'),
     ))(input)?;
 
-    Ok((rest, Module { name, definitions }))
+    Ok((
+        rest,
+        Module {
+            name,
+            types,
+            definitions,
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     use alloc::vec;
 
     #[test]
@@ -535,5 +617,67 @@ mod tests {
         let (rest, ty) = parse_type(r#"(opaque "Foo.Bar")"#).unwrap();
         assert!(rest.is_empty());
         assert_eq!(ty, Type::Opaque("Foo.Bar".into()));
+    }
+
+    #[test]
+    fn test_parse_type_decl_single_ctor() {
+        let input = r#"
+(module M
+  (type "UorAtlas.Instance"
+    (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
+)
+"#;
+        let (rest, module) = parse_module(input).unwrap();
+        assert!(rest.trim().is_empty());
+        assert_eq!(module.types.len(), 1);
+        assert_eq!(module.types[0].name, "UorAtlas.Instance");
+        assert_eq!(module.types[0].ctors.len(), 1);
+        assert_eq!(module.types[0].ctors[0].name, "UorAtlas.Instance.mk");
+        assert_eq!(
+            module.types[0].ctors[0].fields,
+            vec![
+                ("q".to_string(), Type::Nat),
+                ("T".to_string(), Type::Nat),
+                ("O".to_string(), Type::Nat),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_type_decl_multi_ctor_and_named_type() {
+        let input = r#"
+(module M
+  (type "M.Shape"
+    (ctor "M.Shape.circle" (radius Nat))
+    (ctor "M.Shape.rect" (w Nat) (h Nat)))
+  (def area ((s (named "M.Shape"))) Nat 0)
+)
+"#;
+        let (rest, module) = parse_module(input).unwrap();
+        assert!(rest.trim().is_empty());
+        assert_eq!(module.types[0].ctors.len(), 2);
+        assert_eq!(module.types[0].ctors[1].fields.len(), 2);
+        assert_eq!(
+            module.definitions[0].params[0].1,
+            Type::Named("M.Shape".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_ctor_with_no_fields() {
+        let input = r#"(module M (type "M.Unit" (ctor "M.Unit.mk")))"#;
+        let (_, module) = parse_module(input).unwrap();
+        assert!(module.types[0].ctors[0].fields.is_empty());
+    }
+
+    #[test]
+    fn test_parse_unsupported_type_decl() {
+        let input = r#"(module M (type "M.Poly" (unsupported "type parameters")))"#;
+        let (_, module) = parse_module(input).unwrap();
+        assert_eq!(
+            module.types[0].unsupported.as_deref(),
+            Some("type parameters")
+        );
+        assert!(module.types[0].ctors.is_empty());
     }
 }

@@ -397,6 +397,7 @@ fn test_every_error_variant_is_published_in_rejections() {
         Error::OpaqueType(s()),
         Error::UnresolvedCall(s()),
         Error::UnknownField(s(), s()),
+        Error::UnsupportedJoinPoint(s()),
     ];
 
     for error in &all {
@@ -412,6 +413,7 @@ fn test_every_error_variant_is_published_in_rejections() {
             Error::OpaqueType(_) => "OpaqueType",
             Error::UnresolvedCall(_) => "UnresolvedCall",
             Error::UnknownField(..) => "UnknownField",
+            Error::UnsupportedJoinPoint(_) => "UnsupportedJoinPoint",
         };
         assert!(
             REJECTIONS.iter().any(|(variant, _)| *variant == name),
@@ -491,16 +493,52 @@ fn test_generate_jp_jmp_inlined() {
 }
 
 #[test]
-fn test_generate_cyclic_jp_skeleton() {
+fn test_cyclic_join_point_is_rejected() {
+    // This used to emit a `loop { /* manual port required */ }` skeleton at
+    // exit 0. That skeleton never bound the join point's parameter and left
+    // `()` where the arm needed a value, so it was Rust that did not compile —
+    // the same silently-broken output this crate rejects everywhere else.
     let ir = r#"
 (module M
   (def f ((x Nat)) Nat
     (jp loop (i) (if (lt i 10) (jmp loop (add i 1)) i)))
 )
 "#;
-    let out = generate(ir);
-    assert!(out.contains("loop {"));
-    assert!(out.contains("manual port required"));
+    assert_eq!(
+        generate_err(ir),
+        Error::UnsupportedJoinPoint("loop".to_string())
+    );
+}
+
+#[test]
+fn test_multi_caller_join_point_is_rejected() {
+    // Two `jmp` sites for one `jp`. LCNF produces this from something as
+    // ordinary as a `match` whose arms both feed a shared continuation, so it
+    // is not an exotic corner — see `Conformance.c_ctor_body_only`.
+    let ir = r#"
+(module M
+  (def f ((c Nat) (x Nat)) Nat
+    (let g (jp g (a) (add a 1))
+      (if (lt c 1) (jmp g x) (jmp g c))))
+)
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::UnsupportedJoinPoint("g".to_string())
+    );
+}
+
+#[test]
+fn test_join_point_with_no_callers_still_renders() {
+    // The two supported forms are unaffected: no callers renders the body in
+    // place, and exactly one caller inlines (covered above).
+    let ir = r#"
+(module M
+  (def f ((x Nat)) Nat
+    (jp g (a) x))
+)
+"#;
+    assert!(generate(ir).contains("no jump sites"));
 }
 
 #[test]

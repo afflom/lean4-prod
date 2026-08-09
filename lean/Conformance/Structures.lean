@@ -47,7 +47,17 @@ structure BodyOnly where
     real intermediate value. The `match` is on `Nat` rather than a decidable
     comparison so the case stays inside the published subset (a `let`-bound
     `if` lands its `cases` behind a join point, where `decidableIf?` no longer
-    recognizes it, and the decider surfaces as an extern). -/
+    recognizes it, and the decider surfaces as an extern).
+
+    NOTE: this definition's own lowering produces a TWO-CALLER join point (both
+    match arms feed one continuation), which codegen rejects as
+    `UnsupportedJoinPoint`. That is deliberate and it does not weaken the case:
+    the conformance harness pins LOWERING, and what this pins is that
+    `declTypeNames` reaches a type used only in a body. The codegen half — that
+    a body-only type is declared and then renders — is pinned separately by
+    `test_ctor_in_a_definition_body_only_renders_when_declared` in
+    `rust/prod-codegen/src/tests.rs`. If join points ever gain a real lowering,
+    this definition starts generating too, and nothing here needs to change. -/
 @[prod] def c_ctor_body_only (fuel a b : Nat) : Nat :=
   let s := match fuel with
     | 0 => BodyOnly.mk a b

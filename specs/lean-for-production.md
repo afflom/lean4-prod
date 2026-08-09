@@ -61,3 +61,4 @@ Everything else fails, precisely:
 | `OpaqueType` | a type reached codegen with no Rust rendering |
 | `UnresolvedCall` | the callee is neither @[prod]-tagged nor a whitelisted operator, so there is nothing to call |
 | `UnknownField` | a projection names a field the declared type does not have |
+| `UnsupportedJoinPoint` | a join point with several callers, or one that jumps to itself; only the single-caller form, which inlines at its jump site, has a lowering |

@@ -86,9 +86,12 @@
 //!     not inside its own body is inlined at the jump site as
 //!     `{ let p = arg; ...; <jp body> }`, and the declaration site renders as
 //!     `()`. A join point with no callers renders its body in place. Anything
-//!     else (cyclic or multi-caller join points) renders as a `loop {}`
-//!     skeleton with a `manual port required` comment — deliberately not
-//!     over-engineered.
+//!     else — cyclic, or several callers — is rejected as
+//!     [`Error::UnsupportedJoinPoint`], because it would need real control
+//!     flow. This used to emit a `loop {}` skeleton with a "manual port
+//!     required" comment, which did not compile: the join point's parameters
+//!     were never bound, and each jump site had type `()` where its arm
+//!     needed a value.
 //!
 //! ## Recursion
 //!
@@ -135,6 +138,10 @@ pub enum Error {
     /// A projection names a field the declared type does not have. Catches a
     /// declaration and a projection disagreeing within one IR file.
     UnknownField(String, String),
+    /// A join point with several callers, or one that jumps to itself. Only
+    /// the single-caller form has a lowering (it inlines at its jump site);
+    /// the rest would need real control flow.
+    UnsupportedJoinPoint(String),
 }
 
 impl fmt::Display for Error {
@@ -175,6 +182,11 @@ impl fmt::Display for Error {
             Error::UnknownField(ty, field) => {
                 write!(f, "type `{}` declares no field `{}`", ty, field)
             }
+            Error::UnsupportedJoinPoint(name) => write!(
+                f,
+                "join point `{}` has several callers or jumps to itself; only the single-caller form has a lowering",
+                name
+            ),
         }
     }
 }
@@ -228,6 +240,10 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     (
         "UnknownField",
         "a projection names a field the declared type does not have",
+    ),
+    (
+        "UnsupportedJoinPoint",
+        "a join point with several callers, or one that jumps to itself; only the single-caller form, which inlines at its jump site, has a lowering",
     ),
 ];
 
@@ -998,12 +1014,14 @@ impl<'m> Renderer<'_, 'm> {
                     // Inlined at its single jump site; nothing to emit here.
                     Ok(format!("/* jp \"{}\" inlined at its jump site */ ()", name))
                 } else {
-                    // Cyclic or multi-caller: emit a skeleton, not a full lowering.
-                    Ok(format!(
-                        "loop {{\n        /* jp \"{}\": cyclic or multi-caller join point — manual port required */\n        {};\n        break;\n    }}",
-                        name,
-                        self.value(body)?
-                    ))
+                    // Cyclic or multi-caller. This used to emit a `loop {}`
+                    // skeleton with a "manual port required" comment, which is
+                    // not Rust that compiles: the join point's parameters are
+                    // never bound, and each jump site has type `()` where the
+                    // arm needs a value. Emitting it at exit 0 is exactly the
+                    // silently-broken-output failure this crate rejects
+                    // everywhere else, so it is a rejection now.
+                    Err(Error::UnsupportedJoinPoint(name.clone()))
                 }
             }
             Expr::Jmp(name, args) => match self.ctx.decls.get(name.as_str()) {
@@ -1016,11 +1034,14 @@ impl<'m> Renderer<'_, 'm> {
                     out.push_str(" }");
                     Ok(out)
                 }
-                Some(_) => Ok(format!(
-                    "loop {{ /* jmp \"{}\": cyclic or multi-caller join point — manual port required */ break; }}",
+                // The declaration site rejects this too; rejecting here as
+                // well means the error names the jump the reader can see,
+                // whichever of the two codegen reaches first.
+                Some(_) => Err(Error::UnsupportedJoinPoint(name.clone())),
+                None => Ok(format!(
+                    "/* jmp \"{}\": no matching jp declaration */ ()",
                     name
                 )),
-                None => Ok(format!("/* jmp \"{}\": no matching jp declaration */ ()", name)),
             },
             Expr::Unreachable => Ok(String::from("unreachable!()")),
             Expr::Opaque(s) => Err(Error::OpaqueExpr(s.clone())),

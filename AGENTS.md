@@ -209,10 +209,13 @@ Known remaining limitations: typed Lean `Int` semantics is NOT implemented
 saturating sub, total div/mod-by-zero). Arbitrary-precision Nat is ruled OUT by
 the no-heap directive, not merely unimplemented. Closures (`Code.fun`) still
 lower to opaque. User-defined inductives now generate real Rust structs/enums,
-and `ctor`/`cases`/`proj` on them resolve against the module's own `(type ...)`
-declarations — a construction or pattern whose constructor has no declaration
-in the module is rejected (`UnresolvedCall`), not rendered as a dotted Lean
-name pretending to be a Rust path. Monomorphization is still absent, so a
+and `ctor`/`proj` on them resolve against the module's own `(type ...)`
+declarations — a CONSTRUCTION whose constructor has no declaration in the
+module is rejected (`UnresolvedCall`) rather than rendered as a dotted Lean
+name pretending to be a Rust path. That check does NOT yet cover `cases`
+PATTERNS: an alt naming an undeclared constructor still renders
+`Foo.Bar.left(v) => v`, which rustc rejects as "expected a pattern, found an
+expression". Same defect class, same fix shape; not done. Monomorphization is still absent, so a
 parameterised inductive is rejected (`PolymorphicType`) rather than lowered.
 No data-parallel codegen.
 

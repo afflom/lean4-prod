@@ -39,6 +39,15 @@ def conformanceModule : Name := `Conformance
 /-- IR module name for the conformance export. -/
 def conformanceIrModule : String := "Conformance"
 
+/-- Module whose lowering is pinned but whose codegen is a deliberate
+    rejection. Separate from `conformanceModule` so that corpus can promise
+    that everything in it also generates Rust which compiles — enforced by
+    `rust/prod-codegen-compile-tests`. -/
+def conformanceRejectedModule : Name := `ConformanceRejected
+
+/-- IR module name for the rejected-conformance export. -/
+def conformanceRejectedIrModule : String := "ConformanceRejected"
+
 /-! ## Published subset contract
 
 Machine-readable description of the Lean-side lowering surface, consumed by
@@ -114,7 +123,7 @@ def emitKernelIr (ctx : LowerCtx) (irModule : String) (extracted : Array Extract
   return (ir ++ ")\n", reports)
 
 /-- The whole export, as a CoreM computation over the imported environment. -/
-def runExport : CoreM (String × String × String × String) := do
+def runExport : CoreM (String × String × String × String × String) := do
   let env ← getEnv
   let ctx : LowerCtx := { tagged := (taggedNames env targetModule).toArray }
   let extracted ← extractTagged targetModule
@@ -125,11 +134,14 @@ def runExport : CoreM (String × String × String × String) := do
   let confCtx : LowerCtx := { tagged := (taggedNames env conformanceModule).toArray }
   let confExtracted ← extractTagged conformanceModule
   let (confIr, _) ← emitKernelIr confCtx conformanceIrModule confExtracted
-  return (ir, roots, coverage, confIr)
+  let rejCtx : LowerCtx := { tagged := (taggedNames env conformanceRejectedModule).toArray }
+  let rejExtracted ← extractTagged conformanceRejectedModule
+  let (rejIr, _) ← emitKernelIr rejCtx conformanceRejectedIrModule rejExtracted
+  return (ir, roots, coverage, confIr, rejIr)
 
 /-- `runExport` with exceptions rendered to strings (while CoreM context for
     pretty-printing is still available). -/
-def runExportSafe : CoreM (Except String (String × String × String × String)) := do
+def runExportSafe : CoreM (Except String (String × String × String × String × String)) := do
   try
     pure (.ok (← runExport))
   catch e =>
@@ -220,26 +232,30 @@ private def parseOutDir : List String → Option System.FilePath
 unsafe def main (args : List String) : IO Unit := do
   Lean.initSearchPath (← Lean.findSysroot)
   Lean.enableInitializersExecution
-  let env ← Lean.importModules #[{ module := Prod.targetModule }, { module := Prod.conformanceModule }]
+  let env ← Lean.importModules #[{ module := Prod.targetModule }, { module := Prod.conformanceModule },
+      { module := Prod.conformanceRejectedModule }]
     {} (leakEnv := true) (loadExts := true)
   let coreCtx : Core.Context := { fileName := "prod-export", fileMap := default }
   let eio := (ReaderT.run Prod.runExportSafe coreCtx).run { env := env }
   let result ← EIO.toIO' eio
-  let (ir, roots, coverage, confIr) ← match result with
+  let (ir, roots, coverage, confIr, rejIr) ← match result with
     | Except.ok (Except.ok outputs, _st) => pure outputs
     | Except.ok (Except.error msg, _st) => throw (IO.userError s!"prod-export failed: {msg}")
     | Except.error _ => throw (IO.userError "prod-export failed: uncaught exception")
-  let (irPath, rootsPath, covPath, goldensPath, confPath, subsetPath) := match parseOutDir args with
+  let (irPath, rootsPath, covPath, goldensPath, confPath, rejPath, subsetPath) := match parseOutDir args with
     | some dir =>
       (dir / "kernel.ir", dir / "roots.json", dir / "coverage.md", dir / "goldens.ir",
-       dir / "conformance-golden.ir", dir / "subset.json")
+       dir / "conformance-golden.ir", dir / "conformance-golden-rejected.ir",
+       dir / "subset.json")
     | none =>
       ("../rust/prod-core/kernel.ir", "../roots.json", "../coverage.md",
-       "../rust/prod-core/goldens.ir", "Conformance/golden.ir", "../subset.json")
+       "../rust/prod-core/goldens.ir", "Conformance/golden.ir",
+       "Conformance/golden-rejected.ir", "../subset.json")
   IO.FS.writeFile irPath ir
   IO.FS.writeFile rootsPath roots
   IO.FS.writeFile covPath coverage
   IO.FS.writeFile goldensPath Prod.emitGoldensIr
   IO.FS.writeFile confPath confIr
+  IO.FS.writeFile rejPath rejIr
   IO.FS.writeFile subsetPath Prod.subsetJson
-  IO.println s!"prod-export: wrote {irPath}, {rootsPath}, {covPath}, {goldensPath}, {confPath}, {subsetPath}"
+  IO.println s!"prod-export: wrote {irPath}, {rootsPath}, {covPath}, {goldensPath}, {confPath}, {rejPath}, {subsetPath}"

@@ -35,6 +35,32 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
     };
     assert_eq!(c_proj_middle_prop(m), (1, (2, 3)));
 
+    // The invariant-lowering probe structures (`lean/Conformance/Structures.lean`).
+    // What each one pins about lowering lives in `golden.ir`, which `just
+    // conformance` diffs; these calls only establish that the generated Rust
+    // for them is constructible and callable. Values satisfy each structure's
+    // Lean invariant, so they stay valid once Task 5 turns these literals into
+    // checked constructors.
+    let mixed = MixedCompare {
+        lo: 2,
+        hi: 7,
+        extra: 5,
+    };
+    assert_eq!(c_mixed_compare(mixed)?, 14);
+    let split = SplitInvariant { a: 1, b: 3 };
+    assert_eq!(c_split_invariant(split)?, 4);
+    let tagged = TaggedMode { mode: 1, limit: 9 };
+    assert_eq!(c_tagged_mode(tagged)?, 10);
+    // These two have Prop fields OUTSIDE the lowerable fragment, so they carry
+    // no invariant and keep plain public fields — the decline path.
+    let unlowerable = UnlowerableProp { x: 1, y: 2 };
+    assert_eq!(c_unlowerable_prop(unlowerable)?, 3);
+    let non_numeric = NonNumericCompare {
+        flagA: true,
+        flagB: true,
+    };
+    assert!(c_non_numeric_compare(non_numeric));
+
     // List: caller-owned output buffer in, borrowed slice back out.
     // `c_list_build` is base-2 digits least-significant-first, so 5 is [1,0,1]
     // and consuming it sums to 2 — a popcount, not the input.

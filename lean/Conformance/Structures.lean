@@ -79,6 +79,67 @@ structure TaggedMode where
   limit : Nat
   ok    : (mode = 0 ∨ mode = 1) ∧ ¬ (limit = 0)
 
+/-- The only `Int` invariant in the corpus.
+
+    The published contract (`specs/lean-for-production.md`) says comparisons
+    lower "only on `Nat`, `Int` and the sized kinds", and `propCmpKinds`
+    admits `Int` — but every other `(invariant ...)` in the repo is over
+    `Nat`, so `Int` was a published guarantee nothing ran. Dropping `Int`
+    from `propCmpKinds` would have left every golden byte-identical.
+
+    `hi ≤ 100` additionally pins that an `Int` numeric literal reaches
+    `lowerPropOperand` as an `OfNat.ofNat` application whose raw argument is
+    the value — the same shape as `Nat`'s, on a different kind. -/
+structure IntRange where
+  lo : Int
+  hi : Int
+  ok : lo ≤ hi ∧ hi ≤ 100
+
+/-- The only sized-kind invariant in the corpus, and the only place a
+    comparison on a bounded kind is exercised at all.
+
+    Same "published but unexecuted" gap as `IntRange`, plus one that is
+    specific to the sized kinds: `lowerPropOperand` reads an `OfNat` numeral
+    *before* interpretation, so a literal is lowered as its written digits.
+    For `Nat` that is exact — a `Nat` literal is its value — but for `UInt8`
+    it is only exact while the literal is in range: `(256 : UInt8)` is `0`
+    and would lower as `256`. `cap ≤ 200` is in range and therefore correct;
+    it is here so that the sized-kind path is executed at all, and so that a
+    future in-range/out-of-range distinction has something to sit beside.
+    (An out-of-range literal is not added deliberately: it would pin wrong
+    output as expected output.)
+
+    `used ≤ cap` beside it pins a field-to-field comparison on a sized kind,
+    which no literal-only bound can distinguish from a constant fold. -/
+structure ByteWindow where
+  used : UInt8
+  cap  : UInt8
+  fits : used ≤ cap ∧ cap ≤ 200
+
+/-- One lowerable `Prop` field and one unlowerable one, in the same type.
+
+    `UnlowerableProp` and `NonNumericCompare` each have a SINGLE, wholly
+    unlowerable `Prop` field, so both only ever exercise "zero conjuncts
+    survive". This is the only structure that exercises "one survives, one
+    does not" — the sole input under which a PARTIAL invariant could ever be
+    emitted, which the contract and `AGENTS.md` both publish as impossible
+    ("a type re-checks its whole proposition or none of it"; "Never a partial
+    check").
+
+    `h1 : x ≥ 1` lowers on its own — it is the same shape as
+    `SplitInvariant`'s first conjunct — and `h2 : x ≠ y` does not (`≠` is
+    `Ne`). The required outcome is that this type appears in `golden.ir`
+    DECLARED WITH ITS FIELDS and with NO `(invariant ...)` clause at all:
+    not `(invariant (le 1 x))`, which would be a check presented as
+    complete, and not absent. `lowerTypeDecl`'s `invOk := false` on any
+    decline is what makes that true; nothing else in the corpus can tell it
+    from a version that simply skipped the unlowerable conjunct. -/
+structure PartialProp where
+  x  : Nat
+  y  : Nat
+  h1 : x ≥ 1
+  h2 : x ≠ y
+
 /-- The DECLINE path: a `Prop` field outside the fragment.
 
     `≠` is `Ne`, which is not a connective or comparison `lowerProp` handles.
@@ -134,5 +195,14 @@ structure NonNumericCompare where
 
 @[prod] def c_non_numeric_compare (v : NonNumericCompare) : Bool :=
   v.flagA
+
+@[prod] def c_int_range (r : IntRange) : Int :=
+  r.lo + r.hi
+
+@[prod] def c_byte_window (b : ByteWindow) : UInt8 :=
+  b.used + b.cap
+
+@[prod] def c_partial_prop (p : PartialProp) : Nat :=
+  p.x + p.y
 
 end Conformance

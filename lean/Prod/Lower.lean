@@ -252,6 +252,21 @@ private def isCtorName (env : Environment) (n : Name) : Bool :=
 def lowerLetValue (v : LetValue .pure) : LowerM String := do
   match v with
   | .lit (.nat n) => return toString n
+  -- Sized-integer literals are a *distinct* `LitValue` constructor from
+  -- `.nat` (`Lean/Compiler/LCNF/Basic.lean`: `LitValue` has `nat`, `str`,
+  -- `uint8`, `uint16`, `uint32`, `uint64`, `usize`), not a `Nat` literal
+  -- wrapped in a `UIntN` — discovered because `c_u8_guard_lt`'s `then 1 else
+  -- 0` branches (the first sized literals in the conformance suite) fell
+  -- through to the opaque catch-all below and would have made codegen
+  -- reject the whole definition (`Expr::Opaque` → `Error::OpaqueExpr`). The
+  -- IR grammar's numeric literals are untagged decimal tokens either way
+  -- (`prod-ir`'s `parse_u64`/`Expr::Nat`), so the same rendering as `.nat`
+  -- is exact: the sized-integer receiver already pins the Rust type via the
+  -- surrounding `(add U8 ...)`/return-type context, same as `Nat`'s.
+  | .lit (.uint8 n) => return toString n
+  | .lit (.uint16 n) => return toString n
+  | .lit (.uint32 n) => return toString n
+  | .lit (.uint64 n) => return toString n
   | .lit _ => opaqueNode "literal"
   | .erased => opaqueNode "erased"
   | .proj typeName idx struct => do

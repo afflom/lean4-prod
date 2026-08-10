@@ -71,5 +71,10 @@ namespace Conformance
 @[prod] def c_u8_mul (a b : UInt8) : UInt8 := a * b
 @[prod] def c_u8_div (a b : UInt8) : UInt8 := a / b
 @[prod] def c_u8_shl (a b : UInt8) : UInt8 := a <<< b
+-- Exercises the `UInt8` decider rows in `deciderNames`: without this, all 24
+-- sized decider constants (Lt/Le/Eq × 4 widths, plus the auto-generated
+-- `instDecidableEq` forms) are whitelisted and published but never actually
+-- lowered by any conformance case.
+@[prod] def c_u8_guard_lt (a b : UInt8) : UInt8 := if a < b then 1 else 0
 
 end Conformance

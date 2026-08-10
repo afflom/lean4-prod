@@ -978,17 +978,18 @@ fn test_sized_arithmetic_wraps_and_is_infallible() {
 }
 
 #[test]
-fn test_sized_shift_truncates_rather_than_masking() {
-    // wrapping_shl would be WRONG: it masks the amount, so 1u8 << 8 == 1.
-    // Lean's BitVec shift gives 0 for any amount at or beyond the width.
+fn test_sized_shift_masks_the_amount_mod_width() {
+    // `UInt8.shiftLeft a b = ⟨a.toBitVec <<< (UInt8.mod b 8).toBitVec⟩`
+    // (`Init/Data/UInt/Basic.lean:126`) masks the amount mod the width — it
+    // does NOT truncate to 0 past the width (that's `Nat.shiftRight`, whose
+    // unbounded `Nat` genuinely has no width to mask by). So `1u8 << 8`
+    // masks to `1u8 << 0 == 1`, and `checked_shl(..).unwrap_or(0)` — which
+    // would give `0` here — is the WRONG rendering for sized shifts.
     let ir = r#"(module M (def f ((a U8) (b U8)) U8 (shl U8 a b)))"#;
     let out = generate(ir);
-    assert!(out.contains("checked_shl"), "got: {}", out);
-    assert!(
-        !out.contains("wrapping_shl"),
-        "wrapping_shl masks the amount"
-    );
-    assert!(out.contains("unwrap_or(0)"));
+    assert!(out.contains("wrapping_shl"), "got: {}", out);
+    assert!(!out.contains("checked_shl"), "checked_shl truncates to 0");
+    assert!(!out.contains("unwrap_or(0)"));
 }
 
 #[test]
@@ -997,4 +998,16 @@ fn test_sized_division_is_total() {
     let out = generate(ir);
     assert!(out.contains("if (b) == 0 { 0 }"));
     assert!(!out.contains("ComputeError"));
+}
+
+#[test]
+fn test_sized_pow_is_rejected_not_unsoundly_rendered() {
+    // No sized `pow` row is whitelisted from Lean (`sizedOpSuffixes` has no
+    // `pow`), but hand-written IR can still ask for one. `wrapping_pow`'s
+    // exponent has no absorbing case the way shifts do, so the
+    // `u32::try_from(..).unwrap_or(u32::MAX)` narrowing every other exponent
+    // helper here uses would silently compute the wrong number for a `U64`
+    // exponent that overflows `u32`. Rejected outright instead.
+    let ir = r#"(module M (def f ((a U8) (b U8)) U8 (pow U8 a b)))"#;
+    assert!(matches!(generate_err(ir), Error::UnsupportedKind(_)));
 }

@@ -957,6 +957,11 @@ impl<'m> Renderer<'_, 'm> {
             },
             Expr::Div(k, a, b) => self.div_or_mod(*k, a, b, DivMod::Div),
             Expr::Mod(k, a, b) => self.div_or_mod(*k, a, b, DivMod::Mod),
+            // `Nat` shifts are checked (`Nat` is unbounded, so an
+            // out-of-range `Nat` shift amount can genuinely overflow `u64`).
+            // Sized shifts mask the amount mod the width instead — see
+            // `wrapping_shift`'s doc comment — which is exactly Rust's
+            // `wrapping_shl`.
             Expr::Shl(k, a, b) => match k {
                 NumKind::Nat => self.checked_exponent_op(
                     *k,
@@ -969,22 +974,37 @@ impl<'m> Renderer<'_, 'm> {
                 NumKind::Int => Err(Error::UnsupportedKind(String::from(
                     "shifts are not supported for Int",
                 ))),
-                _ => self.total_shift(*k, a, b, "checked_shl"),
+                _ => self.wrapping_shift(*k, a, b, "wrapping_shl"),
             },
-            // Unlike `Shl`, `Nat.shiftRight` (and the sized-integer shifts) is
-            // total and infallible: Lean's `Nat` is unbounded, so `a >>> b =
-            // 0` for any `b >= 64` once `a` fits `u64`. `checked_shr` already
-            // returns `None` exactly there (and for `b >= 2^32`, via the
-            // `try_from` fallback to `u32::MAX`), so `unwrap_or(0)` is the
-            // exact answer, not a fallback for a real error — there is no
-            // `ComputeError` variant for this because none is needed. Shifts
-            // on `Int` are a deliberate non-goal and are rejected outright.
+            // `Nat.shiftRight` is total and infallible: `Nat` is unbounded,
+            // so `a >>> b = 0` for any `b >= 64` once `a` fits `u64` —
+            // `total_shift` (`checked_shr(..).unwrap_or(0)`) is the faithful
+            // rendering, and stays. Sized-integer `shiftRight` masks the
+            // amount instead, like `shiftLeft` — see `wrapping_shift`.
+            // Shifts on `Int` are a deliberate non-goal and are rejected
+            // outright.
             Expr::Shr(k, a, b) => match k {
                 NumKind::Int => Err(Error::UnsupportedKind(String::from(
                     "shifts are not supported for Int",
                 ))),
-                _ => self.total_shift(*k, a, b, "checked_shr"),
+                NumKind::Nat => self.total_shift(*k, a, b, "checked_shr"),
+                _ => self.wrapping_shift(*k, a, b, "wrapping_shr"),
             },
+            // Sized `pow` is deliberately rejected, not rendered. Nothing in
+            // `sizedOpSuffixes` (`lean/Prod/Lower.lean`) whitelists a sized
+            // `pow`, so no Lean input can reach this arm today — but
+            // hand-written IR can, and `wrapping_pow`'s exponent has no
+            // absorbing failure case the way `checked_shl`/`wrapping_shl` do
+            // (any shift amount past the width masks harmlessly to the same
+            // small set of outcomes). `u32::try_from(..).unwrap_or(u32::MAX)`
+            // — the narrowing every other exponent helper here uses — would
+            // silently compute `x.wrapping_pow(u32::MAX)` for a `U64`
+            // exponent that overflows `u32`, which is simply a different
+            // number from `x^e mod 2^64`, not a faithful truncation of it.
+            // Rejecting outright is honest about that gap; a correct
+            // rendering (e.g. binary exponentiation performed at the
+            // simulated bit width) is future work if a real input ever needs
+            // it.
             Expr::Pow(k, a, b) => match k {
                 NumKind::Nat | NumKind::Int => self.checked_exponent_op(
                     *k,
@@ -994,7 +1014,10 @@ impl<'m> Renderer<'_, 'm> {
                     "PowExponentTooLarge",
                     "PowOverflow",
                 ),
-                _ => self.wrapping_exponent_op(*k, a, b, "wrapping_pow"),
+                _ => Err(Error::UnsupportedKind(alloc::format!(
+                    "pow is not supported for sized kind {:?} (unsound u32 exponent narrowing)",
+                    k
+                ))),
             },
             Expr::Neg(k, a) => {
                 if *k == NumKind::Int {
@@ -1422,35 +1445,16 @@ impl<'m> Renderer<'_, 'm> {
         ))
     }
 
-    /// `wrapping_pow`: like `wrapping_binop`, but the exponent is a separate
-    /// `u32` argument (Rust's `wrapping_pow` signature), so it needs the same
-    /// `u32::try_from(..).unwrap_or(u32::MAX)` narrowing `total_shift` uses —
-    /// written as its own helper rather than forced through `wrapping_binop`,
-    /// which assumes both operands share the receiver's type. Unlike
-    /// `checked_exponent_op`, this can never fail: it wraps, so there is no
-    /// `ComputeError` to report.
-    fn wrapping_exponent_op(
-        &self,
-        kind: NumKind,
-        a: &'m Expr,
-        b: &'m Expr,
-        method: &str,
-    ) -> Result<String, Error> {
-        Ok(format!(
-            "(({}) as {}).{}(u32::try_from({}).unwrap_or(u32::MAX))",
-            self.value(a)?,
-            kind.rust_type(),
-            method,
-            self.value(b)?
-        ))
-    }
-
-    /// Shifts on `Nat` (right) and on sized integers (both directions) are
-    /// total: shifting by at least the width yields 0.
+    /// `Nat.shiftRight` is total: `Nat` is unbounded, so `a >>> b = 0` for
+    /// any `b >= 64` once `a` fits `u64` — there is no width to mask by, only
+    /// a genuine "shifted past everything" case. `checked_shr` returns
+    /// `None` exactly there (and for `b >= 2^32`, via the `try_from`
+    /// fallback to `u32::MAX`), so `unwrap_or(0)` is the exact answer, not a
+    /// fallback for a real error — there is no `ComputeError` variant for
+    /// this because none is needed.
     ///
-    /// NOTE: `wrapping_shl` is WRONG here — it masks the shift amount, so
-    /// `1u8.wrapping_shl(8) == 1`, whereas Lean's BitVec shift gives 0.
-    /// `checked_shl(..).unwrap_or(0)` is the faithful rendering.
+    /// NOTE: this is `Nat`-only. `UIntN` shifts do NOT truncate to 0 — see
+    /// `wrapping_shift` below, which is what sized shifts actually use.
     fn total_shift(
         &self,
         kind: NumKind,
@@ -1460,6 +1464,45 @@ impl<'m> Renderer<'_, 'm> {
     ) -> Result<String, Error> {
         Ok(format!(
             "(({}) as {}).{}(u32::try_from({}).unwrap_or(u32::MAX)).unwrap_or(0)",
+            self.value(a)?,
+            kind.rust_type(),
+            method,
+            self.value(b)?
+        ))
+    }
+
+    /// Sized-integer shifts mask the amount mod the width, they do NOT
+    /// truncate to 0 past the width (unlike `Nat`, handled by
+    /// `total_shift` above). Lean's own definition:
+    ///
+    /// ```text
+    /// protected def UInt8.shiftLeft (a b : UInt8) : UInt8 :=
+    ///   ⟨a.toBitVec <<< (UInt8.mod b 8).toBitVec⟩
+    /// ```
+    /// (`Init/Data/UInt/Basic.lean:126`; the same shape at 133 for
+    /// `shiftRight`, and at 297/304, 491/498, 662/669 for `UInt16`/`UInt32`/
+    /// `UInt64`) — the shift amount is reduced mod the width *first*, so
+    /// `(1 : UInt8) <<< 8 = 1 <<< (8 % 8) = 1 <<< 0 = 1`, not `0`.
+    ///
+    /// This is exactly Rust's `wrapping_shl`/`wrapping_shr`: both mask the
+    /// shift amount to the low bits of the type, which is equivalent to
+    /// `rhs % width` because every sized width (8/16/32/64) is a power of
+    /// two. The amount narrows to `u32` (the signature `wrapping_shl`
+    /// requires) with a plain `as u32`, not the `try_from(..).unwrap_or(..)`
+    /// saturation `total_shift`/`checked_exponent_op` use: those helpers
+    /// need the saturating form because their `None` case aborts the whole
+    /// operation on an out-of-range amount, but `wrapping_shl` never aborts,
+    /// and truncating a `u64` amount to `u32` cannot disturb the low 6 bits
+    /// that the mod-64 mask actually reads.
+    fn wrapping_shift(
+        &self,
+        kind: NumKind,
+        a: &'m Expr,
+        b: &'m Expr,
+        method: &str,
+    ) -> Result<String, Error> {
+        Ok(format!(
+            "(({}) as {}).{}(({}) as u32)",
             self.value(a)?,
             kind.rust_type(),
             method,

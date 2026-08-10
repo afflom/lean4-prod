@@ -60,6 +60,11 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
                                       // `Int`'s `emod_zero : a % 0 = a` (doctest `(7 : Int) % (0 : Int) = 7`):
                                       // modulo by zero is the dividend, not zero, same as `Nat` above.
     assert_eq!(c_int_emod(7, 0)?, 7);
+    // Cross-checked against Lean's own computed answer, not just a value
+    // someone typed by hand — see the `golden_*` comparisons below for why
+    // that distinction matters.
+    assert_eq!(c_int_ediv(-12, 7)?, golden_int_ediv_neg_12_7());
+    assert_eq!(c_int_emod(-12, 7)?, golden_int_emod_neg_12_7());
 
     // Sized integers. Lean's `UInt8.add` is BitVec addition, so overflow
     // wraps rather than erroring — the opposite of `Nat`/`Int`.
@@ -67,8 +72,25 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
     assert_eq!(c_u8_add(255, 1), 0);
     assert_eq!(c_u8_mul(16, 16), 0);
     assert_eq!(c_u8_div(5, 0), 0); // total
-                                   // The shift truncates rather than masking: wrapping_shl would give 1.
-    assert_eq!(c_u8_shl(1, 8), 0);
+                                   // Sized shifts mask the amount mod the width (`UInt8.shiftLeft a b =
+                                   // a <<< (b % 8)`, `Init/Data/UInt/Basic.lean:126`) — they do NOT
+                                   // truncate to 0 past the width the way `Nat`'s shift does. So
+                                   // `1u8 <<< 8` masks to `1u8 <<< 0 == 1`, not 0.
+    assert_eq!(c_u8_shl(1, 8), 1);
+    // Guard: a decidable `<` comparison on sized integers lowers to a plain
+    // `if`, exercising the `UInt8` decider rows in `deciderNames` (added but
+    // previously unexercised by any conformance case).
+    assert_eq!(c_u8_guard_lt(1, 2), 1);
+    assert_eq!(c_u8_guard_lt(2, 1), 0);
+
+    // The comparison that actually catches a wrong sized rendering: Lean's
+    // own compiled `UInt8.add`/`UInt8.shiftLeft`, not a value typed by hand.
+    // This is what would have caught (and, once added, did catch) a
+    // backwards shift rendering — a hardcoded assertion above can be wrong
+    // in the same direction as the bug it's meant to catch; a golden
+    // computed by the real Lean toolchain cannot.
+    assert_eq!(c_u8_add(255, 1), golden_u8_add_255_1());
+    assert_eq!(c_u8_shl(1, 8), golden_u8_shl_1_8());
     Ok(())
 }
 

@@ -393,6 +393,26 @@ Verified Lean 4.30.0 API facts (from leanprover/lean4 v4.30.0 sources — trust 
   `Conformance.MidProp.mk` has `numParams=0 numFields=4` for 4 declared fields.
   Getting this wrong swaps struct fields SILENTLY, so any change here must
   re-run that conformance case.
+- Structure `Prop` field propositions, as seen in the constructor telescope:
+  conjunction is `And` with `2` args; `a ≥ b` appears as `GE.ge α inst a b`
+  (still `GE.ge`, not unfolded to `LE.le`/`Nat.le`/`Nat.ble`; `inst` is an
+  `LE α` instance — e.g. `instLENat` — because `GE.ge`'s own signature takes
+  `[LE α]` directly, there is no separate synthesized `GE Nat` instance;
+  4 args total: type, instance, lhs, rhs); earlier fields are referenced as
+  `Expr.bvar` with index `(i - 1) - j`, where `i` is the 0-indexed position
+  of the `Prop` field itself in the telescope and `j` is the 0-indexed
+  position of the referenced field (both counted over ALL fields, not just
+  computational ones) — e.g. in `UorAtlas.Instance` (fields `q`=0,`T`=1,`O`=2,
+  `valid`=3), `valid`'s type is `And (GE.ge Nat instLENat #2 1) (And (GE.ge
+  Nat instLENat #1 1) (GE.ge Nat instLENat #0 1))`, i.e. `q`→`#2`, `T`→`#1`,
+  `O`→`#0`; in `Conformance.MidProp` (fields `first`=0,`ok`=1,`second`=2,
+  `third`=3), `ok`'s type is `GE.ge Nat instLENat #0 0`, i.e. `first`→`#0`;
+  numeric literals appear as `OfNat.ofNat Nat n (instOfNatNat n)`, never a
+  raw `Expr.lit`. Verified by dumping `UorAtlas.Instance.mk` and
+  `Conformance.MidProp.mk`. The invariant lowering (`lowerProp`) is written
+  against exactly this shape, so a toolchain bump that changes it will show
+  up as propositions no longer lowering — which degrades to "no checked
+  constructor", never to a wrong check.
 
 Lowerer requirements:
 - Emit sexp matching `rust/prod-ir` grammar EXACTLY — read

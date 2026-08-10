@@ -777,19 +777,52 @@ Field reads become accessor calls: `inst.q` → `inst.q()`, `inst.T` → `inst.T
 
 `MidProp { first: 1, second: 2, third: 3 }` becomes `MidProp::new(1, 2, 3)?`. That test returns `Result`, so `?` works.
 
-- [ ] **Step 3: Rewrite the contract's erased-invariants section**
+- [ ] **Step 3: Assert the invariant is not inverted, against the REAL exported type**
+
+Tasks 4 and 5 are each verified against hand-written IR or by reading the export. Neither one *asserts*, in a test, that Lean's `q ≥ 1` became `1 <= q` and not `q <= 1`. A reversed comparison compiles, returns a `bool`, and rejects exactly the inputs it should accept — the same silent-wrongness shape as the shift defect this project already shipped. Close it here, where `Instance` comes from the real `kernel.ir` rather than a fixture.
+
+In `rust/prod-core/tests/macro_generation.rs`:
+
+```rust
+#[test]
+fn checked_constructor_accepts_valid_and_rejects_each_violation() -> Result<(), ComputeError> {
+    // Lean proves `q >= 1 /\ T >= 1 /\ O >= 1` for every Instance it builds.
+    // The generated constructor re-checks exactly that at the crate boundary.
+    assert!(Instance::new(4, 3, 8).is_ok());
+    assert!(Instance::new(1, 1, 1).is_ok(), "the boundary itself is valid");
+
+    // One violated conjunct at a time, so a constructor that checked only the
+    // first field — or that lowered a comparison backwards — fails here rather
+    // than passing on a lucky combination.
+    for (q, t, o) in [(0, 3, 8), (4, 0, 8), (4, 3, 0)] {
+        assert_eq!(
+            Instance::new(q, t, o),
+            Err(ComputeError::InvariantViolated("UorAtlas.Instance")),
+            "Instance::new({}, {}, {}) must be rejected",
+            q,
+            t,
+            o
+        );
+    }
+    Ok(())
+}
+```
+
+If the payload string the export produces is not `"UorAtlas.Instance"`, use whatever `decl.name` actually holds — read it from `kernel.ir` rather than guessing, and say in your report which it was.
+
+- [ ] **Step 4: Rewrite the contract's erased-invariants section**
 
 `lean/Prod/Emit.lean`'s `subsetJson` currently states that `Prop` fields are erased and the generated struct does **not** enforce the invariant, so callers must re-check. **That is now backwards for every lowerable case** and must be rewritten, not appended to — this project has already shipped one documentation section that survived the change it described.
 
 The replacement must say: `Prop` fields are still erased, because they are proofs; but when the proposition is lowerable, the struct's fields become `pub(crate)` and a checked `new` re-checks it at the crate boundary, with accessors for reading. When the proposition is not lowerable — quantifiers, arbitrary predicates, anything outside the structure's own fields — the type keeps public fields and the invariant genuinely is not enforced, exactly as before. Name which of the two a reader gets and how to tell.
 
-- [ ] **Step 4: Update `AGENTS.md` and the design doc**
+- [ ] **Step 5: Update `AGENTS.md` and the design doc**
 
 `AGENTS.md`: record that invariant-carrying types exist, that generated code bypasses the check by design and why, and that the lowerable fragment is conjunction/disjunction/negation/comparisons.
 
 The design doc: mark Phase B1 done, and note that Phase B2 (`Fin` literal specialisation) is now unblocked and should be planned against the machinery as it shipped.
 
-- [ ] **Step 5: Full gates and commit**
+- [ ] **Step 6: Full gates and commit**
 
 Run: `nix develop path:/Users/auser/work/rust/mine/lean4-prod --command just prod`, then clippy, fmt and the wasm32 build from `rust/`.
 

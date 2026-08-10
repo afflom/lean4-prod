@@ -54,6 +54,16 @@ non-negative inputs would still pass.
 the non-negative case reduces to `Nat` division, which is also `0`. So `Int`
 division needs the same zero-guard `Nat` already has.
 
+**Modulo by zero is the dividend, not zero.** CORRECTED AFTER THE FACT — this
+section originally said only the division half, and the `div`/`mod` table row
+below generalised `0` to both. `Int.emod`'s `emod_zero` gives
+`(7 : Int) % (0 : Int) = 7`, and `Nat.mod`'s own doc comment says *"When the
+divisor is `0`, the result is the dividend rather than an error"* (doctest
+`5 % 0 = 5`); sized `mod` inherits `Nat`'s answer through
+`BitVec.umod`. So `div` and `mod` need *different* zero-guard values — a shared
+guard rendering `0` for both is right for division and wrong for modulo, which
+is precisely the Critical defect fixed on this branch.
+
 **Sized integers wrap by definition.**
 `Init/Data/UInt/Basic.lean:33`: `UInt8.add a b = ⟨a.toBitVec + b.toBitVec⟩`.
 BitVec arithmetic wraps. So `UIntN` must render `wrapping_*` in exactly the
@@ -61,7 +71,10 @@ positions where `Nat` renders `checked_*(..).ok_or(..)?`.
 
 **Sized-integer division is total too.**
 `Init/Data/BitVec/Basic.lean:271`: `udiv x y = (x.toNat / y.toNat)`, so a zero
-divisor yields `0`, matching `Nat`.
+divisor yields `0`, matching `Nat`. Sized *modulo* is total in the same way and
+by the same route (`umod x y = (x.toNat % y.toNat)`), which means it also
+inherits `Nat`'s answer for a zero divisor — the dividend, not `0`; see the
+correction above.
 
 **`Fin n` is a structure with a `Prop` bound.**
 `Init/Prelude.lean:2306`: `structure Fin (n : Nat) where val : Nat; isLt : val < n`.
@@ -129,10 +142,30 @@ not a fallback rendering.
 | `add` `mul` | checked → error | checked → error | wrapping |
 | `pow` | checked → error | checked → error | rejected (see below) |
 | `sub` | saturating at 0 | checked → error | wrapping |
-| `div` `mod` | total, 0 ⇒ 0 | **Euclidean**, total, 0 ⇒ 0 | total, 0 ⇒ 0 |
-| `shl` | checked → error | not supported | wrapping |
-| `shr` | total, ≥ width ⇒ 0 | not supported | total, ≥ width ⇒ 0 |
+| `div` | total, ÷0 ⇒ 0 | **Euclidean**, total, ÷0 ⇒ 0 | total, ÷0 ⇒ 0 |
+| `mod` | total, %0 ⇒ **dividend** | **Euclidean**, total, %0 ⇒ **dividend** | total, %0 ⇒ **dividend** |
+| `shl` | checked → error | not supported | wrapping (masks mod width) |
+| `shr` | total, ≥ width ⇒ 0 | not supported | wrapping (masks mod width) |
 | unary `neg` | n/a | checked → error | n/a |
+
+CORRECTED AFTER THE FACT — two cells above were wrong, in the same direction
+each time (assuming the zero/out-of-range case is absorbing):
+
+- The `shr`/`UIntN` cell said *"total, ≥ width ⇒ 0"*, copying `Nat`'s row.
+  Sized right shifts mask exactly like sized left shifts —
+  `Init/Data/UInt/Basic.lean:133` defines `UInt8.shiftRight a b =
+  ⟨a.toBitVec >>> (UInt8.mod b 8).toBitVec⟩`, the mirror of `shiftLeft` seven
+  lines above it — so `(1 : UInt8) >>> 8 = 1`, not
+  `0`. This is the same inverted premise that shipped this milestone's only
+  defect on the `shl` side; the correction pass that fixed the `shl` and `pow`
+  cells did not reach this one. `Nat`'s cell is right as written: `Nat` is
+  unbounded, so there is no width to mask by.
+- The single `div`/`mod` row said *"total, 0 ⇒ 0"* for all three kinds. Only
+  division gives `0`. **Modulo by a zero divisor returns the dividend**, for
+  every kind: `Nat.mod`'s own doctest is `5 % 0 = 5`, and `Int`'s `emod_zero`
+  gives `(7 : Int) % (0 : Int) = 7`. Rendering `0` there was a Critical defect
+  fixed on this branch; the row is split in two so the two policies can no
+  longer share a cell.
 
 Sized `pow` is rejected rather than rendered: `wrapping_pow` takes a `u32`
 exponent and, unlike `checked_shl`, has no absorbing behaviour at large

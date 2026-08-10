@@ -206,9 +206,39 @@ What that means in practice, and what you must not regress:
     their bless/regenerate workflows. The operator whitelist
     (`Prod.numOpNames`) and decider list (`Prod.deciderNames`) in `Lower.lean`
     are each a single association list consumed by both the lowerer
-    (`opWhitelist`/`deciderOp`) and the exporter (`subsetJson`), so the
-    contract cannot list an operator/decider the lowerer does not actually
-    accept, or omit one it does.
+    (`opWhitelist`/`deciderOp`) and the exporter (`subsetJson`). What that
+    buys differs between the two, and the difference matters — the same
+    over-reading was already falsified once for conversions (see the
+    `## Conversions` note below):
+      - **Deciders: both directions hold.** `deciderOp` is the sole
+        acceptance route for a decidable guard, so the contract can neither
+        list a decider the lowerer rejects nor omit one it accepts.
+      - **Operators: only one direction holds.** The contract cannot list an
+        operator `opWhitelist` does not accept — but it *does* omit accepted
+        ones. `natDictOp`/`natHDictOp`, consulted by `knownOpOf` on the
+        dictionary path (below), accept thirteen further constants
+        (`instAddNat`, `instSubNat`, `instMulNat`, `instNatPowNat`,
+        `instDiv`, `instMod`, `instHAdd`, `instHSub`, `instHMul`, `instHDiv`,
+        `instHMod`, `instHPow`, `instPowNat`) that appear in no contract row.
+        So read `## Operators` as "every listed operator is really accepted",
+        not as "this is everything the lowerer accepts".
+  - The **dictionary path** is that second acceptance route, and it hard-codes
+    kind `"Nat"`. Lean's `a + b` can reach LCNF as an `instHAdd`/`instAddNat`
+    dictionary bound to a local, then applied; `knownOpOf` recognizes the
+    dictionary constant, records `(op, kind)` in `knownOps`, and
+    `lowerLetValue`'s `.fvar` arm emits the operator when the local is
+    applied to two arguments. Every row in both tables says `"Nat"`, because
+    every constant in them is a `Nat` dictionary — but the *wrapper* names
+    (`instHAdd`, `instHPow`, `instPowNat`, …) are not `Nat`-specific, so a
+    non-`Nat` operation that reached lowering through an unfolded wrapper
+    would be tagged `Nat` and mis-rendered. That is not a hypothetical worry:
+    `Int.pow` reaches `instHPow` → `instPowNat` → `instance : NatPow Int`.
+    It is settled empirically rather than by reasoning —
+    `Conformance.c_int_pow` pins the answer as `(pow Int a b)` in the golden,
+    because LCNF resolves the whole chain to the `Int.pow` constant and
+    `opWhitelist` matches first. **Any new non-`Nat` operator whose
+    typeclass wrapper is one of those thirteen names needs its own
+    conformance case before its contract row can be believed.**
   - One documented, deliberate gap: `Prop` fields (e.g. `Instance.valid : q
     ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1`) are erased on export, so the generated Rust struct
     does not enforce the invariant its Lean source states — see the "Erased

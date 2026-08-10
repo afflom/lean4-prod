@@ -848,15 +848,23 @@ fn test_sized_arithmetic_wraps_and_is_infallible() {
     assert!(!out.contains("ComputeError"));
 }
 
+// CORRECTED AFTER THE FACT — this test was planned as
+// `test_sized_shift_truncates_rather_than_masking`, asserting `checked_shl` +
+// `unwrap_or(0)` and forbidding `wrapping_shl`. That is the inverted premise
+// (see the `total_shift` correction in Task 3): `UInt8.shiftLeft a b =
+// ⟨a.toBitVec <<< (UInt8.mod b 8).toBitVec⟩` (`Init/Data/UInt/Basic.lean:126`)
+// masks mod the width, so `(1 : UInt8) <<< 8 = 1` and the planned assertions
+// would have pinned the wrong rendering. `Nat` is the one that truncates,
+// because it is unbounded and has no width to mask by. Shown here as shipped.
 #[test]
-fn test_sized_shift_truncates_rather_than_masking() {
-    // wrapping_shl would be WRONG: it masks the amount, so 1u8 << 8 == 1.
-    // Lean's BitVec shift gives 0 for any amount at or beyond the width.
+fn test_sized_shift_masks_the_amount_mod_width() {
+    // wrapping_shl is RIGHT: it masks the amount, so 1u8 << 8 == 1, which is
+    // exactly Lean's answer. checked_shl(..).unwrap_or(0) would give 0.
     let ir = r#"(module M (def f ((a U8) (b U8)) U8 (shl U8 a b)))"#;
     let out = generate(ir);
-    assert!(out.contains("checked_shl"), "got: {}", out);
-    assert!(!out.contains("wrapping_shl"), "wrapping_shl masks the amount");
-    assert!(out.contains("unwrap_or(0)"));
+    assert!(out.contains("wrapping_shl"), "got: {}", out);
+    assert!(!out.contains("checked_shl"), "checked_shl truncates to 0");
+    assert!(!out.contains("unwrap_or(0)"));
 }
 
 #[test]
@@ -927,7 +935,15 @@ In `lean/Conformance.lean`. A case that stays in range proves nothing:
 @[prod] def c_u8_shl (a b : UInt8) : UInt8 := a <<< b
 ```
 
-Add Lean-computed goldens for `c_u8_add 255 1` (wraps to 0) and `c_u8_shl 1 8` (0, not 1) in `goldenEntries`.
+Add Lean-computed goldens for `c_u8_add 255 1` (wraps to 0) and `c_u8_shl 1 8`
+in `goldenEntries`.
+
+CORRECTED AFTER THE FACT — this line originally read "`c_u8_shl 1 8` (0, not
+1)". Lean's answer is **1**, not 0: the shift amount masks mod the width
+(`8 % 8 = 0`, so `1 <<< 0 = 1`). Same inverted premise as the Task 4 Step 2
+test above. The golden is computed by calling the compiled Lean definition, so
+`goldenEntries` produced the right value regardless of what this line said —
+which is the whole point of computing goldens instead of typing them.
 
 - [ ] **Step 8: Assert in the compile-tests crate**
 
@@ -936,9 +952,21 @@ Add Lean-computed goldens for `c_u8_add 255 1` (wraps to 0) and `c_u8_shl 1 8` (
     assert_eq!(c_u8_add(255, 1), 0);
     assert_eq!(c_u8_mul(16, 16), 0);
     assert_eq!(c_u8_div(5, 0), 0); // total
-    // The shift truncates rather than masking: wrapping_shl would give 1.
-    assert_eq!(c_u8_shl(1, 8), 0);
+    // The shift masks rather than truncating: 8 % 8 = 0, so 1 <<< 0 = 1.
+    assert_eq!(c_u8_shl(1, 8), 1);
+    // ...and compared against Lean's own computed answer, not only this
+    // hand-typed one — a hand-typed expectation can be wrong in the same
+    // direction as the bug it is meant to catch, which is what happened here.
+    assert_eq!(c_u8_shl(1, 8), golden_u8_shl_1_8());
 ```
+
+CORRECTED AFTER THE FACT — this step originally asserted
+`assert_eq!(c_u8_shl(1, 8), 0)`, the inverted premise again (Task 4 Step 2 and
+Step 7 above). That assertion shipped, disagreeing with the Lean-computed
+`golden_u8_shl_1_8 = 1` sitting in the same repository, and nothing compared
+the two — so the build stayed green. The golden comparison is now part of this
+step, and `prod-codegen-compile-tests/tests/goldens_consumed.rs` fails the
+build if any golden has no consumer at all.
 
 - [ ] **Step 9: Full gates and commit**
 

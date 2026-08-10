@@ -175,7 +175,10 @@ fn test_parse_every_num_kind() {
 fn test_untagged_arithmetic_no_longer_parses() {
     // The tag is mandatory. An untagged node would have to mean something by
     // default, and "add means Nat" implicitly is exactly what this removes.
-    assert!(parse_expr("(add a b)").is_err() || !parse_expr("(add a b)").unwrap().0.is_empty());
+    // No arm of `parse_paren_expr` matches `(add a b)` once `add` requires a
+    // kind, so the whole expression fails rather than parsing as something
+    // else.
+    assert!(parse_expr("(add a b)").is_err());
 }
 
 #[test]

@@ -72,7 +72,7 @@ def subsetJson : String :=
   -- single-block inductives with a single constructor (`Prop` fields
   -- erased) — the only shape the conformance suite exercises
   -- (`Conformance.MidProp`, `Conformance.NoProp`, `UorAtlas.Instance`).
-  let types := ["Nat", "Bool", "Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int)",
+  let types := ["Nat", "Bool", "Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int; Nat -> Int is supported, via the constructors Int.ofNat (n renders as (n as i64)) and Int.negSucc (n renders as -(n as i64) - 1) -- these are constructor applications, not conversion calls, so they never appear in the Conversions list below)",
                 "UInt8, UInt16, UInt32, UInt64 (render as u8/u16/u32/u64; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) — none of this can fail; pow is not whitelisted for sized kinds)",
                 "Prod", "List", "Option",
                 "parameterless, non-recursive, single-constructor structures (Prop fields erased)"]
@@ -223,9 +223,14 @@ def goldenEntries : Array GoldenEntry := Id.run do
   out := out.push { name := "golden_int_emod_neg_12_7", ret := "Int",
                     value := toString (Conformance.c_int_emod (-12) 7) }
   -- Sized integers wrap: both goldens are boundary cases computed by calling
-  -- the compiled `UInt8` `+`/`<<<` instances themselves, so a checked or
-  -- masking rendering would visibly disagree with Lean's own answer (0, not
-  -- 256 or 1).
+  -- the compiled `UInt8` `+`/`<<<` instances themselves. `c_u8_add 255 1`'s
+  -- Lean answer is `0` (wraps; a checked rendering would instead report an
+  -- overflow error, disagreeing with Lean's total answer). `c_u8_shl 1 8`'s
+  -- Lean answer is `1`: `UInt8.shiftLeft` masks the amount mod the width
+  -- (`8 % 8 = 0`, so `1 <<< 0 = 1`), which is what `wrapping_shl` renders; a
+  -- rendering that truncates to `0` past the width instead (`Nat.shiftRight`'s
+  -- `checked_shr(..).unwrap_or(0)` shape) would disagree with Lean's actual
+  -- answer of `1`.
   out := out.push { name := "golden_u8_add_255_1", ret := "U8",
                     value := toString (Conformance.c_u8_add 255 1) }
   out := out.push { name := "golden_u8_shl_1_8", ret := "U8",

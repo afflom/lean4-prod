@@ -194,7 +194,7 @@ What that means in practice, and what you must not regress:
     conformance golden (`lean/Conformance/golden.ir`) are the project's two
     committed generated artifacts — see the "Rules (hard)" section above for
     their bless/regenerate workflows. The operator whitelist
-    (`Prod.natOpNames`) and decider list (`Prod.deciderNames`) in `Lower.lean`
+    (`Prod.numOpNames`) and decider list (`Prod.deciderNames`) in `Lower.lean`
     are each a single association list consumed by both the lowerer
     (`opWhitelist`/`deciderOp`) and the exporter (`subsetJson`), so the
     contract cannot list an operator/decider the lowerer does not actually
@@ -291,8 +291,15 @@ What that means in practice, and what you must not regress:
     operators are whitelisted") is gone: `specs/lean-for-production.md` now
     has a `## Conversions` section alongside `## Operators`, generated from
     `Prod.conversionNames` the same way `## Operators` is generated from
-    `Prod.numOpNames` — one source of truth, so the contract cannot list a
-    conversion the lowerer does not actually accept, or omit one it does.
+    `Prod.numOpNames`. That single-source-of-truth mechanism guarantees only
+    that the *conversion-table* rows cannot drift from what `conversionWhitelist`
+    accepts — it is narrower than "the contract omits no accepted conversion":
+    `Nat → Int` is accepted too, via the `Int.ofNat`/`Int.negSucc`
+    constructors (see above), which never populate `conversionNames` and so
+    never appear under `## Conversions`. That case is documented instead in
+    the `Int` type blurb in `subsetJson` (`lean/Prod/Emit.lean`), which is the
+    one place in the generated contract a reader can confirm `Nat → Int`
+    works at all.
 
 Known remaining limitations: Closures (`Code.fun`) still
 lower to opaque. User-defined inductives now generate real Rust structs/enums,

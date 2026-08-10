@@ -206,7 +206,19 @@ def natOpRows : List (Name × String × String) :=
     (`Nat.shiftLeft, "shl", "Nat"), (`Nat.shiftRight, "shr", "Nat"),
     (`Nat.pow, "pow", "Nat") ]
 
-def numOpNames : List (Name × String × String) := natOpRows
+/-- `Int` operator whitelist. `Int.ediv`/`Int.emod` are the actual `Div
+    Int`/`Mod Int` instance implementations (Euclidean, not truncating —
+    `Init/Data/Int/DivMod/Basic.lean`, "for compatibility with SMT-LIB"), so
+    they are the names that reach LCNF for `a / b`/`a % b` on `Int`, not
+    `Int.div`/`Int.mod` (which are the truncating operations and are never
+    invoked by the `/`/`%` notation). Shifts are deliberately absent: `Int`
+    shifts are not lowered (see `prod-codegen`'s `Expr::Shl`/`Expr::Shr`). -/
+def intOpRows : List (Name × String × String) :=
+  [ (`Int.add, "add", "Int"), (`Int.sub, "sub", "Int"), (`Int.mul, "mul", "Int"),
+    (`Int.ediv, "div", "Int"), (`Int.emod, "mod", "Int"),
+    (`Int.neg, "neg", "Int"), (`Int.pow, "pow", "Int") ]
+
+def numOpNames : List (Name × String × String) := natOpRows ++ intOpRows
 
 /-- `.const` operator whitelist: Lean constant → (IR operator, IR kind). -/
 def opWhitelist (n : Name) : Option (String × String) :=
@@ -247,6 +259,9 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
       return s!"(ctor \"{declName}\"{spaced args'})"
     match opWhitelist declName with
     | some (op, kind) =>
+      -- `Int.neg` is unary, unlike every other whitelisted operator.
+      if op == "neg" && args'.size == 1 then
+        return s!"(neg {kind} {args'[0]!})"
       if args'.size == 2 then
         return s!"({op} {kind} {args'[0]!} {args'[1]!})"
       -- partial/unusual application of a whitelisted op: not a 2-arg operator
@@ -280,7 +295,8 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     is not unfolded (unlike the arithmetic dictionaries). -/
 def deciderNames : List (Name × String) :=
   [ (``Nat.decLt, "lt"), (``Nat.decLe, "le"), (``Nat.decEq, "eq"),
-    (``instDecidableEqNat, "eq") ]
+    (``instDecidableEqNat, "eq"),
+    (``Int.decLt, "lt"), (``Int.decLe, "le"), (``Int.decEq, "eq") ]
 
 /-- The decider constants recognized by `decidableIf?`, mapped to their IR
     comparison operator. -/

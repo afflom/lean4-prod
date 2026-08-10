@@ -51,4 +51,14 @@ namespace Conformance
 @[prod] def c_bool_or  (a b : Nat) : Bool := (a < b) || (b < 10)
 @[prod] def c_bool_not (a b : Nat) : Bool := !(a < b)
 
+-- Int. The negative-operand cases are the point: Lean's / and % are Euclidean
+-- (Int.ediv / Int.emod), Rust's truncate, and they differ only when an operand
+-- is negative. Lean's own doctest gives (-12) % 7 = 2; Rust's % gives -5.
+@[prod] def c_int_add (a b : Int) : Int := a + b
+@[prod] def c_int_sub (a b : Int) : Int := a - b
+@[prod] def c_int_mul (a b : Int) : Int := a * b
+@[prod] def c_int_ediv (a b : Int) : Int := a / b
+@[prod] def c_int_emod (a b : Int) : Int := a % b
+@[prod] def c_int_neg (a : Int) : Int := -a
+
 end Conformance

@@ -44,6 +44,14 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
         c_list_build(10, 5, &mut too_small),
         Err(ComputeError::OutputTooSmall)
     );
+
+    // Int. Euclidean, not truncating. Rust's own `/` and `%` would give -1 and -5.
+    assert_eq!(c_int_ediv(-12, 7)?, -2);
+    assert_eq!(c_int_emod(-12, 7)?, 2);
+    assert_eq!(c_int_sub(i64::MIN, 1), Err(ComputeError::SubOverflow));
+    assert_eq!(c_int_neg(i64::MIN), Err(ComputeError::NegOverflow));
+    assert_eq!(c_int_ediv(i64::MIN, -1), Err(ComputeError::DivOverflow));
+    assert_eq!(c_int_ediv(5, 0)?, 0); // total, like Nat
     Ok(())
 }
 

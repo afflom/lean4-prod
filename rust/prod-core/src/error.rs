@@ -36,6 +36,13 @@ pub enum ComputeError {
     PowExponentTooLarge,
     /// A caller-supplied output slice ran out of room for the produced list.
     OutputTooSmall,
+    /// `a - b` on `Int` underflowed `i64`. `Nat` subtraction saturates and
+    /// cannot reach this.
+    SubOverflow,
+    /// `a / b` on `Int` overflowed `i64` — only `i64::MIN / -1`.
+    DivOverflow,
+    /// `-a` on `Int` overflowed `i64` — only `-i64::MIN`.
+    NegOverflow,
 }
 
 impl ComputeError {
@@ -50,6 +57,9 @@ impl ComputeError {
             ComputeError::ShiftExponentTooLarge => "Nat shift amount exceeds u32",
             ComputeError::PowExponentTooLarge => "Nat power exponent exceeds u32",
             ComputeError::OutputTooSmall => "output slice too small for the produced list",
+            ComputeError::SubOverflow => "Int subtraction overflowed i64",
+            ComputeError::DivOverflow => "Int division overflowed i64",
+            ComputeError::NegOverflow => "Int negation overflowed i64",
         }
     }
 }
@@ -78,6 +88,9 @@ mod tests {
             ComputeError::ShiftExponentTooLarge,
             ComputeError::PowExponentTooLarge,
             ComputeError::OutputTooSmall,
+            ComputeError::SubOverflow,
+            ComputeError::DivOverflow,
+            ComputeError::NegOverflow,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

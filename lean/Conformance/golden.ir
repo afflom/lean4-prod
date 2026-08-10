@@ -22,6 +22,10 @@
   (def c_proj_no_prop ((n (named "Conformance.NoProp"))) (Tuple Nat Nat)
     (let _x_1 (proj "Conformance.NoProp" "alpha" n) (let _x_2 (proj "Conformance.NoProp" "beta" n) (let _x_3 (ctor "Prod.mk" _x_1 _x_2) _x_3))))
 
+  ;; full: Conformance.c_int_mul
+  (def c_int_mul ((a Int) (b Int)) Int
+    (let _x_11 (mul Int a b) _x_11))
+
   ;; full: Conformance.c_option
   ;; arity: 2 erased/type args dropped
   (def c_option ((a Nat)) (Option Nat)
@@ -39,6 +43,10 @@
   (def c_nat_pow ((a Nat) (b Nat)) Nat
     (let _x_18 (pow Nat a b) _x_18))
 
+  ;; full: Conformance.c_int_ediv
+  (def c_int_ediv ((a Int) (b Int)) Int
+    (let _x_11 (div Int a b) _x_11))
+
   ;; full: Conformance.c_nat_rec
   (def c_nat_rec ((fuel Nat) (n Nat)) Nat
     (cases fuel (alt "Nat.zero" () (let _x_58 0 _x_58)) (alt "Nat.succ" (n_32) (let _x_59 2 (if (lt n _x_59) (let _x_68 1 _x_68) (let _x_62 1 (let _x_63 1 (let _x_64 (shr Nat n _x_63) (let _x_65 (call c_nat_rec n_32 _x_64) (let _x_66 (add Nat _x_62 _x_65) _x_66))))))))))
@@ -47,6 +55,10 @@
   ;; arity: 4 erased/type args dropped
   (def c_proj_middle_prop ((m (named "Conformance.MidProp"))) (Tuple Nat (Tuple Nat Nat))
     (let _x_1 (proj "Conformance.MidProp" "first" m) (let _x_2 (proj "Conformance.MidProp" "second" m) (let _x_3 (proj "Conformance.MidProp" "third" m) (let _x_4 (ctor "Prod.mk" _x_2 _x_3) (let _x_5 (ctor "Prod.mk" _x_1 _x_4) _x_5))))))
+
+  ;; full: Conformance.c_int_add
+  (def c_int_add ((a Int) (b Int)) Int
+    (let _x_11 (add Int a b) _x_11))
 
   ;; full: Conformance.c_bool
   (def c_bool ((a Nat) (b Nat)) Bool
@@ -78,9 +90,21 @@
   (def c_bool_or ((a Nat) (b Nat)) Bool
     (let _x_12 (lt a b) (cases _x_12 (alt "Bool.false" () (let _x_23 10 (let _x_25 (lt b _x_23) _x_25))) (alt "Bool.true" () _x_12))))
 
+  ;; full: Conformance.c_int_sub
+  (def c_int_sub ((a Int) (b Int)) Int
+    (let _x_11 (sub Int a b) _x_11))
+
+  ;; full: Conformance.c_int_neg
+  (def c_int_neg ((a Int)) Int
+    (let _x_3 (neg Int a) _x_3))
+
   ;; full: Conformance.c_bool_not
   (def c_bool_not ((a Nat) (b Nat)) Bool
     (let _x_2 (lt a b) (cases _x_2 (alt "Bool.false" () (let _x_5 (ctor "Bool.true") _x_5)) (alt "Bool.true" () (let _x_6 (ctor "Bool.false") _x_6)))))
+
+  ;; full: Conformance.c_int_emod
+  (def c_int_emod ((a Int) (b Int)) Int
+    (let _x_11 (mod Int a b) _x_11))
 
   ;; full: Conformance.c_nat_div
   (def c_nat_div ((a Nat) (b Nat)) Nat

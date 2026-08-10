@@ -36,6 +36,13 @@ generated struct is a plain data carrier, not a refinement type.
 - `Nat.shiftLeft`
 - `Nat.shiftRight`
 - `Nat.pow`
+- `Int.add`
+- `Int.sub`
+- `Int.mul`
+- `Int.ediv`
+- `Int.emod`
+- `Int.neg`
+- `Int.pow`
 
 ## Decidable guards
 
@@ -43,6 +50,9 @@ generated struct is a plain data carrier, not a refinement type.
 - `Nat.decLe`
 - `Nat.decEq`
 - `instDecidableEqNat`
+- `Int.decLt`
+- `Int.decLe`
+- `Int.decEq`
 
 ## Rejections
 

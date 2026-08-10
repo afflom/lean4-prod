@@ -206,6 +206,13 @@ def goldenEntries : Array GoldenEntry := Id.run do
   out := out.push { name := "golden_smallEnough_20000_canonical", ret := "Bool", value := toString (UorAtlas.smallEnough 20000 c) }
   out := out.push { name := "golden_tryClassDecode_43_canonical", ret := "(Option (Tuple Nat (Tuple Nat Nat)))", value := optTripleSexp (UorAtlas.tryClassDecode 43 c) }
   out := out.push { name := "golden_tryClassDecode_100_canonical", ret := "(Option (Tuple Nat (Tuple Nat Nat)))", value := optTripleSexp (UorAtlas.tryClassDecode 100 c) }
+  -- Euclidean, not truncating: computed by calling the compiled `Int` `/`/`%`
+  -- instances (`Int.ediv`/`Int.emod`) themselves, so the golden comes from
+  -- Lean, not from anyone's expectation of what Euclidean division gives.
+  out := out.push { name := "golden_int_ediv_neg_12_7", ret := "Int",
+                    value := toString (Conformance.c_int_ediv (-12) 7) }
+  out := out.push { name := "golden_int_emod_neg_12_7", ret := "Int",
+                    value := toString (Conformance.c_int_emod (-12) 7) }
   return out
 
 /-- Assemble the `goldens.ir` text: one zero-arg def per golden. -/

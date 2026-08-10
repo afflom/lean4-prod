@@ -855,3 +855,61 @@ fn test_projection_of_a_declared_field_still_renders() {
 "#;
     assert!(generate(ir).contains("(r).alpha"));
 }
+
+#[test]
+fn test_int_division_is_euclidean_not_truncating() {
+    // Lean's Div Int / Mod Int instances use Int.ediv / Int.emod — its own
+    // docs say so, "for compatibility with SMT-LIB". Rust's / and % truncate.
+    // They differ for every negative operand: Lean gives (-12) % 7 = 2, Rust
+    // gives -5. Rendering / and % here would be silently wrong, and every test
+    // with non-negative inputs would still pass.
+    let ir = r#"(module M (def f ((a Int) (b Int)) Int (div Int a b)))"#;
+    let out = generate(ir);
+    assert!(out.contains("checked_div_euclid"), "got: {}", out);
+    assert!(
+        !out.contains("(a) / (b)"),
+        "must not render truncating division"
+    );
+    // Int.ediv is total on a zero divisor (Init/Data/Int/DivMod/Basic.lean:76
+    // is explicit: `| -[_+1], 0 => 0`), so the zero-guard stays.
+    assert!(out.contains("if (b) == 0 { 0 }"), "got: {}", out);
+}
+
+#[test]
+fn test_int_modulo_is_euclidean() {
+    let ir = r#"(module M (def f ((a Int) (b Int)) Int (mod Int a b)))"#;
+    assert!(generate(ir).contains("checked_rem_euclid"));
+}
+
+#[test]
+fn test_int_sub_is_checked_unlike_nat() {
+    // Nat subtraction truncates at zero and cannot fail; Int subtraction can
+    // overflow i64, because Lean's Int is unbounded and i64 is not.
+    let nat = generate(r#"(module M (def f ((a Nat) (b Nat)) Nat (sub Nat a b)))"#);
+    assert!(nat.contains("saturating_sub"));
+    assert!(nat.contains("-> u64 {"), "Nat sub is infallible");
+
+    let int = generate(r#"(module M (def f ((a Int) (b Int)) Int (sub Int a b)))"#);
+    assert!(int.contains("checked_sub(b).ok_or(crate::ComputeError::SubOverflow)?"));
+    assert!(int.contains("-> Result<i64, crate::ComputeError>"));
+}
+
+#[test]
+fn test_int_neg_is_checked() {
+    let ir = r#"(module M (def f ((a Int)) Int (neg Int a)))"#;
+    let out = generate(ir);
+    assert!(out.contains("checked_neg().ok_or(crate::ComputeError::NegOverflow)?"));
+}
+
+#[test]
+fn test_neg_on_a_non_int_kind_is_rejected() {
+    let ir = r#"(module M (def f ((a Nat)) Nat (neg Nat a)))"#;
+    assert!(matches!(generate_err(ir), Error::UnsupportedKind(_)));
+}
+
+#[test]
+fn test_int_shifts_are_rejected() {
+    // Deliberate non-goal; rejected precisely rather than rendered.
+    let ir = r#"(module M (def f ((a Int) (b Int)) Int (shl Int a b)))"#;
+    assert!(matches!(generate_err(ir), Error::UnsupportedKind(_)));
+}

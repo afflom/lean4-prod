@@ -921,39 +921,49 @@ impl<'m> Renderer<'_, 'm> {
                 .ok_or(Error::ParamOutOfBounds(*index)),
             Expr::Add(k, a, b) => self.checked_binop(*k, a, b, "checked_add", "AddOverflow"),
             Expr::Mul(k, a, b) => self.checked_binop(*k, a, b, "checked_mul", "MulOverflow"),
-            Expr::Sub(k, a, b) => {
-                // Lean Nat subtraction truncates at zero, so it is total.
-                // See `checked_binop` for the `as` receiver-pin rationale.
-                Ok(format!(
-                    "(({}) as {}).saturating_sub({})",
+            Expr::Sub(k, a, b) => match k {
+                NumKind::Nat => Ok(format!(
+                    "(({}) as u64).saturating_sub({})",
                     self.value(a)?,
-                    k.rust_type(),
                     self.value(b)?
-                ))
+                )),
+                NumKind::Int => self.checked_binop(*k, a, b, "checked_sub", "SubOverflow"),
+                _ => self.wrapping_binop(*k, a, b, "wrapping_sub"),
+            },
+            Expr::Div(k, a, b) => {
+                self.div_or_mod(*k, a, b, "/", "checked_div_euclid", "DivOverflow")
             }
-            Expr::Div(k, a, b) => self.total_binop(*k, a, b, "/"),
-            Expr::Mod(k, a, b) => self.total_binop(*k, a, b, "%"),
-            Expr::Shl(k, a, b) => self.checked_exponent_op(
-                *k,
-                a,
-                b,
-                "checked_shl",
-                "ShiftExponentTooLarge",
-                "ShiftOverflow",
-            ),
-            // Unlike `Shl`, `Nat.shiftRight` is total and infallible: Lean's
-            // `Nat` is unbounded, so `a >>> b = 0` for any `b >= 64` once `a`
-            // fits `u64`. `checked_shr` already returns `None` exactly there
-            // (and for `b >= 2^32`, via the `try_from` fallback to
-            // `u32::MAX`), so `unwrap_or(0)` is the exact answer, not a
-            // fallback for a real error — there is no `ComputeError` variant
-            // for this because none is needed.
-            Expr::Shr(k, a, b) => Ok(format!(
-                "(({}) as {}).checked_shr(u32::try_from({}).unwrap_or(u32::MAX)).unwrap_or(0)",
-                self.value(a)?,
-                k.rust_type(),
-                self.value(b)?
-            )),
+            Expr::Mod(k, a, b) => {
+                self.div_or_mod(*k, a, b, "%", "checked_rem_euclid", "DivOverflow")
+            }
+            Expr::Shl(k, a, b) => match k {
+                NumKind::Nat => self.checked_exponent_op(
+                    *k,
+                    a,
+                    b,
+                    "checked_shl",
+                    "ShiftExponentTooLarge",
+                    "ShiftOverflow",
+                ),
+                NumKind::Int => Err(Error::UnsupportedKind(String::from(
+                    "shifts are not supported for Int",
+                ))),
+                _ => self.total_shift(*k, a, b, "checked_shl"),
+            },
+            // Unlike `Shl`, `Nat.shiftRight` (and the sized-integer shifts) is
+            // total and infallible: Lean's `Nat` is unbounded, so `a >>> b =
+            // 0` for any `b >= 64` once `a` fits `u64`. `checked_shr` already
+            // returns `None` exactly there (and for `b >= 2^32`, via the
+            // `try_from` fallback to `u32::MAX`), so `unwrap_or(0)` is the
+            // exact answer, not a fallback for a real error — there is no
+            // `ComputeError` variant for this because none is needed. Shifts
+            // on `Int` are a deliberate non-goal and are rejected outright.
+            Expr::Shr(k, a, b) => match k {
+                NumKind::Int => Err(Error::UnsupportedKind(String::from(
+                    "shifts are not supported for Int",
+                ))),
+                _ => self.total_shift(*k, a, b, "checked_shr"),
+            },
             Expr::Pow(k, a, b) => self.checked_exponent_op(
                 *k,
                 a,
@@ -962,10 +972,19 @@ impl<'m> Renderer<'_, 'm> {
                 "PowExponentTooLarge",
                 "PowOverflow",
             ),
-            Expr::Neg(k, _) => Err(Error::UnsupportedKind(alloc::format!(
-                "unary negation is not supported for {:?}",
-                k
-            ))),
+            Expr::Neg(k, a) => {
+                if *k == NumKind::Int {
+                    Ok(format!(
+                        "(({}) as i64).checked_neg().ok_or(crate::ComputeError::NegOverflow)?",
+                        self.value(a)?
+                    ))
+                } else {
+                    Err(Error::UnsupportedKind(alloc::format!(
+                        "unary negation is only supported for Int, not {:?}",
+                        k
+                    )))
+                }
+            }
             Expr::Eq(a, b) => self.binop(a, b, "=="),
             Expr::Lt(a, b) => self.binop(a, b, "<"),
             Expr::Le(a, b) => self.binop(a, b, "<="),
@@ -1302,22 +1321,74 @@ impl<'m> Renderer<'_, 'm> {
         ))
     }
 
-    /// Lean Nat division and modulo are total: `x / 0 = x % 0 = 0`.
+    /// Lean `Nat` and sized-integer division/modulo are total: `x / 0 = 0`.
+    /// `Int` is total too (`Int.ediv _ 0 = 0`) but Euclidean, and can overflow
+    /// at `i64::MIN / -1` — so it keeps the zero-guard and adds a check.
     ///
-    /// Takes `kind` for symmetry with the other arithmetic helpers, though it
-    /// renders operators rather than method calls and so needs no cast. Task
-    /// 3's Euclidean-division branch for `Int` reads it.
-    fn total_binop(
+    /// Lean's `Div Int`/`Mod Int` instances use `Int.ediv`/`Int.emod` ("for
+    /// compatibility with SMT-LIB", per their own doc comment), which differ
+    /// from Rust's truncating `/`/`%` on every negative operand:
+    /// `(-12).ediv 7 = -2` and `(-12).emod 7 = 2`, where Rust's `/`/`%` give
+    /// `-1`/`-5`.
+    fn div_or_mod(
         &self,
-        _kind: NumKind,
+        kind: NumKind,
         a: &'m Expr,
         b: &'m Expr,
         op: &str,
+        euclid_method: &str,
+        error: &str,
     ) -> Result<String, Error> {
         let (a, b) = (self.value(a)?, self.value(b)?);
+        if kind == NumKind::Int {
+            return Ok(format!(
+                "if ({}) == 0 {{ 0 }} else {{ (({}) as i64).{}({}).ok_or(crate::ComputeError::{})? }}",
+                b, a, euclid_method, b, error
+            ));
+        }
         Ok(format!(
             "if ({}) == 0 {{ 0 }} else {{ ({}) {} ({}) }}",
             b, a, op, b
+        ))
+    }
+
+    /// Sized-integer arithmetic wraps — that is Lean's semantics
+    /// (`UInt8.add a b = ⟨a.toBitVec + b.toBitVec⟩`), not a failure.
+    fn wrapping_binop(
+        &self,
+        kind: NumKind,
+        a: &'m Expr,
+        b: &'m Expr,
+        method: &str,
+    ) -> Result<String, Error> {
+        Ok(format!(
+            "(({}) as {}).{}({})",
+            self.value(a)?,
+            kind.rust_type(),
+            method,
+            self.value(b)?
+        ))
+    }
+
+    /// Shifts on `Nat` (right) and on sized integers (both directions) are
+    /// total: shifting by at least the width yields 0.
+    ///
+    /// NOTE: `wrapping_shl` is WRONG here — it masks the shift amount, so
+    /// `1u8.wrapping_shl(8) == 1`, whereas Lean's BitVec shift gives 0.
+    /// `checked_shl(..).unwrap_or(0)` is the faithful rendering.
+    fn total_shift(
+        &self,
+        kind: NumKind,
+        a: &'m Expr,
+        b: &'m Expr,
+        method: &str,
+    ) -> Result<String, Error> {
+        Ok(format!(
+            "(({}) as {}).{}(u32::try_from({}).unwrap_or(u32::MAX)).unwrap_or(0)",
+            self.value(a)?,
+            kind.rust_type(),
+            method,
+            self.value(b)?
         ))
     }
 }

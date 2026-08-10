@@ -1186,6 +1186,13 @@ impl<'m> Renderer<'_, 'm> {
             },
             Expr::Unreachable => Ok(String::from("unreachable!()")),
             Expr::Opaque(s) => Err(Error::OpaqueExpr(s.clone())),
+            // TODO(S2 Phase B Task 5): render as `&&`/`||`/`!`. These variants
+            // exist only for invariant lowering (IR Task 3); no producer
+            // targets them yet, so a real rendering isn't testable here.
+            // Task 5 replaces this arm rather than adding alongside it.
+            Expr::And(..) | Expr::Or(..) | Expr::Not(..) => Err(Error::OpaqueExpr(
+                "boolean connective rendering not yet implemented".into(),
+            )),
             // Handled by `render` before it delegates here.
             Expr::If(..)
             | Expr::Let(..)

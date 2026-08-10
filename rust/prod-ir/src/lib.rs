@@ -160,6 +160,14 @@ pub enum Expr {
     /// from `Call` so codegen rejects it instead of emitting a Rust call to a
     /// function that does not exist.
     Extern(String, Vec<Expr>),
+    /// Boolean conjunction. Produced only by the invariant lowering — Lean's
+    /// computational `&&` reaches LCNF as `cases` on `Bool.true`/`Bool.false`
+    /// and needs no node (verified in S2 Phase A). These exist because a
+    /// `Prop` field's proposition is lowered to a boolean expression, and a
+    /// conjunction of comparisons has no `cases` form to reuse.
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    Not(Box<Expr>),
 }
 
 impl Expr {
@@ -186,6 +194,7 @@ impl Expr {
             Expr::Proj(_, _, e) => out.push(e),
             Expr::Neg(_, e) => out.push(e),
             Expr::Convert(_, _, e) => out.push(e),
+            Expr::Not(e) => out.push(e),
             Expr::Add(_, a, b)
             | Expr::Sub(_, a, b)
             | Expr::Mul(_, a, b)
@@ -197,7 +206,9 @@ impl Expr {
             | Expr::Eq(a, b)
             | Expr::Lt(a, b)
             | Expr::Le(a, b)
-            | Expr::Gt(a, b) => {
+            | Expr::Gt(a, b)
+            | Expr::And(a, b)
+            | Expr::Or(a, b) => {
                 out.push(a);
                 out.push(b);
             }
@@ -261,6 +272,12 @@ pub struct TypeDecl {
     /// reference to it *precisely* rather than reporting a generic unknown
     /// name. `ctors` is empty when this is set.
     pub unsupported: Option<String>,
+    /// The structure's erased `Prop` invariant, lowered to a boolean
+    /// expression over its own fields (referenced by name as `Expr::Var`).
+    /// `None` when the structure has no `Prop` field, or has one whose
+    /// proposition the exporter cannot lower — in which case the type keeps
+    /// public fields and no checked constructor, exactly as before.
+    pub invariant: Option<Expr>,
 }
 
 /// A module is a collection of definitions
@@ -288,6 +305,7 @@ mod tests {
     /// there; the assertions then force it into the `children()` table too.
     const ALL_VARIANTS: &[&str] = &[
         "Add",
+        "And",
         "Bool",
         "Call",
         "Convert",
@@ -308,7 +326,9 @@ mod tests {
         "Mul",
         "Nat",
         "Neg",
+        "Not",
         "Opaque",
+        "Or",
         "Param",
         "Pow",
         "Proj",
@@ -351,6 +371,9 @@ mod tests {
             Expr::Unreachable => "Unreachable",
             Expr::Opaque(_) => "Opaque",
             Expr::Extern(..) => "Extern",
+            Expr::And(..) => "And",
+            Expr::Or(..) => "Or",
+            Expr::Not(..) => "Not",
         }
     }
 
@@ -402,6 +425,10 @@ mod tests {
             (Expr::Lt(bx("a"), bx("b")), vec!["a", "b"]),
             (Expr::Le(bx("a"), bx("b")), vec!["a", "b"]),
             (Expr::Gt(bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::And(bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Or(bx("a"), bx("b")), vec!["a", "b"]),
+            // Unary.
+            (Expr::Not(bx("a")), vec!["a"]),
             // Control flow and binders.
             (Expr::If(bx("c"), bx("t"), bx("f")), vec!["c", "t", "f"]),
             (

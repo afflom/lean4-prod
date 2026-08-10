@@ -3,8 +3,9 @@
 //! Grammar (simplified sexp):
 //! ```text
 //! module   ::= "(" "module" ident type_decl* def* ")"
-//! type_decl ::= "(" "type" '"' ident '"' unsupported? ctor_decl* ")"
+//! type_decl ::= "(" "type" '"' ident '"' unsupported? ctor_decl* invariant? ")"
 //! unsupported ::= "(" "unsupported" '"' text '"' ")"
+//! invariant ::= "(" "invariant" expr ")"                    ; erased Prop invariant
 //! ctor_decl ::= "(" "ctor" '"' ident '"' field* ")"
 //! field    ::= "(" ident type ")"
 //! def      ::= "(" "def" ident "(" param* ")" type expr ")"
@@ -31,6 +32,7 @@
 //!            | "(" "jmp" ident expr* ")"                   ; LCNF jump
 //!            | "(" "unreachable" ")"
 //!            | "(" "extern" '"' ident '"' expr* ")"        ; unresolved callee
+//!            | "(" "and" expr expr ")" | "(" "or" expr expr ")" | "(" "not" expr ")"
 //! alt      ::= "(" "alt" '"' ident '"' "(" ident* ")" expr ")"
 //! default  ::= "(" "default" expr ")"
 //! comment  ::= ";;" ... end-of-line                       ; skipped as whitespace
@@ -363,6 +365,17 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                     tuple((tag("extern"), ws(quoted_ident), many0(ws(parse_expr)))),
                     |(_, name, args)| Expr::Extern(name, args),
                 ),
+                map(
+                    tuple((tag("and"), ws(parse_expr), ws(parse_expr))),
+                    |(_, a, b)| Expr::And(Box::new(a), Box::new(b)),
+                ),
+                map(
+                    tuple((tag("or"), ws(parse_expr), ws(parse_expr))),
+                    |(_, a, b)| Expr::Or(Box::new(a), Box::new(b)),
+                ),
+                map(tuple((tag("not"), ws(parse_expr))), |(_, a)| {
+                    Expr::Not(Box::new(a))
+                }),
             )),
         ))),
         ws(char(')')),
@@ -386,6 +399,16 @@ fn parse_ctor_decl(input: &str) -> IResult<&str, CtorDecl> {
     )(input)
 }
 
+/// `(invariant <expr>)` — the structure's erased Prop invariant, as a boolean
+/// expression over its own field names.
+fn parse_invariant(input: &str) -> IResult<&str, Expr> {
+    delimited(
+        char('('),
+        map(tuple((tag("invariant"), ws(parse_expr))), |(_, e)| e),
+        char(')'),
+    )(input)
+}
+
 /// `(unsupported "reason")` — a type the exporter reached but cannot describe.
 fn parse_unsupported(input: &str) -> IResult<&str, String> {
     delimited(
@@ -404,7 +427,8 @@ fn quoted_reason(input: &str) -> IResult<&str, String> {
     )(input)
 }
 
-/// `(type "Full.Name" (ctor ...)...)` or `(type "Full.Name" (unsupported "why"))`
+/// `(type "Full.Name" (ctor ...)... (invariant <expr>)?)` or
+/// `(type "Full.Name" (unsupported "why"))`
 fn parse_type_decl(input: &str) -> IResult<&str, TypeDecl> {
     map(
         delimited(
@@ -414,13 +438,15 @@ fn parse_type_decl(input: &str) -> IResult<&str, TypeDecl> {
                 ws(quoted_ident),
                 opt(ws(parse_unsupported)),
                 many0(ws(parse_ctor_decl)),
+                opt(ws(parse_invariant)),
             )),
             char(')'),
         ),
-        |(_, name, unsupported, ctors)| TypeDecl {
+        |(_, name, unsupported, ctors, invariant)| TypeDecl {
             name,
             ctors,
             unsupported,
+            invariant,
         },
     )(input)
 }
@@ -833,5 +859,41 @@ mod tests {
         // Both operands share a Rust type and `<` works for every kind, so a tag
         // here would be noise.
         assert!(matches!(parse_expr("(lt a b)").unwrap().1, Expr::Lt(_, _)));
+    }
+
+    #[test]
+    fn test_parse_connectives() {
+        assert!(matches!(
+            parse_expr("(and a b)").unwrap().1,
+            Expr::And(_, _)
+        ));
+        assert!(matches!(parse_expr("(or a b)").unwrap().1, Expr::Or(_, _)));
+        assert!(matches!(parse_expr("(not a)").unwrap().1, Expr::Not(_)));
+    }
+
+    #[test]
+    fn test_parse_type_decl_with_invariant() {
+        let input = r#"
+(module M
+  (type "UorAtlas.Instance"
+    (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat))
+    (invariant (and (le 1 q) (and (le 1 T) (le 1 O)))))
+)
+"#;
+        let (rest, module) = parse_module(input).unwrap();
+        assert!(rest.trim().is_empty());
+        let decl = &module.types[0];
+        assert_eq!(decl.ctors.len(), 1);
+        assert!(decl.invariant.is_some(), "invariant must round-trip");
+        assert!(matches!(decl.invariant.as_ref().unwrap(), Expr::And(_, _)));
+    }
+
+    #[test]
+    fn test_type_decl_without_invariant_still_parses() {
+        // A structure with no lowerable Prop field carries no invariant. That is
+        // the common case and must stay unaffected.
+        let input = r#"(module M (type "M.Pair" (ctor "M.Pair.mk" (a Nat) (b Nat))))"#;
+        let (_, module) = parse_module(input).unwrap();
+        assert!(module.types[0].invariant.is_none());
     }
 }

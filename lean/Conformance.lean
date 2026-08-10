@@ -60,5 +60,7 @@ namespace Conformance
 @[prod] def c_int_ediv (a b : Int) : Int := a / b
 @[prod] def c_int_emod (a b : Int) : Int := a % b
 @[prod] def c_int_neg (a : Int) : Int := -a
+@[prod] def c_int_guard_lt (a b : Int) : Int := if a < b then 1 else 0
+@[prod] def c_int_guard_eq (a b : Int) : Int := if a = b then 1 else 0
 
 end Conformance

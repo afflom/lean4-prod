@@ -14,6 +14,11 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
     // From `lean/Conformance/` — the real Lean → LCNF → IR pipeline.
     assert_eq!(c_nat_add(2, 3)?, 5);
     assert_eq!(c_nat_sub(3, 10), 0); // Lean Nat subtraction truncates
+                                     // Lean `Nat.mod`'s own doc comment: "When the divisor is `0`, the result
+                                     // is the dividend rather than an error" (doctest `5 % 0 = 5`). This was a
+                                     // pre-existing bug (shipping since M3): the shared div/mod zero-guard
+                                     // rendered `0` for both, which is right for division but wrong here.
+    assert_eq!(c_nat_mod(5, 0), 5);
     assert_eq!(c_nat_shr(8, 2), 2);
     assert_eq!(c_nat_shr(8, 70), 0); // shift past the width is 0, not an error
                                      // Infallible by the fallibility fixpoint: a decidable guard performs no
@@ -52,6 +57,9 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
     assert_eq!(c_int_neg(i64::MIN), Err(ComputeError::NegOverflow));
     assert_eq!(c_int_ediv(i64::MIN, -1), Err(ComputeError::DivOverflow));
     assert_eq!(c_int_ediv(5, 0)?, 0); // total, like Nat
+                                      // `Int`'s `emod_zero : a % 0 = a` (doctest `(7 : Int) % (0 : Int) = 7`):
+                                      // modulo by zero is the dividend, not zero, same as `Nat` above.
+    assert_eq!(c_int_emod(7, 0)?, 7);
     Ok(())
 }
 

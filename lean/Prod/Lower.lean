@@ -291,12 +291,21 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     with their IR comparison operator. Single source of truth for both
     `deciderOp` and `subsetJson` (`Prod.Emit`), so the published contract
     cannot list a decider the lowerer does not actually accept, or omit one
-    it does. `instDecidableEqNat` appears in LCNF when the instance wrapper
-    is not unfolded (unlike the arithmetic dictionaries). -/
+    it does. `instDecidableEqNat`/`Int.instDecidableEq` appear in LCNF when
+    the `DecidableEq` instance wrapper is not unfolded (unlike the arithmetic
+    dictionaries) — `Int` has the structurally identical anonymous instance
+    (`Init/Data/Int/Basic.lean`: `instance : DecidableEq Int := Int.decEq`,
+    declared inside `namespace Int`) as `Nat`, so it needs the same second
+    row. The auto-generated name is `Int.instDecidableEq`, not
+    `instDecidableEqInt`: Lean drops the redundant `Int` argument suffix
+    because the instance already sits inside `namespace Int` (confirmed by
+    enumerating the environment's constants — `instDecidableEqInt` does not
+    exist and fails the build with `unknown constant`). -/
 def deciderNames : List (Name × String) :=
   [ (``Nat.decLt, "lt"), (``Nat.decLe, "le"), (``Nat.decEq, "eq"),
     (``instDecidableEqNat, "eq"),
-    (``Int.decLt, "lt"), (``Int.decLe, "le"), (``Int.decEq, "eq") ]
+    (``Int.decLt, "lt"), (``Int.decLe, "le"), (``Int.decEq, "eq"),
+    (``Int.instDecidableEq, "eq") ]
 
 /-- The decider constants recognized by `decidableIf?`, mapped to their IR
     comparison operator. -/

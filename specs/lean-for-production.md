@@ -10,7 +10,7 @@ named error rather than silently mis-compiled.
 
 - `Nat`
 - `Bool`
-- `Int (renders as i64; no Int operators are whitelisted, so Int arithmetic is rejected as UnresolvedCall)`
+- `Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int)`
 - `Prod`
 - `List`
 - `Option`
@@ -53,6 +53,7 @@ generated struct is a plain data carrier, not a refinement type.
 - `Int.decLt`
 - `Int.decLe`
 - `Int.decEq`
+- `Int.instDecidableEq`
 
 ## Rejections
 

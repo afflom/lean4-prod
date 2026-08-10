@@ -26,6 +26,10 @@
   (def c_int_mul ((a Int) (b Int)) Int
     (let _x_11 (mul Int a b) _x_11))
 
+  ;; full: Conformance.c_int_guard_lt
+  (def c_int_guard_lt ((a Int) (b Int)) Int
+    (if (lt a b) (let _x_7 1 (let _x_14 (ctor "Int.ofNat" _x_7) _x_14)) (let _x_3 0 (let _x_12 (ctor "Int.ofNat" _x_3) _x_12))))
+
   ;; full: Conformance.c_option
   ;; arity: 2 erased/type args dropped
   (def c_option ((a Nat)) (Option Nat)
@@ -113,6 +117,10 @@
   ;; full: Conformance.c_guard_eq
   (def c_guard_eq ((a Nat) (b Nat)) Nat
     (if (eq a b) (let _x_7 1 _x_7) (let _x_3 0 _x_3)))
+
+  ;; full: Conformance.c_int_guard_eq
+  (def c_int_guard_eq ((a Int) (b Int)) Int
+    (if (eq a b) (let _x_7 1 (let _x_14 (ctor "Int.ofNat" _x_7) _x_14)) (let _x_3 0 (let _x_12 (ctor "Int.ofNat" _x_3) _x_12))))
 
   ;; full: Conformance.c_bool_and
   (def c_bool_and ((a Nat) (b Nat)) Bool

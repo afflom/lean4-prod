@@ -71,7 +71,7 @@ def subsetJson : String :=
   -- single-block inductives with a single constructor (`Prop` fields
   -- erased) — the only shape the conformance suite exercises
   -- (`Conformance.MidProp`, `Conformance.NoProp`, `UorAtlas.Instance`).
-  let types := ["Nat", "Bool", "Int (renders as i64; no Int operators are whitelisted, so Int arithmetic is rejected as UnresolvedCall)",
+  let types := ["Nat", "Bool", "Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int)",
                 "Prod", "List", "Option",
                 "parameterless, non-recursive, single-constructor structures (Prop fields erased)"]
   let quoted (xs : List String) : String :=

@@ -45,9 +45,11 @@
 //! shifts, and powers render as `checked_*(..).ok_or(crate::ComputeError::X)?`
 //! (with the shift/power exponent narrowed through
 //! `u32::try_from(..).map_err(..)?`). Subtraction saturates at zero (Lean Nat
-//! subtraction) and division/modulo by zero return zero (Lean Nat's total
-//! operations), so neither is fallible. There is no bignum fallback, so this
-//! is exact only while values fit in `u64`.
+//! subtraction), and division/modulo by zero are total but not the same
+//! value: division by zero is `0`, modulo by zero is the dividend (Lean
+//! `Nat.mod`'s own doc comment: "the result is the dividend rather than an
+//! error"), so neither is fallible. There is no bignum fallback, so this is
+//! exact only while values fit in `u64`.
 //!
 //! A definition returns `Result<T, crate::ComputeError>` **only if it needs
 //! to**: if its body contains a checked operation, or calls a definition that
@@ -739,6 +741,14 @@ fn count_jmps(expr: &Expr, name: &str) -> usize {
     self_count + expr.children().map(|c| count_jmps(c, name)).sum::<usize>()
 }
 
+/// Which of Lean's two total-but-differently-zero integer operations
+/// [`Renderer::div_or_mod`] is rendering.
+#[derive(Clone, Copy)]
+enum DivMod {
+    Div,
+    Mod,
+}
+
 /// Where the expression being rendered will land.
 ///
 /// The two modes share one traversal: control flow (`if`, `let`, `cases`)
@@ -930,12 +940,8 @@ impl<'m> Renderer<'_, 'm> {
                 NumKind::Int => self.checked_binop(*k, a, b, "checked_sub", "SubOverflow"),
                 _ => self.wrapping_binop(*k, a, b, "wrapping_sub"),
             },
-            Expr::Div(k, a, b) => {
-                self.div_or_mod(*k, a, b, "/", "checked_div_euclid", "DivOverflow")
-            }
-            Expr::Mod(k, a, b) => {
-                self.div_or_mod(*k, a, b, "%", "checked_rem_euclid", "DivOverflow")
-            }
+            Expr::Div(k, a, b) => self.div_or_mod(*k, a, b, DivMod::Div),
+            Expr::Mod(k, a, b) => self.div_or_mod(*k, a, b, DivMod::Mod),
             Expr::Shl(k, a, b) => match k {
                 NumKind::Nat => self.checked_exponent_op(
                     *k,
@@ -1001,6 +1007,18 @@ impl<'m> Renderer<'_, 'm> {
                     Ok(String::from("None"))
                 } else if name == "Option.some" && args.len() == 1 {
                     Ok(format!("Some({})", args[0]))
+                } else if name == "Int.ofNat" && args.len() == 1 {
+                    // `Int`'s own non-negative constructor: an `Int` literal
+                    // like `(1 : Int)` (or any `Nat`-typed subexpression
+                    // reaching an `Int` position) elaborates through this,
+                    // not through a bare numeral — LCNF still sees it as a
+                    // constructor application (`isCtorName` in `Lower.lean`
+                    // is right that it is one), so it must render here rather
+                    // than fall through to `UnresolvedCall`.
+                    Ok(format!("(({}) as i64)", args[0]))
+                } else if name == "Int.negSucc" && args.len() == 1 {
+                    // `Int`'s negative constructor: `Int.negSucc n = -(n + 1)`.
+                    Ok(format!("(-(({}) as i64) - 1)", args[0]))
                 } else if let Some((decl, cdecl)) = self.ctor_decl(name) {
                     if args.len() != cdecl.fields.len() {
                         return Err(Error::UnsupportedFieldType(format!(
@@ -1321,34 +1339,50 @@ impl<'m> Renderer<'_, 'm> {
         ))
     }
 
-    /// Lean `Nat` and sized-integer division/modulo are total: `x / 0 = 0`.
-    /// `Int` is total too (`Int.ediv _ 0 = 0`) but Euclidean, and can overflow
-    /// at `i64::MIN / -1` — so it keeps the zero-guard and adds a check.
+    /// Lean division and modulo by zero are both total, but NOT the same
+    /// value: `x / 0 = 0` for every kind (`Nat.div n 0 = 0`, `Int.ediv _ 0 =
+    /// 0`, and the same for sized integers), while `x % 0 = x` — the
+    /// dividend, not zero. This is `Nat.mod`'s own doc comment ("When the
+    /// divisor is `0`, the result is the dividend rather than an error",
+    /// doctest `5 % 0 = 5`) and `Int`'s `emod_zero : a % 0 = a` (doctest `(7 :
+    /// Int) % (0 : Int) = 7`) — so the two branches share a divisor-is-zero
+    /// guard but NOT a zero-branch value; `which` selects it, along with the
+    /// rest of the div-vs-mod-specific spelling (operator, Euclidean method).
     ///
-    /// Lean's `Div Int`/`Mod Int` instances use `Int.ediv`/`Int.emod` ("for
-    /// compatibility with SMT-LIB", per their own doc comment), which differ
+    /// `Int` is Euclidean on top of that (`Int.ediv`/`Int.emod`, "for
+    /// compatibility with SMT-LIB" per their own doc comment), which differs
     /// from Rust's truncating `/`/`%` on every negative operand:
     /// `(-12).ediv 7 = -2` and `(-12).emod 7 = 2`, where Rust's `/`/`%` give
-    /// `-1`/`-5`.
+    /// `-1`/`-5`. It can also overflow at `i64::MIN / -1` — so it keeps the
+    /// zero-guard and adds a check (`DivOverflow` for both: `checked_rem_euclid`
+    /// fails exactly where `checked_div_euclid` does, `i64::MIN % -1`, since
+    /// the Euclidean remainder is defined in terms of the division).
     fn div_or_mod(
         &self,
         kind: NumKind,
         a: &'m Expr,
         b: &'m Expr,
-        op: &str,
-        euclid_method: &str,
-        error: &str,
+        which: DivMod,
     ) -> Result<String, Error> {
+        let (op, euclid_method, zero_is_dividend) = match which {
+            DivMod::Div => ("/", "checked_div_euclid", false),
+            DivMod::Mod => ("%", "checked_rem_euclid", true),
+        };
         let (a, b) = (self.value(a)?, self.value(b)?);
+        let zero = if zero_is_dividend {
+            a.clone()
+        } else {
+            String::from("0")
+        };
         if kind == NumKind::Int {
             return Ok(format!(
-                "if ({}) == 0 {{ 0 }} else {{ (({}) as i64).{}({}).ok_or(crate::ComputeError::{})? }}",
-                b, a, euclid_method, b, error
+                "if ({}) == 0 {{ {} }} else {{ (({}) as i64).{}({}).ok_or(crate::ComputeError::DivOverflow)? }}",
+                b, zero, a, euclid_method, b
             ));
         }
         Ok(format!(
-            "if ({}) == 0 {{ 0 }} else {{ ({}) {} ({}) }}",
-            b, a, op, b
+            "if ({}) == 0 {{ {} }} else {{ ({}) {} ({}) }}",
+            b, zero, a, op, b
         ))
     }
 

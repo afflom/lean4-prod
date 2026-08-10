@@ -686,9 +686,17 @@ Wire the arms:
     /// Shifts on `Nat` (right) and on sized integers (both directions) are
     /// total: shifting by at least the width yields 0.
     ///
-    /// NOTE: `wrapping_shl` is WRONG here — it masks the shift amount, so
-    /// `1u8.wrapping_shl(8) == 1`, whereas Lean's BitVec shift gives 0.
-    /// `checked_shl(..).unwrap_or(0)` is the faithful rendering.
+    /// CORRECTED AFTER THE FACT — this paragraph originally claimed
+    /// `wrapping_shl` was wrong for sized kinds "because it masks the shift
+    /// amount, whereas Lean's BitVec shift gives 0". That is true of `BitVec`
+    /// shifted by a `Nat`, and FALSE for `UIntN`:
+    /// `Init/Data/UInt/Basic.lean:126` defines
+    /// `UInt8.shiftLeft a b = ⟨a.toBitVec <<< (UInt8.mod b 8).toBitVec⟩`,
+    /// which masks mod width first — so `(1 : UInt8) <<< 8 = 1` and
+    /// `wrapping_shl` IS correct there. The design said so; this plan
+    /// overrode it wrongly. `total_shift` is for `Nat` ONLY, where the type is
+    /// unbounded, there is no width to mask by, and shifting past 64 really
+    /// does give 0. Sized kinds use `wrapping_shl`/`wrapping_shr` (Task 4).
     fn total_shift(
         &self,
         kind: NumKind,
@@ -945,11 +953,14 @@ Division is total on a zero divisor like Nat. Nothing here can fail, so
 the fallibility fixpoint leaves sized definitions with plain return
 types.
 
-Shifts render checked_shl(..).unwrap_or(0), NOT wrapping_shl:
-wrapping_shl masks the shift amount, so 1u8 << 8 would be 1, where
-Lean's BitVec shift gives 0. The conformance cases use boundary values
-for exactly this reason — a case that stays in range would pass under
-a wrong rendering.
+Shifts render wrapping_shl/wrapping_shr. UIntN masks the shift amount
+mod width before shifting (Init/Data/UInt/Basic.lean:126), so
+(1 : UInt8) <<< 8 = 1, and wrapping_shl — which masks rhs & (bits-1),
+identical for power-of-two widths — is exactly right. Nat is different:
+unbounded, no width to mask by, so it keeps the truncating rendering.
+The conformance case shifts at the width boundary for exactly this
+reason, and is asserted against Lean's own computed golden rather than
+a hand-written expectation.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```

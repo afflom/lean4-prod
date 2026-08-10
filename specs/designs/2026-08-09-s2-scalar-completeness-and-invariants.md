@@ -116,12 +116,18 @@ not a fallback rendering.
 
 | | `Nat` → `u64` | `Int` → `i64` | `UIntN` → `uN` |
 |---|---|---|---|
-| `add` `mul` `pow` | checked → error | checked → error | wrapping |
+| `add` `mul` | checked → error | checked → error | wrapping |
+| `pow` | checked → error | checked → error | rejected (see below) |
 | `sub` | saturating at 0 | checked → error | wrapping |
 | `div` `mod` | total, 0 ⇒ 0 | **Euclidean**, total, 0 ⇒ 0 | total, 0 ⇒ 0 |
 | `shl` | checked → error | not supported | wrapping |
 | `shr` | total, ≥ width ⇒ 0 | not supported | total, ≥ width ⇒ 0 |
 | unary `neg` | n/a | checked → error | n/a |
+
+Sized `pow` is rejected rather than rendered: `wrapping_pow` takes a `u32`
+exponent and, unlike `checked_shl`, has no absorbing behaviour at large
+exponents, so narrowing a `u64` exponent to it would silently change the
+answer. Lean whitelists no sized `pow`, so nothing is lost.
 
 `Int` division renders `checked_div_euclid`/`checked_rem_euclid` behind a
 zero-guard. The `checked_` prefix covers `i64::MIN / -1`, which overflows where

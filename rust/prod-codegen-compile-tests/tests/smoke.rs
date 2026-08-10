@@ -45,8 +45,11 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
     // conjuncts discriminate. (3 + 6 + 5 is still 14.)
     let mixed = MixedCompare::new(3, 6, 5)?;
     assert_eq!(c_mixed_compare(mixed)?, 14);
-    let split = SplitInvariant::new(1, 3)?;
-    assert_eq!(c_split_invariant(split)?, 4);
+    // Interior values here too: `SplitInvariant`'s invariant is
+    // `1 <= a /\ a <= b`, and at `a = 1` the first conjunct reads the same
+    // either way (`1 <= 1`). At `a = 2, b = 3` both conjuncts discriminate.
+    let split = SplitInvariant::new(2, 3)?;
+    assert_eq!(c_split_invariant(split)?, 5);
     let tagged = TaggedMode::new(1, 9)?;
     assert_eq!(c_tagged_mode(tagged)?, 10);
     // These two have Prop fields OUTSIDE the lowerable fragment, so they carry
@@ -144,6 +147,70 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
     // Cross-checked against Lean's own computed answer, same reasoning as the
     // Int/UInt8 goldens above.
     assert_eq!(c_int_to_nat(-5), golden_int_to_nat_neg_5());
+    Ok(())
+}
+
+#[test]
+fn mixed_compare_constructor_rejects_each_violated_conjunct() -> Result<(), ComputeError> {
+    // `Conformance.MixedCompare`'s Lean invariant is `lo >= 2 /\ hi <= 7 /\
+    // lo < hi` (`lean/Conformance/golden.ir`: `(and (le 2 lo) (and (le hi 7)
+    // (lt lo hi)))`). It is the one probe structure whose conjuncts do NOT all
+    // point the same direction, which is what lets it separate a blanket
+    // operand swap from a correct per-operator lowering. `UorAtlas.Instance`
+    // cannot: its three conjuncts are all `1 <= field`.
+    //
+    // `extra` is unconstrained by the invariant, so it is held at 5 throughout
+    // and every difference below is a difference in a constrained field.
+    assert!(MixedCompare::new(3, 6, 5).is_ok());
+    assert!(
+        MixedCompare::new(2, 7, 5).is_ok(),
+        "both non-strict bounds at their boundary are still valid"
+    );
+
+    // One violated conjunct at a time. The middle row is the load-bearing one:
+    // `hi <= 7` is the only conjunct whose bound sits on the RIGHT, so an
+    // inverted rendering of it (`7 <= hi`) would accept `hi = 8` while every
+    // other case in this crate stayed green.
+    for (lo, hi, extra, violated) in [
+        (1, 6, 5, "lo >= 2"),
+        (3, 8, 5, "hi <= 7"),
+        (6, 6, 5, "lo < hi"),
+    ] {
+        assert_eq!(
+            MixedCompare::new(lo, hi, extra),
+            Err(ComputeError::InvariantViolated("Conformance.MixedCompare")),
+            "MixedCompare::new({}, {}, {}) violates `{}` and must be rejected",
+            lo,
+            hi,
+            extra,
+            violated
+        );
+    }
+
+    // The other two lowerable probes, for the connectives rather than the
+    // comparison directions: `SplitInvariant` is `1 <= a /\ a <= b` (a
+    // field-to-field comparison, not a field-to-literal one), and `TaggedMode`
+    // is `(mode = 0 \/ mode = 1) /\ !(limit = 0)` — disjunction and negation.
+    assert_eq!(
+        SplitInvariant::new(0, 3),
+        Err(ComputeError::InvariantViolated(
+            "Conformance.SplitInvariant"
+        ))
+    );
+    assert_eq!(
+        SplitInvariant::new(4, 3),
+        Err(ComputeError::InvariantViolated(
+            "Conformance.SplitInvariant"
+        ))
+    );
+    assert_eq!(
+        TaggedMode::new(2, 9),
+        Err(ComputeError::InvariantViolated("Conformance.TaggedMode"))
+    );
+    assert_eq!(
+        TaggedMode::new(1, 0),
+        Err(ComputeError::InvariantViolated("Conformance.TaggedMode"))
+    );
     Ok(())
 }
 

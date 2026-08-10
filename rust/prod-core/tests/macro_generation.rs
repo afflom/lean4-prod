@@ -27,6 +27,42 @@ prod_macros::prod_defs! { ir = "goldens.ir" }
 const DIGIT_CAPACITY: usize = 64;
 
 #[test]
+fn checked_constructor_accepts_valid_and_rejects_each_violation() -> Result<(), ComputeError> {
+    // Lean proves `q >= 1 /\ T >= 1 /\ O >= 1` for every Instance it builds.
+    // The generated constructor re-checks exactly that at the crate boundary.
+    //
+    // This is the only place in the repo that EXECUTES the lowered invariant
+    // against the real `kernel.ir` rather than reading the exported text. A
+    // comparison lowered with reversed operands compiles, returns a `bool`,
+    // and rejects exactly the inputs it should accept; only running it tells
+    // the two apart.
+    assert!(Instance::new(4, 3, 8).is_ok());
+    assert!(
+        Instance::new(1, 1, 1).is_ok(),
+        "the boundary itself is valid"
+    );
+
+    // One violated conjunct at a time, so a constructor that checked only the
+    // first field — or that lowered a comparison backwards — fails here rather
+    // than passing on a lucky combination.
+    for (q, t, o) in [(0, 3, 8), (4, 0, 8), (4, 3, 0)] {
+        assert_eq!(
+            Instance::new(q, t, o),
+            Err(ComputeError::InvariantViolated("UorAtlas.Instance")),
+            "Instance::new({}, {}, {}) must be rejected",
+            q,
+            t,
+            o
+        );
+    }
+    // `Instance`'s three conjuncts all point the same direction, so it cannot
+    // distinguish a blanket operand swap from a correct per-operator one.
+    // `Conformance.MixedCompare` carries that half of the test — see
+    // `rust/prod-codegen-compile-tests/tests/smoke.rs`.
+    Ok(())
+}
+
+#[test]
 fn generated_definitions_compile_and_run() -> Result<(), ComputeError> {
     let canonical = Instance::new(4, 3, 8)?;
     assert_eq!(classIndex(1, 2, 3, canonical)?, 43);

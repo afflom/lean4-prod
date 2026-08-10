@@ -20,15 +20,56 @@ named error rather than silently mis-compiled.
 - `UInt64 (renders as u64; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) -- none of this can fail; pow is not whitelisted for sized kinds)`
 - `parameterless, non-recursive, single-constructor structures (Prop fields erased)`
 
-**Erased invariants.** A Lean structure may carry `Prop` fields
-expressing invariants over the computational fields — for example
-`UorAtlas.Instance.valid : q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1`. `Prop` fields are
-erased on export, correctly: they are proofs, not data, and carry no
-runtime representation. The consequence is that the generated Rust
-struct does **not** enforce the invariant — `Instance { q: 0, T: 0,
-O: 0 }` is constructible in Rust where the Lean type forbids it.
-Callers that need the invariant must re-check it in Rust; the
-generated struct is a plain data carrier, not a refinement type.
+**Erased invariants, and where they are re-checked.** A Lean
+structure may carry `Prop` fields expressing invariants over its
+computational fields — for example `UorAtlas.Instance.valid : q ≥ 1 ∧
+T ≥ 1 ∧ O ≥ 1`. `Prop` fields are still erased on export, correctly:
+they are proofs, not data, and carry no runtime representation. What
+happens to the *proposition* depends on whether it falls inside the
+lowerable fragment below. Both outcomes are published, so the first
+thing a reader needs is how to tell which one a given type got.
+
+**Which shape did I get?** Read the generated struct.
+
+- `pub(crate)` fields, plus an `impl` block holding `new` and one
+accessor per field → the invariant **is** enforced.
+- `pub` fields and no `impl` block → the invariant is **not**
+enforced.
+
+There is no third shape and no partially-enforced one: a type
+re-checks its whole proposition or none of it.
+
+**Enforced (the proposition lowered).** The exporter turned it into a
+boolean expression over the structure's own fields, and codegen emits
+a checked constructor — `Instance::new(q, T, O) -> Result<Instance,
+ComputeError>` — that re-checks exactly that proposition and returns
+`ComputeError::InvariantViolated("UorAtlas.Instance")` when it does
+not hold. Outside the crate, `new` is the only way to build the type,
+so the invariant cannot be broken from there. Generated code inside
+the crate does **not** call `new`, by design: Lean already supplied
+the proof, and re-checking would turn proved-total functions
+fallible. That is why the fields are `pub(crate)` rather than
+private.
+
+**Not enforced (the proposition did not lower).** It is dropped. The
+type keeps `pub` fields and gets no constructor and no accessors, and
+the invariant genuinely is not enforced: the struct is a plain data
+carrier, not a refinement type, and a caller that needs the invariant
+must re-check it in Rust by hand.
+
+**The lowerable fragment.** Conjunction (`∧`), disjunction (`∨`),
+negation (`¬`), and the comparisons `=`, `≤`, `<`, `≥`, `>` between a
+field and a literal or between two fields. `≥` and `>` lower to `≤`
+and `<` with their operands swapped, not to nodes of their own.
+Comparisons lower **only on `Nat`, `Int` and the sized kinds**
+(`UInt8`…`UInt64`); `Bool` is deliberately excluded, so a structure
+whose only `Prop` field compares `Bool`s (`flagA = flagB`) gets no
+constructor and takes the unenforced shape. So does anything else
+outside the fragment: quantifiers, arbitrary predicates, `≠` (which
+is `Ne`, not a comparison — spell it `¬ (a = b)` to stay inside), and
+any proposition naming something that is not one of this structure's
+own fields. Falling outside always costs the check, never corrupts
+it.
 
 ## Operators
 
@@ -127,7 +168,7 @@ Everything else fails, precisely:
 | `HeapType` | a type that would require a heap allocation in generated code |
 | `RecursiveType` | an inductive refers to itself (directly, or through one level of indirection); needs the tier-1 memory profile |
 | `PolymorphicType` | an inductive has type parameters; monomorphization is not implemented |
-| `UnsupportedFieldType` | a field type not allowed in an allocation-free generated type (e.g. a list or vector field, which would need owned storage) |
+| `UnsupportedFieldType` | a structure shape that has no allocation-free rendering. Two causes: a field type that would need owned storage (a list or vector field); or a type that carries an invariant and has more than one constructor, which cannot get the checked constructor an invariant requires, since a `Prop` field belongs to exactly one constructor |
 | `DuplicateTypeName` | two Lean types share a last name component, so they would collide in Rust |
 | `OpaqueType` | a type reached codegen with no Rust rendering |
 | `UnresolvedCall` | the callee is neither @[prod]-tagged nor a whitelisted operator, so there is nothing to call |

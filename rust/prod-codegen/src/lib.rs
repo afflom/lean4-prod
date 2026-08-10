@@ -129,7 +129,10 @@ pub enum Error {
     RecursiveType(String),
     /// A type takes type parameters; needs monomorphization (S5).
     PolymorphicType(String),
-    /// A field's type cannot appear in an allocation-free generated type.
+    /// A structure shape with no allocation-free rendering: a field type that
+    /// cannot appear in one, or — since a `Prop` field belongs to exactly one
+    /// constructor — an invariant on a type with more than one constructor,
+    /// which could not be given the checked constructor an invariant needs.
     UnsupportedFieldType(String),
     /// Two Lean types share a last name component, so they would collide.
     DuplicateTypeName(String),
@@ -245,7 +248,7 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     ),
     (
         "UnsupportedFieldType",
-        "a field type not allowed in an allocation-free generated type (e.g. a list or vector field, which would need owned storage)",
+        "a structure shape that has no allocation-free rendering. Two causes: a field type that would need owned storage (a list or vector field); or a type that carries an invariant and has more than one constructor, which cannot get the checked constructor an invariant requires, since a `Prop` field belongs to exactly one constructor",
     ),
     (
         "DuplicateTypeName",

@@ -60,6 +60,12 @@ namespace Conformance
 @[prod] def c_int_ediv (a b : Int) : Int := a / b
 @[prod] def c_int_emod (a b : Int) : Int := a % b
 @[prod] def c_int_neg (a : Int) : Int := -a
+-- `Int.pow : Int → Nat → Int` is reached through `instance : NatPow Int` →
+-- `instPowNat` → `instHPow`, and all three of those wrapper names are matched
+-- by `natHDictOp` and hard-mapped to kind `"Nat"`. This case is what decides
+-- whether the published `Int.pow` contract row is true: it must lower to
+-- `(pow Int ...)`, not `(pow Nat ...)` or an `(extern ...)`.
+@[prod] def c_int_pow (a : Int) (b : Nat) : Int := a ^ b
 @[prod] def c_int_guard_lt (a b : Int) : Int := if a < b then 1 else 0
 @[prod] def c_int_guard_eq (a b : Int) : Int := if a = b then 1 else 0
 

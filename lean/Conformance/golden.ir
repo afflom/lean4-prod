@@ -13,6 +13,10 @@
   (def c_guard_le ((a Nat) (b Nat)) Nat
     (if (le a b) (let _x_7 1 _x_7) (let _x_3 0 _x_3)))
 
+  ;; full: Conformance.c_int_pow
+  (def c_int_pow ((a Int) (b Nat)) Int
+    (let _x_18 (pow Int a b) _x_18))
+
   ;; full: Conformance.c_u8_add
   (def c_u8_add ((a U8) (b U8)) U8
     (let _x_11 (add U8 a b) _x_11))

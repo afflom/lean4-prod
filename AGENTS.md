@@ -58,6 +58,16 @@ What that means in practice, and what you must not regress:
   first) and `specs/lean-for-production.md` (pinned by `just subset-check`,
   part of `just prod`; there is no bless step, just rerun `just subset` and
   review+commit the diff). Never hand-edit either.
+- Every golden in `goldens.ir` must be **consumed**. `goldenEntries`
+  (`lean/Prod/Emit.lean`) and the assertions in
+  `prod-codegen-compile-tests/tests/smoke.rs` /
+  `prod-core/tests/macro_generation.rs` are hand-maintained lists with no
+  mechanical relationship, and that is exactly how this milestone's only
+  defect shipped green: Lean computed `golden_u8_shl_1_8 = 1`, the assertion
+  beside it said `0`, and nothing compared them.
+  `prod-codegen-compile-tests/tests/goldens_consumed.rs` now fails the build
+  for any `golden_*` name that appears in neither consumer. Adding a golden
+  without an assertion is a build failure, not an oversight nobody notices.
 - The old repo at `~/work/rust/mine/lean-four-prod/` is READ-ONLY reference.
 - No `git add`/`git commit`/other git mutations without the user's explicit go-ahead.
 - Verify gates below must actually pass before claiming a milestone done.

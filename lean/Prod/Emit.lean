@@ -235,6 +235,16 @@ def goldenEntries : Array GoldenEntry := Id.run do
                     value := toString (Conformance.c_u8_add 255 1) }
   out := out.push { name := "golden_u8_shl_1_8", ret := "U8",
                     value := toString (Conformance.c_u8_shl 1 8) }
+  -- `Int.pow` is the one contract row whose *kind* was in doubt: it is reached
+  -- through `instance : NatPow Int` → `instPowNat` → `instHPow`, and all three
+  -- of those wrapper names are matched by `natHDictOp` (`Prod.Lower`) and
+  -- hard-mapped to kind `"Nat"`. The conformance golden settles the lowering
+  -- (`(pow Int a b)`); this golden settles the *value*, with a negative base so
+  -- a `pow Nat` rendering — `((a) as u64).checked_pow(..)` — could not agree by
+  -- accident: `(-2)^3 = -8`, where the unsigned reading gives 2^192-ish and
+  -- overflows instead.
+  out := out.push { name := "golden_int_pow_neg_2_3", ret := "Int",
+                    value := toString (Conformance.c_int_pow (-2) 3) }
   -- Int.toNat clamps negatives to 0 (`Init/Data/Int/Basic.lean`); computed by
   -- calling the compiled `c_int_to_nat` itself, so a bare-cast rendering
   -- (which would wrap -5 to 18446744073709551611) would visibly disagree

@@ -65,6 +65,24 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
     // that distinction matters.
     assert_eq!(c_int_ediv(-12, 7)?, golden_int_ediv_neg_12_7());
     assert_eq!(c_int_emod(-12, 7)?, golden_int_emod_neg_12_7());
+    // `Int.pow` was the only published operator with no conformance witness.
+    // `Int.pow : Int → Nat → Int` reaches the lowerer through `instance :
+    // NatPow Int` → `instPowNat` → `instHPow`, every one of which `natHDictOp`
+    // hard-maps to kind `"Nat"` — so the risk was `(pow Nat a b)`, rendering
+    // `((a) as u64).checked_pow(..)`. The golden pins `(pow Int a b)`, and a
+    // negative base is what makes the assertion able to tell the two apart:
+    // under the unsigned reading -2 becomes 18446744073709551614 and the
+    // power overflows rather than giving -8.
+    assert_eq!(c_int_pow(-2, 3)?, -8);
+    assert_eq!(c_int_pow(-2, 3)?, golden_int_pow_neg_2_3());
+    assert_eq!(c_int_pow(2, 0)?, 1);
+    // Checked, like the rest of `Int`: the exponent is a `Nat`, so both the
+    // overflow and the "exponent does not fit u32" case are reported.
+    assert_eq!(c_int_pow(2, 63), Err(ComputeError::PowOverflow));
+    assert_eq!(
+        c_int_pow(2, u64::from(u32::MAX) + 1),
+        Err(ComputeError::PowExponentTooLarge)
+    );
 
     // Sized integers. Lean's `UInt8.add` is BitVec addition, so overflow
     // wraps rather than erroring — the opposite of `Nat`/`Int`.

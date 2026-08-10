@@ -37,7 +37,13 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
     // for them is constructible and callable. Each carries an invariant, so it
     // is constructed through the generated checked `new` — these values satisfy
     // the Lean invariant, so `new` accepts them.
-    let mixed = MixedCompare::new(2, 7, 5)?;
+    // Interior values, not boundary ones. `MixedCompare`'s invariant is
+    // `lo >= 2 /\ hi <= 7 /\ lo < hi`, and it exists to discriminate a blanket
+    // operand swap from a correct per-operator one. At `lo = 2, hi = 7` both
+    // non-strict conjuncts read the same either way (`2 <= 2`, `7 <= 7`), so
+    // only `lo < hi` would catch a swap. At `lo = 3, hi = 6` all three
+    // conjuncts discriminate. (3 + 6 + 5 is still 14.)
+    let mixed = MixedCompare::new(3, 6, 5)?;
     assert_eq!(c_mixed_compare(mixed)?, 14);
     let split = SplitInvariant::new(1, 3)?;
     assert_eq!(c_split_invariant(split)?, 4);

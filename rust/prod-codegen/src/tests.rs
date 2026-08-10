@@ -399,6 +399,7 @@ fn test_every_error_variant_is_published_in_rejections() {
         Error::UnknownField(s(), s()),
         Error::UnsupportedJoinPoint(s()),
         Error::UnsupportedKind(s()),
+        Error::ReservedFieldName(s(), s()),
     ];
 
     for error in &all {
@@ -416,6 +417,7 @@ fn test_every_error_variant_is_published_in_rejections() {
             Error::UnknownField(..) => "UnknownField",
             Error::UnsupportedJoinPoint(_) => "UnsupportedJoinPoint",
             Error::UnsupportedKind(_) => "UnsupportedKind",
+            Error::ReservedFieldName(..) => "ReservedFieldName",
         };
         assert!(
             REJECTIONS.iter().any(|(variant, _)| *variant == name),
@@ -1119,4 +1121,57 @@ fn test_multi_constructor_type_with_an_invariant_is_rejected() {
         }
         other => panic!("expected UnsupportedFieldType, got {:?}", other),
     }
+}
+
+#[test]
+fn test_field_named_new_on_an_invariant_type_is_rejected() {
+    // The accessors share an `impl` block with the generated `new`, so a field
+    // named `new` would emit two inherent methods of that name (E0592).
+    // `new` is not a Rust keyword, so nothing downstream escapes or renames it
+    // — without this rejection the output simply would not compile.
+    let ir = r#"
+(module M
+  (type "M.Collide"
+    (ctor "M.Collide.mk" (new Nat) (other Nat))
+    (invariant (le 1 new))))
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::ReservedFieldName(String::from("M.Collide"), String::from("new"))
+    );
+}
+
+#[test]
+fn test_field_named_new_without_an_invariant_is_fine() {
+    // The name is only reserved where the constructor exists. A type with no
+    // invariant gets neither `new` nor accessors, so nothing collides.
+    let ir = r#"(module M (type "M.Plain" (ctor "M.Plain.mk" (new Nat))))"#;
+    assert!(generate(ir).contains("pub new: u64"));
+}
+
+#[test]
+fn test_keyword_field_name_is_raw_escaped_inside_the_checked_constructor() {
+    // `new`'s parameters, the struct's fields and the accessors all go through
+    // `rust_ident`, so the invariant's references to those fields must too --
+    // otherwise a field named `type` renders `pub fn new(r#type: u64)` whose
+    // body reads `if (1 <= type)`, which is a syntax error.
+    let ir = r#"
+(module M
+  (type "M.Kw"
+    (ctor "M.Kw.mk" (type Nat) (fn Nat))
+    (invariant (and (le 1 type) (le 1 fn)))))
+"#;
+    let out = generate(ir);
+    assert!(
+        out.contains("pub fn new(r#type: u64, r#fn: u64) -> Result<Self, crate::ComputeError>"),
+        "got: {}",
+        out
+    );
+    assert!(
+        out.contains("if ((1 <= r#type) && (1 <= r#fn))"),
+        "the invariant must escape the same names the parameters do; got: {}",
+        out
+    );
+    assert!(out.contains("Ok(Kw { r#type, r#fn })"), "got: {}", out);
+    assert!(out.contains("pub fn r#type(&self) -> u64 { self.r#type }"));
 }

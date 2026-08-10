@@ -147,6 +147,13 @@ pub enum Error {
     /// An operation that has no rendering for the numeric kind it was applied
     /// to — for example a shift on `Int`, or negation on an unsigned kind.
     UnsupportedKind(String),
+    /// An invariant-carrying type has a field whose name the generated
+    /// checked constructor has already taken. `new` and the field's accessor
+    /// would be two inherent methods of the same name in one `impl` (E0592),
+    /// so the output would not compile. Only invariant-carrying types are
+    /// affected: without an invariant there is no `new` and no accessors, and
+    /// a field named `new` is unremarkable.
+    ReservedFieldName(String, String),
 }
 
 impl fmt::Display for Error {
@@ -196,6 +203,11 @@ impl fmt::Display for Error {
                 f,
                 "operation has no rendering for its numeric kind: {}",
                 s
+            ),
+            Error::ReservedFieldName(ty, field) => write!(
+                f,
+                "type `{}` carries an invariant, so it gets a generated `new` constructor and one accessor per field; its field `{}` would collide with `new`",
+                ty, field
             ),
         }
     }
@@ -258,6 +270,10 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     (
         "UnsupportedKind",
         "an operation with no rendering for the numeric kind it was applied to. There are exactly four causes: a shift on Int; negation on any kind other than Int; pow on a sized kind (UInt8..UInt64), whose u32 exponent cannot be narrowed without silently changing the answer; and a conversion between a pair of numeric kinds that has no rendering, namely every sized-to-sized pair (e.g. UInt8 -> UInt32) and every Int-to-sized pair, both deliberate non-goals",
+    ),
+    (
+        "ReservedFieldName",
+        "a field of a structure whose invariant is enforced is named `new`, which the generated checked constructor already uses; the field's accessor would collide with it. Structures with no enforced invariant get neither, so the name is only reserved where the constructor exists",
     ),
 ];
 
@@ -377,6 +393,20 @@ fn generate_type_decl<'m>(decl: &'m TypeDecl, table: &TypeTable<'m>) -> Result<S
 
         if let Some(invariant) = &decl.invariant {
             let rust_name = rust_ident(short);
+
+            // The accessors share an `impl` block with `new`, so a field named
+            // `new` would emit two inherent methods of that name (E0592).
+            // `new` is not a Rust keyword, so `rust_ident` leaves it alone and
+            // nothing downstream would catch it — the output would simply not
+            // compile. Reject here, naming the type and the field.
+            for (name, _) in &ctor.fields {
+                if rust_ident(name) == "new" {
+                    return Err(Error::ReservedFieldName(
+                        decl.name.clone(),
+                        String::from(name.as_str()),
+                    ));
+                }
+            }
 
             // Render the invariant with the constructor's parameters in scope:
             // the IR refers to fields by name, and `new`'s parameters carry
@@ -961,7 +991,16 @@ impl<'m> Renderer<'_, 'm> {
                         name
                     ))),
                 },
-                Mode::Value => Ok(name.clone()),
+                // Raw-escaped, because a `Var` can name a structure field: an
+                // invariant refers to the fields by name, and the `new` that
+                // renders it declares its parameters (and the struct declares
+                // its fields) through `rust_ident`. Emitting the use raw would
+                // give `pub fn new(r#type: u64) { if (1 <= type)`. The lookup
+                // key above stays raw — only the emitted text is escaped.
+                //
+                // `rust_ident` is the identity on every non-keyword name, so
+                // this changes no rendering that compiles today.
+                Mode::Value => Ok(rust_ident(name)),
             },
             Expr::Call(name, args) => {
                 let rendered = self.render_args(args)?;

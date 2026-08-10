@@ -607,6 +607,91 @@ def indent (n : Nat) (s : String) : String :=
 def isPropType (e : Expr) : LowerM Bool :=
   liftM (Lean.Meta.MetaM.run' (Lean.Meta.isProp e))
 
+/-- An operand inside a proposition: either a reference to one of the
+    structure's own fields, or a numeric literal. Anything else makes the
+    whole proposition unlowerable.
+
+    Defined before `lowerProp`, which calls it: Lean has no forward references
+    outside a `mutual` block, and this function never calls back, so ordering
+    is enough. -/
+partial def lowerPropOperand (e : Expr) (fields : Array String) (depth : Nat)
+    : LowerM (Option String) := do
+  match e with
+  | .bvar i =>
+    let idx := depth - 1 - i
+    match fields[idx]? with
+    | some name => return some name
+    | none => return none
+  | .lit (.natVal n) => return some (toString n)
+  | _ =>
+    -- `OfNat.ofNat`-wrapped literals: take the raw literal argument if there
+    -- is one, otherwise decline. This is the shape numeric literals actually
+    -- take in a constructor telescope (`OfNat.ofNat Nat n (instOfNatNat n)`);
+    -- the raw `.lit` arm above is a harmless belt-and-braces case.
+    match e.getAppFn with
+    | .const ``OfNat.ofNat _ =>
+      let raw? : Option Expr := e.getAppArgs[1]?
+      match raw? with
+      | some (.lit (.natVal n)) => return some (toString n)
+      | _ => return none
+    | _ => return none
+
+/-- Lower a `Prop` to a boolean IR expression over a structure's own fields,
+    or `none` if it is outside the lowerable fragment.
+
+    `fields` holds the field names in binder order — **including** `Prop`
+    fields, since de Bruijn indices count every binder. A proposition refers
+    to an earlier field by de Bruijn index, so `bvar i` at binder depth `d`
+    (the `Prop` field's own 0-indexed telescope position) names
+    `fields[d - 1 - i]`. See AGENTS.md for the verified shape.
+
+    Lowerable: conjunction, disjunction, negation, and comparisons on
+    supported numeric kinds. Everything else — quantifiers, arbitrary
+    predicates, anything mentioning a name that is not one of this
+    structure's fields — returns `none`, and the structure then keeps public
+    fields and no checked constructor. That is a strictly weaker outcome, not
+    a wrong one. -/
+partial def lowerProp (e : Expr) (fields : Array String) (depth : Nat)
+    : LowerM (Option String) := do
+  let arg? (i : Nat) : Option Expr := e.getAppArgs[i]?
+  match e.getAppFn with
+  | .const ``And _ => do
+    let some a := arg? 0 | return none
+    let some b := arg? 1 | return none
+    let some a' ← lowerProp a fields depth | return none
+    let some b' ← lowerProp b fields depth | return none
+    return some s!"(and {a'} {b'})"
+  | .const ``Or _ => do
+    let some a := arg? 0 | return none
+    let some b := arg? 1 | return none
+    let some a' ← lowerProp a fields depth | return none
+    let some b' ← lowerProp b fields depth | return none
+    return some s!"(or {a'} {b'})"
+  | .const ``Not _ => do
+    let some a := arg? 0 | return none
+    let some a' ← lowerProp a fields depth | return none
+    return some s!"(not {a'})"
+  | .const cmp _ =>
+    -- Comparisons. `a ≥ b` is `b ≤ a` and `a > b` is `b < a`, so the two
+    -- reversed forms map onto the IR's `le`/`lt` with their operands swapped
+    -- rather than needing their own nodes.
+    let swap? : Option (String × Bool) :=
+      if cmp == ``LE.le || cmp == ``Nat.le then some ("le", false)
+      else if cmp == ``GE.ge then some ("le", true)
+      else if cmp == ``LT.lt || cmp == ``Nat.lt then some ("lt", false)
+      else if cmp == ``GT.gt then some ("lt", true)
+      else if cmp == ``Eq then some ("eq", false)
+      else none
+    let some (op, reversed) := swap? | return none
+    -- Comparisons carry instance/type arguments ahead of the operands; take
+    -- the LAST two arguments, which are the operands under every spelling.
+    let args := e.getAppArgs
+    if args.size < 2 then return none
+    let some a ← lowerPropOperand args[args.size - 2]! fields depth | return none
+    let some b ← lowerPropOperand args[args.size - 1]! fields depth | return none
+    return some (if reversed then s!"({op} {b} {a})" else s!"({op} {a} {b})")
+  | _ => return none
+
 /-- Render one inductive as an IR `(type ...)` declaration, erasing `Prop`
     fields.
 
@@ -626,27 +711,55 @@ def lowerTypeDecl (typeName : Name) : LowerM (Option String) := do
   if let some reason := unsupported? then
     return some s!"(type \"{typeName}\" (unsupported \"{reason}\"))"
   let mut ctorSexps : Array String := #[]
+  -- Propositions collected from `Prop` fields, and whether every one lowered.
+  -- A single unlowerable `Prop` field suppresses the whole `(invariant ...)`
+  -- clause: emitting a partial invariant would claim the generated
+  -- constructor checks everything Lean proved when it does not.
+  let mut invProps : Array String := #[]
+  let mut invOk := true
   for ctorName in iv.ctors do
     let some (.ctorInfo cv) := env.find? ctorName | return none
     -- Walk the constructor telescope past the (zero) type params to reach the
     -- value fields, pairing each with its declared name.
     let fieldNames := getStructureFields env typeName
+    -- Two different lists, deliberately kept apart. `fields` is the OUTPUT
+    -- field list and excludes `Prop` fields (they are erased). `binderNames`
+    -- is every telescope binder in order, `Prop` fields included, because de
+    -- Bruijn indices inside a proposition count every binder — conflating the
+    -- two shifts every index and silently references the wrong field.
     let mut fields : Array String := #[]
+    let mut binderNames : Array String := #[]
     let mut ty := cv.type
     let mut i := 0
     while i < cv.numFields do
       match ty with
       | .forallE _ fieldTy rest _ =>
-        if !(← isPropType fieldTy) then
-          let nm := match fieldNames[i]? with
-            | some n => sanitize n
-            | none => s!"field_{i}"
+        let nm := match fieldNames[i]? with
+          | some n => sanitize n
+          | none => s!"field_{i}"
+        if ← isPropType fieldTy then
+          -- `i` is this `Prop` field's own 0-indexed telescope position,
+          -- which is exactly the binder depth its bvars are relative to.
+          match ← lowerProp fieldTy binderNames i with
+          | some p => invProps := invProps.push p
+          | none => invOk := false
+        else
           fields := fields.push s!"({nm} {← lowerType fieldTy})"
+        binderNames := binderNames.push nm
         ty := rest
         i := i + 1
       | _ => i := cv.numFields
     ctorSexps := ctorSexps.push s!"(ctor \"{ctorName}\"{spaced fields})"
-  return some s!"(type \"{typeName}\"{spaced ctorSexps})"
+  -- Only a single-constructor type gets an invariant: with several
+  -- constructors the field references would belong to different telescopes.
+  let invariant : String :=
+    if iv.ctors.length == 1 && invOk && !invProps.isEmpty then
+      -- Left-associated: `p0`, `(and p0 p1)`, `(and (and p0 p1) p2)`, …
+      let conj := (invProps.extract 1 invProps.size).foldl
+        (init := invProps[0]!) fun acc p => s!"(and {acc} {p})"
+      s!" (invariant {conj})"
+    else ""
+  return some s!"(type \"{typeName}\"{spaced ctorSexps}{invariant})"
 
 /-- Type names a single LCNF `LetValue` mentions: a constructor application
     names its inductive, a projection names the structure it projects from.

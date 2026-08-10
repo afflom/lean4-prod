@@ -219,6 +219,29 @@ def sizedOpSuffixes : List (Name × String) :=
 def sizedKinds : List (Name × String) :=
   [ (`UInt8, "U8"), (`UInt16, "U16"), (`UInt32, "U32"), (`UInt64, "U64") ]
 
+/-- Types the IR handles natively, paired with their contract annotation.
+    Single source of truth for three consumers that previously each carried
+    their own copy: `collectTypeDecls`' exclusion test (a builtin must not be
+    collected as a user inductive — `UInt8` is a structure over
+    `toBitVec : BitVec 8`, and trying to describe that field aborts the
+    export), and `subsetJson`'s published Types list.
+
+    `lowerType` deliberately does NOT consume this: it maps each builtin to a
+    *different* IR tag, which is a mapping rather than a membership test, and
+    collapsing the two would make the list carry two unrelated jobs. -/
+def builtinTypes : List (Name × String) :=
+  [ (`Nat, "Nat"),
+    (`Bool, "Bool"),
+    (`Int, "Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int; Nat -> Int is supported, via the constructors Int.ofNat (n renders as (n as i64)) and Int.negSucc (n renders as -(n as i64) - 1) -- these are constructor applications, not conversion calls, so they never appear in the Conversions list below)"),
+    (`Prod, "Prod (renders as a Rust tuple)"),
+    (`List, "List (parameter: &[a]; return: a caller-owned output buffer)"),
+    (`Option, "Option") ]
+  ++ sizedKinds.map (fun p =>
+       (p.1, s!"{p.1} (renders as {p.2.toLower}; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) -- none of this can fail; pow is not whitelisted for sized kinds)"))
+
+/-- Is this constant a type the IR handles natively? -/
+def isBuiltinType (n : Name) : Bool := builtinTypes.any (fun p => p.1 == n)
+
 /-- The cross product of `sizedKinds` and `sizedOpSuffixes`: every
     sized-integer operator row, e.g. `UInt8.add` ↦ `("add", "U8")`. This is
     what makes the "generated rather than typed out" claim above true. -/

@@ -11,10 +11,13 @@ named error rather than silently mis-compiled.
 - `Nat`
 - `Bool`
 - `Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int; Nat -> Int is supported, via the constructors Int.ofNat (n renders as (n as i64)) and Int.negSucc (n renders as -(n as i64) - 1) -- these are constructor applications, not conversion calls, so they never appear in the Conversions list below)`
-- `UInt8, UInt16, UInt32, UInt64 (render as u8/u16/u32/u64; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) — none of this can fail; pow is not whitelisted for sized kinds)`
-- `Prod`
-- `List`
+- `Prod (renders as a Rust tuple)`
+- `List (parameter: &[a]; return: a caller-owned output buffer)`
 - `Option`
+- `UInt8 (renders as u8; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) -- none of this can fail; pow is not whitelisted for sized kinds)`
+- `UInt16 (renders as u16; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) -- none of this can fail; pow is not whitelisted for sized kinds)`
+- `UInt32 (renders as u32; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) -- none of this can fail; pow is not whitelisted for sized kinds)`
+- `UInt64 (renders as u64; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) -- none of this can fail; pow is not whitelisted for sized kinds)`
 - `parameterless, non-recursive, single-constructor structures (Prop fields erased)`
 
 **Erased invariants.** A Lean structure may carry `Prop` fields

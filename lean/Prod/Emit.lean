@@ -66,16 +66,14 @@ def subsetJson : String :=
   let ops := numOpNames.map fun r => toString r.1
   let conversions := conversionNames.map fun r => toString r.1
   let deciders := deciderNames.map fun p => toString p.1
-  -- `Nat`/`Bool`/`Int`/`Prod`/`List`/`Option` are built into the IR type
-  -- grammar (`lowerType`); anything else is a user inductive, and
-  -- `lowerTypeDecl` supports exactly parameterless, non-recursive,
-  -- single-block inductives with a single constructor (`Prop` fields
-  -- erased) — the only shape the conformance suite exercises
-  -- (`Conformance.MidProp`, `Conformance.NoProp`, `UorAtlas.Instance`).
-  let types := ["Nat", "Bool", "Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int; Nat -> Int is supported, via the constructors Int.ofNat (n renders as (n as i64)) and Int.negSucc (n renders as -(n as i64) - 1) -- these are constructor applications, not conversion calls, so they never appear in the Conversions list below)",
-                "UInt8, UInt16, UInt32, UInt64 (render as u8/u16/u32/u64; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) — none of this can fail; pow is not whitelisted for sized kinds)",
-                "Prod", "List", "Option",
-                "parameterless, non-recursive, single-constructor structures (Prop fields erased)"]
+  -- `builtinTypes` (`Prod.Lower`) is built into the IR type grammar
+  -- (`lowerType`); anything else is a user inductive, and `lowerTypeDecl`
+  -- supports exactly parameterless, non-recursive, single-block inductives
+  -- with a single constructor (`Prop` fields erased) — the only shape the
+  -- conformance suite exercises (`Conformance.MidProp`, `Conformance.NoProp`,
+  -- `UorAtlas.Instance`).
+  let types := builtinTypes.map (·.2) ++
+    ["parameterless, non-recursive, single-constructor structures (Prop fields erased)"]
   let quoted (xs : List String) : String :=
     String.intercalate ", " (xs.map fun s => "\"" ++ jsonEscape s ++ "\"")
   "{\n  \"operators\": [" ++ quoted ops ++ "],\n  \"conversions\": [" ++ quoted conversions ++
@@ -97,12 +95,9 @@ def collectTypeDecls (ctx : LowerCtx) (extracted : Array ExtractedDef)
         -- `UInt8.ofBitVec`), so without this exclusion they would be
         -- collected as ordinary user inductives and `lowerTypeDecl` would
         -- try (and fail) to describe their `toBitVec : BitVec 8` field —
-        -- `sizedKinds` is the same list `lowerType` uses to map them to
-        -- `U8`…`U64` instead.
-        let isSized := sizedKinds.any fun p => p.1 == n
-        if n != ``Nat && n != ``Bool && n != ``Int && n != ``Prod
-            && n != ``List && n != ``Option && !isSized && !wanted.contains n then
-          if (env.find? n).isSome && !wanted.contains n then
+        -- `isBuiltinType` is the single source of truth for this exclusion.
+        if !isBuiltinType n && !wanted.contains n then
+          if (env.find? n).isSome then
             wanted := wanted.push n
   let sorted := wanted.qsort fun a b => Name.quickCmp a b == .lt
   let mut out : Array String := #[]

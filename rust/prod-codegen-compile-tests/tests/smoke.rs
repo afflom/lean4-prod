@@ -28,28 +28,20 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
 
     // Structure projection, including the type whose Prop field sits in the
     // middle of the declaration.
-    let m = MidProp {
-        first: 1,
-        second: 2,
-        third: 3,
-    };
+    let m = MidProp::new(1, 2, 3)?;
     assert_eq!(c_proj_middle_prop(m), (1, (2, 3)));
 
     // The invariant-lowering probe structures (`lean/Conformance/Structures.lean`).
     // What each one pins about lowering lives in `golden.ir`, which `just
     // conformance` diffs; these calls only establish that the generated Rust
-    // for them is constructible and callable. Values satisfy each structure's
-    // Lean invariant, so they stay valid once Task 5 turns these literals into
-    // checked constructors.
-    let mixed = MixedCompare {
-        lo: 2,
-        hi: 7,
-        extra: 5,
-    };
+    // for them is constructible and callable. Each carries an invariant, so it
+    // is constructed through the generated checked `new` — these values satisfy
+    // the Lean invariant, so `new` accepts them.
+    let mixed = MixedCompare::new(2, 7, 5)?;
     assert_eq!(c_mixed_compare(mixed)?, 14);
-    let split = SplitInvariant { a: 1, b: 3 };
+    let split = SplitInvariant::new(1, 3)?;
     assert_eq!(c_split_invariant(split)?, 4);
-    let tagged = TaggedMode { mode: 1, limit: 9 };
+    let tagged = TaggedMode::new(1, 9)?;
     assert_eq!(c_tagged_mode(tagged)?, 10);
     // These two have Prop fields OUTSIDE the lowerable fragment, so they carry
     // no invariant and keep plain public fields — the decline path.

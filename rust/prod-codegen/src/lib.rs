@@ -329,7 +329,12 @@ fn type_table(types: &[TypeDecl]) -> Result<TypeTable<'_>, Error> {
 /// Every generated type is `Copy`, which is what keeps it inside the
 /// allocation-free tier: a type is eligible only if every field is a scalar, a
 /// tuple of eligible types, or another eligible generated type.
-fn generate_type_decl(decl: &TypeDecl, table: &TypeTable) -> Result<String, Error> {
+///
+/// A type carrying an invariant (the exporter lowered its `Prop` fields to a
+/// boolean expression over its own fields) additionally gets `pub(crate)`
+/// fields, a checked `new`, and one accessor per field — see the invariant
+/// block below for why the fields are crate-visible rather than private.
+fn generate_type_decl<'m>(decl: &'m TypeDecl, table: &TypeTable<'m>) -> Result<String, Error> {
     // The exporter reached this type but could not describe it. It is declared
     // anyway so that the rejection names a reason instead of an unknown type.
     if let Some(reason) = &decl.unsupported {
@@ -350,16 +355,94 @@ fn generate_type_decl(decl: &TypeDecl, table: &TypeTable) -> Result<String, Erro
 
     if decl.ctors.len() == 1 {
         let ctor = &decl.ctors[0];
+        // Generated code keeps constructing invariant-carrying types by struct
+        // literal — Lean already supplied the proof — so the fields stay
+        // reachable in-crate. Only callers outside the crate, where the proof
+        // was erased on export, are routed through the checked constructor.
+        let vis = if decl.invariant.is_some() {
+            "pub(crate)"
+        } else {
+            "pub"
+        };
         out.push_str(&format!("pub struct {} {{\n", rust_ident(short)));
         for (name, ty) in &ctor.fields {
             out.push_str(&format!(
-                "    pub {}: {},\n",
+                "    {} {}: {},\n",
+                vis,
                 rust_ident(name),
                 type_to_rust(ty)?
             ));
         }
         out.push_str("}\n");
+
+        if let Some(invariant) = &decl.invariant {
+            let rust_name = rust_ident(short);
+
+            // Render the invariant with the constructor's parameters in scope:
+            // the IR refers to fields by name, and `new`'s parameters carry
+            // those same names, so `Var("q")` resolves without any rebinding.
+            // `no_shapes` must be a named binding, not a temporary: `Renderer`
+            // holds `&'s Signatures<'m>`, so `&BTreeMap::new()` inline would be
+            // dropped at the end of the statement and fail to borrow-check.
+            let no_shapes: Signatures = BTreeMap::new();
+            let renderer = Renderer {
+                shapes: &no_shapes,
+                params: &[],
+                types: table,
+                ctx: JpContext::collect(invariant),
+            };
+            let predicate = renderer.value(invariant)?;
+
+            let mut params = Vec::with_capacity(ctor.fields.len());
+            let mut inits = Vec::with_capacity(ctor.fields.len());
+            for (name, ty) in &ctor.fields {
+                params.push(format!("{}: {}", rust_ident(name), type_to_rust(ty)?));
+                inits.push(rust_ident(name));
+            }
+
+            out.push_str(&format!("impl {} {{\n", rust_name));
+            out.push_str(&format!(
+                "    /// Re-checks the invariant Lean proved at construction.\n\
+                 \x20   ///\n\
+                 \x20   /// Generated code does not call this: inside the generated world the\n\
+                 \x20   /// proof holds, and re-checking would turn proved-total functions\n\
+                 \x20   /// fallible. It exists for callers at the crate boundary, where the\n\
+                 \x20   /// proof is not available because it was erased on export.\n\
+                 \x20   pub fn new({}) -> Result<Self, crate::ComputeError> {{\n\
+                 \x20       if {} {{\n\
+                 \x20           Ok({} {{ {} }})\n\
+                 \x20       }} else {{\n\
+                 \x20           Err(crate::ComputeError::InvariantViolated({:?}))\n\
+                 \x20       }}\n\
+                 \x20   }}\n",
+                params.join(", "),
+                predicate,
+                rust_name,
+                inits.join(", "),
+                decl.name
+            ));
+            for (name, ty) in &ctor.fields {
+                out.push_str(&format!(
+                    "    pub fn {}(&self) -> {} {{ self.{} }}\n",
+                    rust_ident(name),
+                    type_to_rust(ty)?,
+                    rust_ident(name)
+                ));
+            }
+            out.push_str("}\n");
+        }
         return Ok(out);
+    }
+
+    // Only a single-constructor structure can carry an invariant: a `Prop`
+    // field belongs to one constructor. Reject rather than render half of it.
+    if decl.invariant.is_some() {
+        return Err(Error::UnsupportedFieldType(format!(
+            "`{}` carries an invariant but has {} constructors; only a \
+             single-constructor structure can have one",
+            decl.name,
+            decl.ctors.len()
+        )));
     }
 
     out.push_str(&format!("pub enum {} {{\n", rust_ident(short)));
@@ -1186,13 +1269,11 @@ impl<'m> Renderer<'_, 'm> {
             },
             Expr::Unreachable => Ok(String::from("unreachable!()")),
             Expr::Opaque(s) => Err(Error::OpaqueExpr(s.clone())),
-            // TODO(S2 Phase B Task 5): render as `&&`/`||`/`!`. These variants
-            // exist only for invariant lowering (IR Task 3); no producer
-            // targets them yet, so a real rendering isn't testable here.
-            // Task 5 replaces this arm rather than adding alongside it.
-            Expr::And(..) | Expr::Or(..) | Expr::Not(..) => Err(Error::OpaqueExpr(
-                "boolean connective rendering not yet implemented".into(),
-            )),
+            // Boolean connectives. Fully parenthesised, so the rendering never
+            // depends on Rust's precedence agreeing with the IR's nesting.
+            Expr::And(a, b) => Ok(format!("({} && {})", self.value(a)?, self.value(b)?)),
+            Expr::Or(a, b) => Ok(format!("({} || {})", self.value(a)?, self.value(b)?)),
+            Expr::Not(a) => Ok(format!("(!{})", self.value(a)?)),
             // Handled by `render` before it delegates here.
             Expr::If(..)
             | Expr::Let(..)

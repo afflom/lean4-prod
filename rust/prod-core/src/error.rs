@@ -5,10 +5,12 @@
 //! `checked_pow`, and writing a list into a caller-owned buffer) reports
 //! failure through [`ComputeError`] instead.
 //!
-//! The type is deliberately a small `Copy` C-like enum with no payload: it is
-//! allocation-free, cheap to propagate through `?`, and `Display` writes
-//! straight into the formatter without building a `String`, so the whole error
-//! path stays within the crate's heapless memory profile.
+//! The type is deliberately small and `Copy`: it is allocation-free, cheap to
+//! propagate through `?`, and `Display` writes straight into the formatter
+//! without building a `String`, so the whole error path stays within the
+//! crate's heapless memory profile. The one variant that carries a payload,
+//! [`ComputeError::InvariantViolated`], carries a `&'static str`, which keeps
+//! both of those properties.
 
 use core::fmt;
 
@@ -43,11 +45,20 @@ pub enum ComputeError {
     DivOverflow,
     /// `-a` on `Int` overflowed `i64` — only `-i64::MIN`.
     NegOverflow,
+    /// A generated checked constructor's invariant did not hold. The payload
+    /// names the type; it is `&'static str` so the enum stays `Copy` and the
+    /// error path stays allocation-free.
+    InvariantViolated(&'static str),
 }
 
 impl ComputeError {
-    /// The `Display` text, also usable in `const` contexts and by callers that
-    /// want the message without a formatter.
+    /// The message text, also usable in `const` contexts and by callers that
+    /// want it without a formatter.
+    ///
+    /// Deliberately payload-free, which is what keeps it `const`: for
+    /// [`ComputeError::InvariantViolated`] this is the message *without* the
+    /// type name, and `Display` appends the name on top of it. Every other
+    /// variant's `Display` is exactly this string.
     pub const fn as_str(self) -> &'static str {
         match self {
             ComputeError::AddOverflow => "Nat addition overflowed u64",
@@ -60,13 +71,19 @@ impl ComputeError {
             ComputeError::SubOverflow => "Int subtraction overflowed i64",
             ComputeError::DivOverflow => "Int division overflowed i64",
             ComputeError::NegOverflow => "Int negation overflowed i64",
+            ComputeError::InvariantViolated(_) => "structure invariant violated",
         }
     }
 }
 
 impl fmt::Display for ComputeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            ComputeError::InvariantViolated(name) => {
+                write!(f, "{} for `{}`", self.as_str(), name)
+            }
+            _ => f.write_str(self.as_str()),
+        }
     }
 }
 
@@ -91,6 +108,7 @@ mod tests {
             ComputeError::SubOverflow,
             ComputeError::DivOverflow,
             ComputeError::NegOverflow,
+            ComputeError::InvariantViolated("X"),
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

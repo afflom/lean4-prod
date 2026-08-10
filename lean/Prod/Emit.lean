@@ -64,6 +64,7 @@ lowerer accepts. -/
     render the published contract. -/
 def subsetJson : String :=
   let ops := numOpNames.map fun r => toString r.1
+  let conversions := conversionNames.map fun r => toString r.1
   let deciders := deciderNames.map fun p => toString p.1
   -- `Nat`/`Bool`/`Int`/`Prod`/`List`/`Option` are built into the IR type
   -- grammar (`lowerType`); anything else is a user inductive, and
@@ -77,8 +78,8 @@ def subsetJson : String :=
                 "parameterless, non-recursive, single-constructor structures (Prop fields erased)"]
   let quoted (xs : List String) : String :=
     String.intercalate ", " (xs.map fun s => "\"" ++ jsonEscape s ++ "\"")
-  "{\n  \"operators\": [" ++ quoted ops ++ "],\n  \"deciders\": [" ++ quoted deciders ++
-    "],\n  \"types\": [" ++ quoted types ++ "]\n}\n"
+  "{\n  \"operators\": [" ++ quoted ops ++ "],\n  \"conversions\": [" ++ quoted conversions ++
+    "],\n  \"deciders\": [" ++ quoted deciders ++ "],\n  \"types\": [" ++ quoted types ++ "]\n}\n"
 
 /-- Rendered `(type ...)` declarations for every inductive reachable from the
     extracted definitions — from their signatures *and* from the constructor
@@ -229,6 +230,11 @@ def goldenEntries : Array GoldenEntry := Id.run do
                     value := toString (Conformance.c_u8_add 255 1) }
   out := out.push { name := "golden_u8_shl_1_8", ret := "U8",
                     value := toString (Conformance.c_u8_shl 1 8) }
+  -- Int.toNat clamps negatives to 0 (`Init/Data/Int/Basic.lean`); computed by
+  -- calling the compiled `c_int_to_nat` itself, so a bare-cast rendering
+  -- (which would wrap -5 to 18446744073709551611) would visibly disagree
+  -- with Lean's own answer rather than only with a hand-typed expectation.
+  out := out.push { name := "golden_int_to_nat_neg_5", value := toString (Conformance.c_int_to_nat (-5)) }
   return out
 
 /-- Assemble the `goldens.ir` text: one zero-arg def per golden. -/

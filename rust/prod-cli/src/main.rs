@@ -58,6 +58,7 @@ enum Commands {
 #[derive(Debug, serde::Deserialize)]
 struct SubsetFile {
     operators: Vec<String>,
+    conversions: Vec<String>,
     deciders: Vec<String>,
     types: Vec<String>,
 }
@@ -93,6 +94,10 @@ fn render_subset(subset: &SubsetFile) -> String {
     out.push_str("\n## Operators\n\n");
     for op in &subset.operators {
         out.push_str(&format!("- `{}`\n", op));
+    }
+    out.push_str("\n## Conversions\n\n");
+    for c in &subset.conversions {
+        out.push_str(&format!("- `{}`\n", c));
     }
     out.push_str("\n## Decidable guards\n\n");
     for d in &subset.deciders {

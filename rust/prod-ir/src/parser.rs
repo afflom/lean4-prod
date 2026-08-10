@@ -19,6 +19,7 @@
 //!            | "(" "mod" kind expr expr ")" | "(" "shl" kind expr expr ")"
 //!            | "(" "shr" kind expr expr ")" | "(" "pow" kind expr expr ")"
 //!            | "(" "neg" kind expr ")"
+//!            | "(" "convert" kind kind expr ")"              ; numeric-kind conversion
 //!            | "(" "opaque" '"' ident '"' ")"
 //!            | "(" "eq" expr expr ")" | "(" "lt" expr expr ")" | "(" "le" expr expr ")"
 //!            | "(" "gt" expr expr ")" | "(" "if" expr expr expr ")" | "(" "let" ident expr expr ")"
@@ -294,6 +295,15 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                 map(
                     tuple((tag("gt"), ws(parse_expr), ws(parse_expr))),
                     |(_, a, b)| Expr::Gt(Box::new(a), Box::new(b)),
+                ),
+                map(
+                    tuple((
+                        tag("convert"),
+                        parse_num_kind,
+                        parse_num_kind,
+                        ws(parse_expr),
+                    )),
+                    |(_, from, to, e)| Expr::Convert(from, to, Box::new(e)),
                 ),
                 map(
                     tuple((tag("if"), ws(parse_expr), ws(parse_expr), ws(parse_expr))),
@@ -801,6 +811,20 @@ mod tests {
         match parse_expr("(neg Int a)").unwrap().1 {
             Expr::Neg(kind, _) => assert_eq!(kind, NumKind::Int),
             other => panic!("expected Neg, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_convert() {
+        let (rest, expr) = parse_expr("(convert Nat Int a)").unwrap();
+        assert!(rest.is_empty());
+        match expr {
+            Expr::Convert(from, to, e) => {
+                assert_eq!(from, NumKind::Nat);
+                assert_eq!(to, NumKind::Int);
+                assert!(matches!(*e, Expr::Var(_)));
+            }
+            other => panic!("expected Convert, got {:?}", other),
         }
     }
 

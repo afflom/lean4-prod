@@ -77,4 +77,12 @@ namespace Conformance
 -- lowered by any conformance case.
 @[prod] def c_u8_guard_lt (a b : UInt8) : UInt8 := if a < b then 1 else 0
 
+-- Conversions. Int.toNat clamping is the one with a wrong-by-default
+-- rendering: (-5).toNat is 0 in Lean, and a bare `as u64` cast would give
+-- 18446744073709551611.
+@[prod] def c_int_of_nat (a : Nat) : Int := Int.ofNat a
+@[prod] def c_int_to_nat (a : Int) : Nat := a.toNat
+@[prod] def c_nat_to_u8 (a : Nat) : UInt8 := a.toUInt8
+@[prod] def c_u8_to_nat (a : UInt8) : Nat := a.toNat
+
 end Conformance

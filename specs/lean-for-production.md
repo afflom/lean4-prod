@@ -73,6 +73,18 @@ generated struct is a plain data carrier, not a refinement type.
 - `UInt64.shiftLeft`
 - `UInt64.shiftRight`
 
+## Conversions
+
+- `Int.toNat`
+- `UInt8.toNat`
+- `UInt8.ofNat`
+- `UInt16.toNat`
+- `UInt16.ofNat`
+- `UInt32.toNat`
+- `UInt32.ofNat`
+- `UInt64.toNat`
+- `UInt64.ofNat`
+
 ## Decidable guards
 
 - `Nat.decLt`

@@ -91,6 +91,17 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
     // computed by the real Lean toolchain cannot.
     assert_eq!(c_u8_add(255, 1), golden_u8_add_255_1());
     assert_eq!(c_u8_shl(1, 8), golden_u8_shl_1_8());
+
+    // Conversions. Int.toNat is the one with a wrong-by-default rendering:
+    // Lean clamps negatives to 0, while a bare `as u64` cast would wrap -5 to
+    // 18446744073709551611.
+    assert_eq!(c_int_to_nat(-5), 0); // clamps, does not wrap
+    assert_eq!(c_int_to_nat(5), 5);
+    assert_eq!(c_nat_to_u8(300), 44); // truncates: 300 - 256
+    assert_eq!(c_u8_to_nat(255), 255);
+    // Cross-checked against Lean's own computed answer, same reasoning as the
+    // Int/UInt8 goldens above.
+    assert_eq!(c_int_to_nat(-5), golden_int_to_nat_neg_5());
     Ok(())
 }
 

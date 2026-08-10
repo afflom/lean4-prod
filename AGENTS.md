@@ -204,10 +204,97 @@ What that means in practice, and what you must not regress:
     does not enforce the invariant its Lean source states — see the "Erased
     invariants" note in `specs/lean-for-production.md`.
 
-Known remaining limitations: typed Lean `Int` semantics is NOT implemented
-(generated Nat is u64 with the bounded policy: checked add/mul/shl/pow,
-saturating sub, total div/mod-by-zero). Arbitrary-precision Nat is ruled OUT by
-the no-heap directive, not merely unimplemented. Closures (`Code.fun`) still
+- S2 Phase A (`specs/designs/2026-08-09-s2-scalar-completeness-and-invariants.md`,
+  plan `specs/plans/2026-08-09-s2-phase-a-arithmetic.md`) DONE: `Int` and
+  sized-integer (`UInt8`…`UInt64`) arithmetic, plus conversions between
+  kinds. What this adds on top of S0/S1:
+  - **Arithmetic nodes carry an explicit `NumKind`**
+    (`Nat | Int | U8 | U16 | U32 | U64`) rather than codegen inferring the
+    kind — `(add Nat a b)`, `(add Int a b)`, `(add U8 a b)` are distinct IR
+    nodes. Lean emits the tag because it already sees `Nat.add` vs `Int.add`
+    vs `UInt8.add`; codegen guessing would recreate the derive-it-twice
+    pattern that has already swapped a struct field once in this project. An
+    unhandled `(op, kind)` combination is `Error::UnsupportedKind`, a compile
+    error, never a fallback rendering.
+  - **Three arithmetic policies, and they differ on purpose, not by
+    oversight:**
+    - `Nat` (→ `u64`): `add`/`mul`/`pow`/`shl` are `checked_*(..).ok_or(..)?`
+      (can genuinely overflow `u64` since Lean's `Nat` is unbounded); `sub`
+      saturates at 0 (Lean `Nat` subtraction); `div`/`mod` are total
+      (zero-divisor gives `0`/the dividend); `shr` (`shiftRight`) is total
+      via `checked_shr(..).unwrap_or(0)` — infallible because `a >>> b = 0`
+      for any `b ≥ 64` once `a` fits `u64`, unlike `shl`, which has no such
+      absorbing case.
+    - `Int` (→ `i64`): `add`/`sub`/`mul`/`pow`/unary `neg` are
+      `checked_*(..).ok_or(..)?`. **Division and modulo are Euclidean, not
+      truncating** — Lean's `/`/`%` on `Int` resolve to `Int.ediv`/`Int.emod`,
+      not the truncating `Int.div`/`Int.mod`
+      (`Init/Data/Int/DivMod/Basic.lean:108-118`: *"The `Div Int` and `Mod
+      Int` instances use `Int.ediv` and `Int.emod` for compatibility with
+      SMT-LIB"*; doctest `(-12) % 7 = 2`, where Rust's `%` gives `-5`).
+      Rendered as `checked_div_euclid`/`checked_rem_euclid` behind a
+      zero-guard (`checked_` covers `i64::MIN / -1`, which overflows where
+      Lean's unbounded `Int` does not); zero-divisor is total, same as `Nat`.
+      Shifts are not whitelisted for `Int` at all (`Error::UnsupportedKind`).
+    - `UIntN` (→ `u8`/`u16`/`u32`/`u64`): **entirely infallible.** `add`/
+      `sub`/`mul` are `wrapping_*` (BitVec arithmetic wraps by definition —
+      `Init/Data/UInt/Basic.lean:33`: `UInt8.add a b = ⟨a.toBitVec +
+      b.toBitVec⟩`); `div`/`mod` are total (zero ⇒ 0, `Init/Data/BitVec/
+      Basic.lean:271`); `shl`/`shr` are `wrapping_shl`/`wrapping_shr`, which
+      **mask** the shift amount mod the width (`1u8 <<< 8` masks to `1u8 <<<
+      0 == 1`) rather than truncating to 0 the way `Nat`'s unbounded `shr`
+      does — a `checked_shr(..).unwrap_or(0)` rendering here would be wrong
+      (it would give `0`, not `1`), which is why sized shifts get their own
+      `wrapping_shift` helper instead of reusing `Nat`'s `total_shift`. `pow`
+      is rejected outright (`Error::UnsupportedKind`), not rendered:
+      `wrapping_pow`'s `u32` exponent has no absorbing case the way shifts
+      do, so narrowing a `u64` exponent to it would silently compute a
+      different number, and Lean whitelists no sized `pow` so nothing real is
+      lost.
+    A definition using only `UIntN` therefore keeps its plain (non-`Result`)
+    return type through the existing `Shape` fixpoint, exactly like a `Nat`
+    definition with no checked op in it.
+  - **Conversions between kinds** (`Expr::Convert(NumKind, NumKind, Box<Expr>)`,
+    grammar `(convert Nat Int a)`): the lossless/total set only —
+    `Nat↔Int`, `UIntN→Nat`, `Nat→UIntN` — with cross-width sized conversions
+    (`UInt8↔UInt32`) rejected as `Error::UnsupportedKind`, a deliberate
+    non-goal. `Int.toNat` **clamps** negatives to 0
+    (`(-5).toNat = 0`); a bare `as u64` cast would wrap `-5` to
+    `18446744073709551611`, so it renders `(v).max(0) as u64`, not a cast.
+    `Nat→Int` renders a plain `as i64` cast (widening; a `u64` above
+    `i64::MAX` cannot arise from Lean's bounded-`u64` `Nat` policy without
+    already having overflowed). `Nat→UIntN` truncates and `UIntN→Nat` widens,
+    both plain casts.
+    - **`Int.ofNat` is owned by `prod-codegen`'s `Expr::Ctor` arm, not by the
+      conversion table**, even though it converts `Nat → Int`. `Int` is
+      `inductive Int | ofNat : Nat → Int | negSucc : Nat → Int`, so
+      `Int.ofNat` is a *constructor*, and `Lower.lean`'s `lowerLetValue`
+      checks `isCtorName` before consulting any operator/conversion
+      whitelist — every occurrence (an explicit call, or a `Nat`-typed
+      literal elaborating into an `Int` position) is intercepted there and
+      lowered as `(ctor "Int.ofNat" ...)`, never as `(convert Nat Int ...)`.
+      Confirmed by export, not assumed. A row for `Int.ofNat` in
+      `Lower.lean`'s `conversionNames` would be dead code; there is deliberately
+      only one handler.
+    - **`Nat.toUInt8`/`toUInt16`/`toUInt32`/`toUInt64` are NOT the constant
+      names that reach lowering**, despite existing as that spelling
+      (`Init/Data/UInt/BasicAux.lean`). Each is `abbrev Nat.toUIntN :=
+      UIntN.ofNat`, and Lean's compiler unfolds the abbrev before the
+      `.const` reaches LCNF — confirmed empirically by export, not
+      constructed and assumed: a conformance def using `a.toUInt8` (and the
+      other three widths) lowers to `extern "UInt8.ofNat"` (etc.), never
+      `extern "Nat.toUIntN"`. `conversionNames`'s `Nat → UIntN` row is
+      therefore `ty ++ \`ofNat`, not the source-level spelling. The `UIntN →
+      Nat` direction (`UInt8.toNat` etc.) IS a genuine `def`, so that half's
+      constructed spelling is exact.
+  - The published contract's S1-era `Int` qualifier ("renders as i64; no Int
+    operators are whitelisted") is gone: `specs/lean-for-production.md` now
+    has a `## Conversions` section alongside `## Operators`, generated from
+    `Prod.conversionNames` the same way `## Operators` is generated from
+    `Prod.numOpNames` — one source of truth, so the contract cannot list a
+    conversion the lowerer does not actually accept, or omit one it does.
+
+Known remaining limitations: Closures (`Code.fun`) still
 lower to opaque. User-defined inductives now generate real Rust structs/enums,
 and `ctor`/`proj` on them resolve against the module's own `(type ...)`
 declarations — a CONSTRUCTION whose constructor has no declaration in the
@@ -217,7 +304,9 @@ PATTERNS: an alt naming an undeclared constructor still renders
 `Foo.Bar.left(v) => v`, which rustc rejects as "expected a pattern, found an
 expression". Same defect class, same fix shape; not done. Monomorphization is still absent, so a
 parameterised inductive is rejected (`PolymorphicType`) rather than lowered.
-No data-parallel codegen.
+No data-parallel codegen. Invariant-carrying types (a structure's erased
+`Prop` fields re-checked at the crate boundary) and `Fin` with a literal bound
+are S2 Phase B, not yet implemented — see "Phase B" in the S2 design doc.
 
 ## M3 spec — the LCNF extractor (the defensible core)
 

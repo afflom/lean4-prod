@@ -1032,6 +1032,31 @@ impl<'m> Renderer<'_, 'm> {
                     )))
                 }
             }
+            Expr::Convert(from, to, e) => {
+                use NumKind::*;
+                let v = self.value(e)?;
+                match (from, to) {
+                    // Nat → Int widens; u64 values above i64::MAX cannot arise
+                    // from Lean's Nat under the bounded-u64 policy without
+                    // having already overflowed, so this is a plain cast.
+                    (Nat, Int) => Ok(format!("(({}) as i64)", v)),
+                    // Lean's Int.toNat clamps negatives to 0. A bare cast
+                    // would wrap them to enormous values.
+                    (Int, Nat) => Ok(format!("(({}).max(0) as u64)", v)),
+                    // Lean's Nat.toUIntN truncates, matching BitVec.
+                    (Nat, U8) | (Nat, U16) | (Nat, U32) | (Nat, U64) => {
+                        Ok(format!("(({}) as {})", v, to.rust_type()))
+                    }
+                    // UIntN → Nat widens.
+                    (U8, Nat) | (U16, Nat) | (U32, Nat) | (U64, Nat) => {
+                        Ok(format!("(({}) as u64)", v))
+                    }
+                    _ => Err(Error::UnsupportedKind(format!(
+                        "no conversion from {:?} to {:?}; cross-width sized conversions are a deliberate non-goal",
+                        from, to
+                    ))),
+                }
+            }
             Expr::Eq(a, b) => self.binop(a, b, "=="),
             Expr::Lt(a, b) => self.binop(a, b, "<"),
             Expr::Le(a, b) => self.binop(a, b, "<="),

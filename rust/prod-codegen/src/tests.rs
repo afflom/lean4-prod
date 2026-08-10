@@ -1011,3 +1011,42 @@ fn test_sized_pow_is_rejected_not_unsoundly_rendered() {
     let ir = r#"(module M (def f ((a U8) (b U8)) U8 (pow U8 a b)))"#;
     assert!(matches!(generate_err(ir), Error::UnsupportedKind(_)));
 }
+
+#[test]
+fn test_nat_to_int_widens() {
+    let ir = r#"(module M (def f ((a Nat)) Int (convert Nat Int a)))"#;
+    assert!(generate(ir).contains("((a) as i64)"));
+}
+
+#[test]
+fn test_int_to_nat_clamps_negatives_to_zero() {
+    // Lean's Int.toNat clamps: (-5).toNat = 0. `as u64` would wrap to a huge
+    // number, which is the whole reason this needs a rendering rather than a
+    // cast.
+    let ir = r#"(module M (def f ((a Int)) Nat (convert Int Nat a)))"#;
+    let out = generate(ir);
+    assert!(out.contains("max(0)"), "got: {}", out);
+    assert!(
+        !out.contains("(a) as u64)."),
+        "a bare cast would wrap negatives"
+    );
+}
+
+#[test]
+fn test_nat_to_sized_wraps() {
+    let ir = r#"(module M (def f ((a Nat)) U8 (convert Nat U8 a)))"#;
+    assert!(generate(ir).contains("as u8"));
+}
+
+#[test]
+fn test_sized_to_nat_widens() {
+    let ir = r#"(module M (def f ((a U8)) Nat (convert U8 Nat a)))"#;
+    assert!(generate(ir).contains("as u64"));
+}
+
+#[test]
+fn test_unsupported_conversion_is_rejected() {
+    // Cross-width sized conversions are a deliberate non-goal.
+    let ir = r#"(module M (def f ((a U8)) U32 (convert U8 U32 a)))"#;
+    assert!(matches!(generate_err(ir), Error::UnsupportedKind(_)));
+}

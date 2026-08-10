@@ -244,6 +244,44 @@ def numOpNames : List (Name × String × String) := natOpRows ++ intOpRows ++ si
 def opWhitelist (n : Name) : Option (String × String) :=
   (numOpNames.find? (fun p => p.1 == n)).map (fun p => (p.2.1, p.2.2))
 
+/-- (Lean constant, from-kind, to-kind). Unary; emitted as `(convert F T x)`.
+    A conversion carries two kinds, not one, so this is a separate table from
+    `numOpNames` rather than another row shape squeezed into it.
+
+    `Int.ofNat` is deliberately **absent** here even though it converts
+    `Nat → Int`: `Int` is `inductive Int | ofNat : Nat → Int | negSucc : Nat →
+    Int`, so `Int.ofNat` is a constructor, and `lowerLetValue` below checks
+    `isCtorName` *before* consulting this table. Every occurrence — an
+    explicit call, or a `Nat`-typed literal elaborating into an `Int`
+    position — is intercepted there and lowered as `(ctor "Int.ofNat" ...)`,
+    never reaching this table; a row for it here would be dead. Confirmed by
+    export: `Int.ofNat a` lowers to `(ctor "Int.ofNat" a)` even when this
+    table is consulted first for every other `.const`. `prod-codegen`'s
+    `Expr::Ctor` arm already renders that ctor as `((n) as i64)` — identical
+    to what `Expr::Convert`'s `(Nat, Int)` arm renders — so the two would be
+    indistinguishable in output even if both existed; only one does.
+
+    `Int.toNat` and the `UIntN.toNat` half below are genuine `def`s, so the
+    constructed spelling (`ty ++ \`toNat`) is exactly the constant that
+    reaches lowering. The `Nat → UIntN` half is NOT `Nat.toUIntN`, despite
+    that spelling existing (`Nat.toUInt8`, `Init/Data/UInt/BasicAux.lean`):
+    every one of `Nat.toUInt8`/16/32/64 is declared as
+    `abbrev Nat.toUIntN := UIntN.ofNat`, and Lean's compiler unfolds the
+    abbrev before the constant reaches LCNF — confirmed by export: a
+    conformance def using `a.toUInt8`/`a.toUInt16`/`a.toUInt32`/`a.toUInt64`
+    lowers to `extern "UInt8.ofNat"`/`"UInt16.ofNat"`/`"UInt32.ofNat"`/
+    `"UInt64.ofNat"`, never `extern "Nat.toUIntN"`. So the row is `ty ++
+    \`ofNat`, not the constructed `Nat.toUIntN` name the source-level spelling
+    would suggest. -/
+def conversionNames : List (Name × String × String) :=
+  [ (`Int.toNat, "Int", "Nat") ]
+  ++ sizedKinds.flatMap fun (ty, kind) =>
+       [ (ty ++ `toNat, kind, "Nat"), (ty ++ `ofNat, "Nat", kind) ]
+
+/-- `.const` conversion whitelist: Lean constant → (from-kind, to-kind). -/
+def conversionWhitelist (n : Name) : Option (String × String) :=
+  (conversionNames.find? (fun p => p.1 == n)).map (fun p => (p.2.1, p.2.2))
+
 private def isCtorName (env : Environment) (n : Name) : Bool :=
   match env.find? n with
   | some (.ctorInfo _) => true
@@ -302,6 +340,14 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
       -- partial/unusual application of a whitelisted op: not a 2-arg operator
       -- use, and not necessarily `@[prod]`-tagged either, so it is the same
       -- kind of unresolved callee as the `none` case below.
+      modify fun st => { st with externs := st.externs.push s!"{declName} (unusual application)" }
+      return s!"(extern \"{declName}\"{spaced args'})"
+    | none =>
+    match conversionWhitelist declName with
+    | some (from_, to) =>
+      -- Conversions are unary, unlike the (mostly) binary `numOpNames`.
+      if args'.size == 1 then
+        return s!"(convert {from_} {to} {args'[0]!})"
       modify fun st => { st with externs := st.externs.push s!"{declName} (unusual application)" }
       return s!"(extern \"{declName}\"{spaced args'})"
     | none =>

@@ -1,7 +1,17 @@
 # Design: S2 — scalar completeness and invariant-carrying types
 
 **Date:** 2026-08-09
-**Status:** Approved design. Implementation plan to follow.
+**Status:** Phase A (the arithmetic layer, migration steps 1–5) is DONE —
+implemented by `specs/plans/2026-08-09-s2-phase-a-arithmetic.md`'s five
+tasks (Bool-connective probe, kind tags, `Int` arithmetic, sized integers,
+conversions). The published contract's `Int` qualifier from S1 ("no Int
+operators are whitelisted") is gone, all three arithmetic policies in the
+table below match the shipped rendering, and `specs/lean-for-production.md`
+now lists the kinds, operators, conversions, and deciders it actually
+accepts. Phase B (invariant-carrying types and `Fin`, migration steps 6–8) is
+now unblocked and should be planned as a separate plan against the
+arithmetic layer as it actually shipped — see the note at the top of "Phase
+B" below.
 **Scope:** Milestone S2 of the coverage roadmap in
 `specs/designs/2026-08-08-lean-for-production-coverage.md`, extended to include
 `Fin` and the first piece of the invariant subsystem.
@@ -175,6 +185,16 @@ Evidence: `c_bool_and`/`c_bool_or`/`c_bool_not` in
 lean/Conformance/golden.ir. No IR change is needed.
 
 ## Phase B — invariant-carrying types
+
+**Unblocked.** Phase A shipped exactly the arithmetic layer this phase is
+built on: comparisons per kind (`Eq`/`Lt`/`Le`/`Gt`, kind-less by design),
+the deciders per kind that make `∧`/`∨`/`¬`-shaped predicates lowerable, and
+`NumKind` itself for describing a bound like `Fin`'s `val < n`. Plan Phase B
+against what actually shipped, not this design's prediction of it — in
+particular, `conversionNames`/`Expr::Convert` (Phase A's conversions) are a
+plain lookup-table + kind-pair match, the same shape `deciderNames` and
+`numOpNames` already used, which Phase B's invariant predicates can likely
+follow rather than invent a new mechanism for.
 
 ### The rule
 

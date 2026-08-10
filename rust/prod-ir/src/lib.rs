@@ -115,6 +115,12 @@ pub enum Expr {
     Pow(NumKind, Box<Expr>, Box<Expr>),
     /// Unary negation. `Int` only; every other kind is `Error::UnsupportedKind`.
     Neg(NumKind, Box<Expr>),
+    /// Conversion between numeric kinds: from-kind, to-kind, value. Grammar
+    /// `(convert Nat Int a)`. The lossless/total set only — `Nat<->Int`,
+    /// `UIntN->Nat`, `Nat->UIntN` — with cross-width sized conversions
+    /// (`UInt8<->UInt32`) rejected as `Error::UnsupportedKind` rather than
+    /// rendered, a deliberate non-goal.
+    Convert(NumKind, NumKind, Box<Expr>),
     Eq(Box<Expr>, Box<Expr>),
     Lt(Box<Expr>, Box<Expr>),
     Le(Box<Expr>, Box<Expr>),
@@ -179,6 +185,7 @@ impl Expr {
         match self {
             Expr::Proj(_, _, e) => out.push(e),
             Expr::Neg(_, e) => out.push(e),
+            Expr::Convert(_, _, e) => out.push(e),
             Expr::Add(_, a, b)
             | Expr::Sub(_, a, b)
             | Expr::Mul(_, a, b)
@@ -283,6 +290,7 @@ mod tests {
         "Add",
         "Bool",
         "Call",
+        "Convert",
         "Ctor",
         "Div",
         "Eq",
@@ -327,6 +335,7 @@ mod tests {
             Expr::Shr(..) => "Shr",
             Expr::Pow(..) => "Pow",
             Expr::Neg(..) => "Neg",
+            Expr::Convert(..) => "Convert",
             Expr::Eq(..) => "Eq",
             Expr::Lt(..) => "Lt",
             Expr::Le(..) => "Le",
@@ -375,6 +384,11 @@ mod tests {
             ),
             // Unary.
             (Expr::Neg(NumKind::Int, bx("a")), vec!["a"]),
+            // Unary.
+            (
+                Expr::Convert(NumKind::Nat, NumKind::Int, bx("a")),
+                vec!["a"],
+            ),
             // Binary.
             (Expr::Add(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
             (Expr::Sub(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),

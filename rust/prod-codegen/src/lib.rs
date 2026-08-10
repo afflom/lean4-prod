@@ -108,7 +108,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
-use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, Type, TypeDecl};
+use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, NumKind, Type, TypeDecl};
 
 /// Errors that can occur during code generation
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +142,9 @@ pub enum Error {
     /// the single-caller form has a lowering (it inlines at its jump site);
     /// the rest would need real control flow.
     UnsupportedJoinPoint(String),
+    /// An operation that has no rendering for the numeric kind it was applied
+    /// to — for example a shift on `Int`, or negation on an unsigned kind.
+    UnsupportedKind(String),
 }
 
 impl fmt::Display for Error {
@@ -186,6 +189,11 @@ impl fmt::Display for Error {
                 f,
                 "join point `{}` has several callers or jumps to itself; only the single-caller form has a lowering",
                 name
+            ),
+            Error::UnsupportedKind(s) => write!(
+                f,
+                "operation has no rendering for its numeric kind: {}",
+                s
             ),
         }
     }
@@ -244,6 +252,10 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     (
         "UnsupportedJoinPoint",
         "a join point with several callers, or one that jumps to itself; only the single-caller form, which inlines at its jump site, has a lowering",
+    ),
+    (
+        "UnsupportedKind",
+        "an operation with no rendering for the numeric kind it was applied to, such as a shift on Int or negation on an unsigned kind",
     ),
 ];
 
@@ -478,16 +490,30 @@ fn signatures<'m>(defs: &'m [Definition]) -> Signatures<'m> {
     }
 }
 
+/// Does this operation report failure? Kind-dependent: `Nat` and `Int` are
+/// checked, sized integers wrap and are total, and `Nat` subtraction
+/// saturates rather than failing.
+fn op_is_fallible(expr: &Expr) -> bool {
+    use prod_ir::NumKind::{Int, Nat};
+    match expr {
+        Expr::Add(k, ..) | Expr::Mul(k, ..) | Expr::Pow(k, ..) => matches!(k, Nat | Int),
+        Expr::Sub(k, ..) | Expr::Div(k, ..) | Expr::Mod(k, ..) => *k == Int,
+        Expr::Neg(k, _) => *k == Int,
+        Expr::Shl(k, ..) => *k == Nat,
+        _ => false,
+    }
+}
+
 /// Does this expression perform, or reach, an operation that can fail?
 fn is_fallible(expr: &Expr, shapes: &Signatures) -> bool {
-    let here = match expr {
-        Expr::Add(..) | Expr::Mul(..) | Expr::Shl(..) | Expr::Pow(..) => true,
-        Expr::Call(name, _) => matches!(
-            shapes.get(name.as_str()),
-            Some(Shape::Fallible) | Some(Shape::Buffer)
-        ),
-        _ => false,
-    };
+    let here = op_is_fallible(expr)
+        || matches!(
+            expr,
+            Expr::Call(name, _) if matches!(
+                shapes.get(name.as_str()),
+                Some(Shape::Fallible) | Some(Shape::Buffer)
+            )
+        );
     here || expr.children().any(|child| is_fallible(child, shapes))
 }
 
@@ -893,20 +919,22 @@ impl<'m> Renderer<'_, 'm> {
                 .get(*index)
                 .map(|(name, _)| name.clone())
                 .ok_or(Error::ParamOutOfBounds(*index)),
-            Expr::Add(a, b) => self.checked_binop(a, b, "checked_add", "AddOverflow"),
-            Expr::Mul(a, b) => self.checked_binop(a, b, "checked_mul", "MulOverflow"),
-            Expr::Sub(a, b) => {
+            Expr::Add(k, a, b) => self.checked_binop(*k, a, b, "checked_add", "AddOverflow"),
+            Expr::Mul(k, a, b) => self.checked_binop(*k, a, b, "checked_mul", "MulOverflow"),
+            Expr::Sub(k, a, b) => {
                 // Lean Nat subtraction truncates at zero, so it is total.
-                // See `checked_binop` for the `as u64` receiver pin.
+                // See `checked_binop` for the `as` receiver-pin rationale.
                 Ok(format!(
-                    "(({}) as u64).saturating_sub({})",
+                    "(({}) as {}).saturating_sub({})",
                     self.value(a)?,
+                    k.rust_type(),
                     self.value(b)?
                 ))
             }
-            Expr::Div(a, b) => self.total_binop(a, b, "/"),
-            Expr::Mod(a, b) => self.total_binop(a, b, "%"),
-            Expr::Shl(a, b) => self.checked_exponent_op(
+            Expr::Div(k, a, b) => self.total_binop(*k, a, b, "/"),
+            Expr::Mod(k, a, b) => self.total_binop(*k, a, b, "%"),
+            Expr::Shl(k, a, b) => self.checked_exponent_op(
+                *k,
                 a,
                 b,
                 "checked_shl",
@@ -920,14 +948,24 @@ impl<'m> Renderer<'_, 'm> {
             // `u32::MAX`), so `unwrap_or(0)` is the exact answer, not a
             // fallback for a real error — there is no `ComputeError` variant
             // for this because none is needed.
-            Expr::Shr(a, b) => Ok(format!(
-                "(({}) as u64).checked_shr(u32::try_from({}).unwrap_or(u32::MAX)).unwrap_or(0)",
+            Expr::Shr(k, a, b) => Ok(format!(
+                "(({}) as {}).checked_shr(u32::try_from({}).unwrap_or(u32::MAX)).unwrap_or(0)",
                 self.value(a)?,
+                k.rust_type(),
                 self.value(b)?
             )),
-            Expr::Pow(a, b) => {
-                self.checked_exponent_op(a, b, "checked_pow", "PowExponentTooLarge", "PowOverflow")
-            }
+            Expr::Pow(k, a, b) => self.checked_exponent_op(
+                *k,
+                a,
+                b,
+                "checked_pow",
+                "PowExponentTooLarge",
+                "PowOverflow",
+            ),
+            Expr::Neg(k, _) => Err(Error::UnsupportedKind(alloc::format!(
+                "unary negation is not supported for {:?}",
+                k
+            ))),
             Expr::Eq(a, b) => self.binop(a, b, "=="),
             Expr::Lt(a, b) => self.binop(a, b, "<"),
             Expr::Le(a, b) => self.binop(a, b, "<="),
@@ -1220,19 +1258,22 @@ impl<'m> Renderer<'_, 'm> {
 
     /// `checked_add`/`checked_mul`: report overflow instead of panicking.
     ///
-    /// `as u64` pins the receiver: method calls on an inferred `{integer}`
-    /// (a let-bound literal, e.g. LCNF's `let _x := 1`) fail method resolution
-    /// (E0689) — a no-op when the receiver is already `u64`.
+    /// The `as` cast pins the receiver's type: method calls on an inferred
+    /// `{integer}` (a let-bound literal, e.g. LCNF's `let _x := 1`) fail
+    /// method resolution (E0689). It is a no-op when the receiver already has
+    /// the kind's type.
     fn checked_binop(
         &self,
+        kind: NumKind,
         a: &'m Expr,
         b: &'m Expr,
         method: &str,
         error: &str,
     ) -> Result<String, Error> {
         Ok(format!(
-            "(({}) as u64).{}({}).ok_or(crate::ComputeError::{})?",
+            "(({}) as {}).{}({}).ok_or(crate::ComputeError::{})?",
             self.value(a)?,
+            kind.rust_type(),
             method,
             self.value(b)?,
             error
@@ -1243,6 +1284,7 @@ impl<'m> Renderer<'_, 'm> {
     /// which is a second, distinct failure mode.
     fn checked_exponent_op(
         &self,
+        kind: NumKind,
         a: &'m Expr,
         b: &'m Expr,
         method: &str,
@@ -1250,8 +1292,9 @@ impl<'m> Renderer<'_, 'm> {
         overflow_error: &str,
     ) -> Result<String, Error> {
         Ok(format!(
-            "(({}) as u64).{}(u32::try_from({}).map_err(|_| crate::ComputeError::{})?).ok_or(crate::ComputeError::{})?",
+            "(({}) as {}).{}(u32::try_from({}).map_err(|_| crate::ComputeError::{})?).ok_or(crate::ComputeError::{})?",
             self.value(a)?,
+            kind.rust_type(),
             method,
             self.value(b)?,
             exponent_error,
@@ -1260,7 +1303,17 @@ impl<'m> Renderer<'_, 'm> {
     }
 
     /// Lean Nat division and modulo are total: `x / 0 = x % 0 = 0`.
-    fn total_binop(&self, a: &'m Expr, b: &'m Expr, op: &str) -> Result<String, Error> {
+    ///
+    /// Takes `kind` for symmetry with the other arithmetic helpers, though it
+    /// renders operators rather than method calls and so needs no cast. Task
+    /// 3's Euclidean-division branch for `Int` reads it.
+    fn total_binop(
+        &self,
+        _kind: NumKind,
+        a: &'m Expr,
+        b: &'m Expr,
+        op: &str,
+    ) -> Result<String, Error> {
         let (a, b) = (self.value(a)?, self.value(b)?);
         Ok(format!(
             "if ({}) == 0 {{ 0 }} else {{ ({}) {} ({}) }}",

@@ -53,7 +53,7 @@ def conformanceRejectedIrModule : String := "ConformanceRejected"
 Machine-readable description of the Lean-side lowering surface, consumed by
 `prod subset` to render `specs/lean-for-production.md`. Hand-rolled JSON, no
 dependencies, matching how `rootsJson` is built. The operator and decider
-lists are derived from `natOpNames`/`deciderNames` (`Prod.Lower`) — the same
+lists are derived from `numOpNames`/`deciderNames` (`Prod.Lower`) — the same
 association lists `opWhitelist`/`deciderOp` consume to decide what actually
 lowers — so the published contract cannot describe more, or less, than the
 lowerer accepts. -/
@@ -63,7 +63,7 @@ lowerer accepts. -/
     subset` (`prod-cli`), which merges it with codegen's rejection list to
     render the published contract. -/
 def subsetJson : String :=
-  let ops := natOpNames.map fun p => toString p.1
+  let ops := numOpNames.map fun r => toString r.1
   let deciders := deciderNames.map fun p => toString p.1
   -- `Nat`/`Bool`/`Int`/`Prod`/`List`/`Option` are built into the IR type
   -- grammar (`lowerType`); anything else is a user inductive, and

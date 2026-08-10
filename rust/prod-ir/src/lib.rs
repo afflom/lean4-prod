@@ -54,6 +54,43 @@ pub struct Alt {
     pub body: Expr,
 }
 
+/// The numeric type an arithmetic node operates on.
+///
+/// Carried explicitly rather than inferred. The Lean side sees `Nat.add` vs
+/// `Int.add` vs `UInt8.add` and knows exactly; codegen would have to guess,
+/// and guessing is how this project previously shipped a type declaration and
+/// a projection that disagreed about a field name. The three kinds have
+/// genuinely different arithmetic contracts — `Nat` and `Int` are checked,
+/// sized integers wrap — so a wrong guess is a wrong answer, not a style slip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NumKind {
+    /// Lean `Nat`, unbounded. Bounded to `u64` by policy.
+    Nat,
+    /// Lean `Int`, unbounded. Bounded to `i64` by policy.
+    Int,
+    U8,
+    U16,
+    U32,
+    U64,
+}
+
+impl NumKind {
+    /// The Rust type this kind renders as. Also the cast used to pin an
+    /// arithmetic receiver's type — LCNF emits let-bound integer literals
+    /// whose type is ambiguous, and a method call on `{integer}` fails
+    /// resolution (E0689).
+    pub const fn rust_type(self) -> &'static str {
+        match self {
+            NumKind::Nat => "u64",
+            NumKind::Int => "i64",
+            NumKind::U8 => "u8",
+            NumKind::U16 => "u16",
+            NumKind::U32 => "u32",
+            NumKind::U64 => "u64",
+        }
+    }
+}
+
 /// Expression AST — a simplified lambda calculus with constants,
 /// extended with LCNF-flavored nodes (cases/ctor/proj/jp/jmp/unreachable)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,16 +100,18 @@ pub enum Expr {
     Bool(bool),
     Var(String),
     Param(usize), // De Bruijn-style parameter index
-    Add(Box<Expr>, Box<Expr>),
-    Sub(Box<Expr>, Box<Expr>),
-    Mul(Box<Expr>, Box<Expr>),
-    Div(Box<Expr>, Box<Expr>),
-    Mod(Box<Expr>, Box<Expr>),
-    Shl(Box<Expr>, Box<Expr>),
+    Add(NumKind, Box<Expr>, Box<Expr>),
+    Sub(NumKind, Box<Expr>, Box<Expr>),
+    Mul(NumKind, Box<Expr>, Box<Expr>),
+    Div(NumKind, Box<Expr>, Box<Expr>),
+    Mod(NumKind, Box<Expr>, Box<Expr>),
+    Shl(NumKind, Box<Expr>, Box<Expr>),
     /// `Nat.shiftRight`: total and infallible (`a >>> b = 0` for `b >= 64`
     /// when `a` fits `u64`), unlike `Shl`/`Pow` which can overflow.
-    Shr(Box<Expr>, Box<Expr>),
-    Pow(Box<Expr>, Box<Expr>),
+    Shr(NumKind, Box<Expr>, Box<Expr>),
+    Pow(NumKind, Box<Expr>, Box<Expr>),
+    /// Unary negation. `Int` only; every other kind is `Error::UnsupportedKind`.
+    Neg(NumKind, Box<Expr>),
     Eq(Box<Expr>, Box<Expr>),
     Lt(Box<Expr>, Box<Expr>),
     Le(Box<Expr>, Box<Expr>),
@@ -136,14 +175,15 @@ impl Expr {
         let mut out: Vec<&Expr> = Vec::new();
         match self {
             Expr::Proj(_, _, e) => out.push(e),
-            Expr::Add(a, b)
-            | Expr::Sub(a, b)
-            | Expr::Mul(a, b)
-            | Expr::Div(a, b)
-            | Expr::Mod(a, b)
-            | Expr::Shl(a, b)
-            | Expr::Shr(a, b)
-            | Expr::Pow(a, b)
+            Expr::Neg(_, e) => out.push(e),
+            Expr::Add(_, a, b)
+            | Expr::Sub(_, a, b)
+            | Expr::Mul(_, a, b)
+            | Expr::Div(_, a, b)
+            | Expr::Mod(_, a, b)
+            | Expr::Shl(_, a, b)
+            | Expr::Shr(_, a, b)
+            | Expr::Pow(_, a, b)
             | Expr::Eq(a, b)
             | Expr::Lt(a, b)
             | Expr::Le(a, b)
@@ -256,6 +296,7 @@ mod tests {
         "Mod",
         "Mul",
         "Nat",
+        "Neg",
         "Opaque",
         "Param",
         "Pow",
@@ -282,6 +323,7 @@ mod tests {
             Expr::Shl(..) => "Shl",
             Expr::Shr(..) => "Shr",
             Expr::Pow(..) => "Pow",
+            Expr::Neg(..) => "Neg",
             Expr::Eq(..) => "Eq",
             Expr::Lt(..) => "Lt",
             Expr::Le(..) => "Le",
@@ -328,15 +370,17 @@ mod tests {
                 Expr::Proj(String::from("T"), String::from("f"), bx("a")),
                 vec!["a"],
             ),
+            // Unary.
+            (Expr::Neg(NumKind::Int, bx("a")), vec!["a"]),
             // Binary.
-            (Expr::Add(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Sub(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Mul(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Div(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Mod(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Shl(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Shr(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Pow(bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Add(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Sub(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Mul(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Div(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Mod(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Shl(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Shr(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Pow(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
             (Expr::Eq(bx("a"), bx("b")), vec!["a", "b"]),
             (Expr::Lt(bx("a"), bx("b")), vec!["a", "b"]),
             (Expr::Le(bx("a"), bx("b")), vec!["a", "b"]),

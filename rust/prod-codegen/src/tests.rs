@@ -19,12 +19,12 @@ fn test_generate_class_index() {
     (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
 
   (def classIndex ((h2 Nat) (d Nat) (l Nat) (inst (named "UorAtlas.Instance"))) Nat
-    (add (mul (call stride inst) h2)
-         (add (mul (proj "UorAtlas.Instance" "O" inst) d) l)))
+    (add Nat (mul Nat (call stride inst) h2)
+         (add Nat (mul Nat (proj "UorAtlas.Instance" "O" inst) d) l)))
 
   (def belt ((inst (named "UorAtlas.Instance"))) Nat
-    (mul (call class_count inst)
-         (shl 1 (sub (proj "UorAtlas.Instance" "O" inst) 1))))
+    (mul Nat (call class_count inst)
+         (shl Nat 1 (sub Nat (proj "UorAtlas.Instance" "O" inst) 1))))
 )
 "#;
     let out = generate(ir);
@@ -60,11 +60,11 @@ fn test_generate_list_param_is_a_slice_and_return_is_a_buffer() {
   (def digitSum ((xs (List Nat))) Nat
     (cases xs
       (alt "List.nil" () 0)
-      (alt "List.cons" (h t) (add h (call digitSum t)))))
+      (alt "List.cons" (h t) (add Nat h (call digitSum t)))))
   (def digits ((n Nat)) (List Nat)
     (if (lt n 8)
         (ctor "List.cons" n (ctor "List.nil"))
-        (ctor "List.cons" (mod n 8) (call digits (div n 8)))))
+        (ctor "List.cons" (mod Nat n 8) (call digits (div Nat n 8)))))
 )
 "#;
     let out = generate(ir);
@@ -92,8 +92,8 @@ fn test_generate_list_builder_resolves_anf_let_bindings() {
         (let _x_47 (proj "UorAtlas.Instance" "O" i)
           (if (lt n _x_47)
             (let _x_55 (ctor "List.nil") (let _x_56 (ctor "List.cons" n _x_55) _x_56))
-            (let _x_50 (mod n _x_47)
-              (let _x_51 (div n _x_47)
+            (let _x_50 (mod Nat n _x_47)
+              (let _x_51 (div Nat n _x_47)
                 (let _x_52 (call digits n_25 _x_51 i)
                   (let _x_53 (ctor "List.cons" _x_50 _x_52) _x_53)))))))))
 )
@@ -126,14 +126,14 @@ fn test_fallibility_is_precise_not_uniform() {
     // property propagates through the call graph — including recursion.
     let ir = r#"
 (module M
-  (def pure ((x Nat) (y Nat)) Nat (sub x y))
-  (def viaDiv ((x Nat)) Nat (call pure (div x 2) 1))
-  (def risky ((x Nat)) Nat (add x 1))
+  (def pure ((x Nat) (y Nat)) Nat (sub Nat x y))
+  (def viaDiv ((x Nat)) Nat (call pure (div Nat x 2) 1))
+  (def risky ((x Nat)) Nat (add Nat x 1))
   (def caller ((x Nat)) Nat (call risky x))
   (def loops ((fuel Nat) (x Nat)) Nat
     (cases fuel
       (alt "Nat.zero" () x)
-      (alt "Nat.succ" (k) (call loops k (add x 1)))))
+      (alt "Nat.succ" (k) (call loops k (add Nat x 1)))))
 )
 "#;
     let out = generate(ir);
@@ -195,7 +195,7 @@ fn test_computed_zero_arg_list_is_a_codegen_error() {
     // A golden whose elements are computed cannot be a promoted static slice.
     let ir = r#"
 (module M
-  (def g () (List Nat) (ctor "List.cons" (add 1 2) (ctor "List.nil")))
+  (def g () (List Nat) (ctor "List.cons" (add Nat 1 2) (ctor "List.nil")))
 )
 "#;
     assert!(matches!(generate_err(ir), Error::UnsupportedList(_)));
@@ -230,7 +230,7 @@ fn test_generate_nat_cases_recursion() {
   (def digitCount ((fuel Nat) (n Nat)) Nat
     (cases fuel
       (alt "Nat.zero" () 0)
-      (alt "Nat.succ" (k) (if (lt n 8) 1 (add 1 (call digitCount k (div n 8)))))))
+      (alt "Nat.succ" (k) (if (lt n 8) 1 (add Nat 1 (call digitCount k (div Nat n 8)))))))
 )
 "#;
     let out = generate(ir);
@@ -291,10 +291,10 @@ fn test_generate_kernel_ir_shapes() {
     (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
 
   (def stride ((i (named "UorAtlas.Instance"))) Nat
-    (let _x_4 (proj "UorAtlas.Instance" "T" i) (let _x_5 (proj "UorAtlas.Instance" "O" i) (let _x_13 (mul _x_4 _x_5) _x_13))))
+    (let _x_4 (proj "UorAtlas.Instance" "T" i) (let _x_5 (proj "UorAtlas.Instance" "O" i) (let _x_13 (mul Nat _x_4 _x_5) _x_13))))
 
   (def classDecode ((idx Nat) (i (named "UorAtlas.Instance"))) (Tuple Nat (Tuple Nat Nat))
-    (let _x_4 (call stride i) (let h2 (div idx _x_4) (let rem (mod idx _x_4) (let _x_10 (proj "UorAtlas.Instance" "O" i) (let d (div rem _x_10) (let l (mod rem _x_10) (let _x_13 (ctor "Prod.mk" d l) (let _x_14 (ctor "Prod.mk" h2 _x_13) _x_14)))))))))
+    (let _x_4 (call stride i) (let h2 (div Nat idx _x_4) (let rem (mod Nat idx _x_4) (let _x_10 (proj "UorAtlas.Instance" "O" i) (let d (div Nat rem _x_10) (let l (mod Nat rem _x_10) (let _x_13 (ctor "Prod.mk" d l) (let _x_14 (ctor "Prod.mk" h2 _x_13) _x_14)))))))))
 )
 "#;
     let out = generate(ir);
@@ -398,6 +398,7 @@ fn test_every_error_variant_is_published_in_rejections() {
         Error::UnresolvedCall(s()),
         Error::UnknownField(s(), s()),
         Error::UnsupportedJoinPoint(s()),
+        Error::UnsupportedKind(s()),
     ];
 
     for error in &all {
@@ -414,6 +415,7 @@ fn test_every_error_variant_is_published_in_rejections() {
             Error::UnresolvedCall(_) => "UnresolvedCall",
             Error::UnknownField(..) => "UnknownField",
             Error::UnsupportedJoinPoint(_) => "UnsupportedJoinPoint",
+            Error::UnsupportedKind(_) => "UnsupportedKind",
         };
         assert!(
             REJECTIONS.iter().any(|(variant, _)| *variant == name),
@@ -482,7 +484,7 @@ fn test_generate_jp_jmp_inlined() {
     let ir = r#"
 (module M
   (def f ((x Nat)) Nat
-    (let g (jp g (a) (add a 1)) (jmp g x)))
+    (let g (jp g (a) (add Nat a 1)) (jmp g x)))
 )
 "#;
     let out = generate(ir);
@@ -501,7 +503,7 @@ fn test_cyclic_join_point_is_rejected() {
     let ir = r#"
 (module M
   (def f ((x Nat)) Nat
-    (jp loop (i) (if (lt i 10) (jmp loop (add i 1)) i)))
+    (jp loop (i) (if (lt i 10) (jmp loop (add Nat i 1)) i)))
 )
 "#;
     assert_eq!(
@@ -518,7 +520,7 @@ fn test_multi_caller_join_point_is_rejected() {
     let ir = r#"
 (module M
   (def f ((c Nat) (x Nat)) Nat
-    (let g (jp g (a) (add a 1))
+    (let g (jp g (a) (add Nat a 1))
       (if (lt c 1) (jmp g x) (jmp g c))))
 )
 "#;
@@ -546,7 +548,7 @@ fn test_generate_pow() {
     let ir = r#"
 (module M
   (def belt ((i Nat)) Nat
-    (pow 2 (sub i 1)))
+    (pow Nat 2 (sub Nat i 1)))
 )
 "#;
     let out = generate(ir);
@@ -564,7 +566,7 @@ fn test_generate_shr() {
     let ir = r#"
 (module M
   (def half ((n Nat) (k Nat)) Nat
-    (shr n k))
+    (shr Nat n k))
 )
 "#;
     let out = generate(ir);
@@ -597,12 +599,12 @@ fn test_generate_decide_unwrapped_comparison_is_a_plain_bool() {
 fn test_generate_nat_arithmetic_policy_never_panics() {
     let ir = r#"
 (module M
-  (def add ((x Nat) (y Nat)) Nat (add x y))
-  (def sub ((x Nat) (y Nat)) Nat (sub x y))
-  (def div ((x Nat) (y Nat)) Nat (div x y))
-  (def modu ((x Nat) (y Nat)) Nat (mod x y))
-  (def shl ((x Nat) (y Nat)) Nat (shl x y))
-  (def pow ((x Nat) (y Nat)) Nat (pow x y))
+  (def add ((x Nat) (y Nat)) Nat (add Nat x y))
+  (def sub ((x Nat) (y Nat)) Nat (sub Nat x y))
+  (def div ((x Nat) (y Nat)) Nat (div Nat x y))
+  (def modu ((x Nat) (y Nat)) Nat (mod Nat x y))
+  (def shl ((x Nat) (y Nat)) Nat (shl Nat x y))
+  (def pow ((x Nat) (y Nat)) Nat (pow Nat x y))
 )
 "#;
     let out = generate(ir);
@@ -767,7 +769,7 @@ fn test_generate_enum_construction_and_patterns() {
   (def area ((s (named "M.Shape"))) Nat
     (cases s
       (alt "M.Shape.circle" (r) r)
-      (alt "M.Shape.rect" (w h) (mul w h))))
+      (alt "M.Shape.rect" (w h) (mul Nat w h))))
   (def unit ((r Nat)) (named "M.Shape") (ctor "M.Shape.circle" r)))
 "#;
     let out = generate(ir);
@@ -812,7 +814,7 @@ fn test_cases_alt_on_an_undeclared_ctor_still_falls_through() {
 (module M
   (def f ((x Nat)) Nat
     (cases x
-      (alt "Foo.Bar" (a b) (add a b))
+      (alt "Foo.Bar" (a b) (add Nat a b))
       (default 0))))
 "#;
     let out = generate(ir);

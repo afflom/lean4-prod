@@ -5,5 +5,5 @@
 
   ;; full: ConformanceRejected.r_ctor_body_only
   (def r_ctor_body_only ((fuel Nat) (a Nat) (b Nat)) Nat
-    (let _jp_19 (jp _jp_19 (_y_12) (let _x_16 (proj "ConformanceRejected.BodyOnly" "alpha" _y_12) (let _x_17 (proj "ConformanceRejected.BodyOnly" "beta" _y_12) (let _x_32 (add _x_16 _x_17) _x_32)))) (cases fuel (alt "Nat.zero" () (let _x_37 (ctor "ConformanceRejected.BodyOnly.mk" a b) (jmp _jp_19 _x_37))) (alt "Nat.succ" (n_10) (let _x_39 (ctor "ConformanceRejected.BodyOnly.mk" b a) (jmp _jp_19 _x_39))))))
+    (let _jp_19 (jp _jp_19 (_y_12) (let _x_16 (proj "ConformanceRejected.BodyOnly" "alpha" _y_12) (let _x_17 (proj "ConformanceRejected.BodyOnly" "beta" _y_12) (let _x_32 (add Nat _x_16 _x_17) _x_32)))) (cases fuel (alt "Nat.zero" () (let _x_37 (ctor "ConformanceRejected.BodyOnly.mk" a b) (jmp _jp_19 _x_37))) (alt "Nat.succ" (n_10) (let _x_39 (ctor "ConformanceRejected.BodyOnly.mk" b a) (jmp _jp_19 _x_39))))))
 )

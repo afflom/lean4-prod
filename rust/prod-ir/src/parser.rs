@@ -9,14 +9,17 @@
 //! field    ::= "(" ident type ")"
 //! def      ::= "(" "def" ident "(" param* ")" type expr ")"
 //! param    ::= "(" ident type ")"
+//! kind     ::= "Nat" | "Int" | "U8" | "U16" | "U32" | "U64"  ; numeric kind tag
 //! type     ::= "Nat" | "Int" | "Bool" | "(" "Option" type ")" | "(" "Vec" type ")"
 //!            | "(" "List" type ")" | "(" "Tuple" type* ")" | "(" "named" '"' ident '"' ")"
 //!            | "(" "opaque" '"' ident '"' ")"
 //! expr     ::= nat | ident | "(" "param" nat ")"
-//!            | "(" "add" expr expr ")" | "(" "sub" expr expr ")" | "(" "mul" expr expr ")"
-//!            | "(" "div" expr expr ")" | "(" "mod" expr expr ")" | "(" "shl" expr expr ")"
-//!            | "(" "shr" expr expr ")"
-//!            | "(" "pow" expr expr ")" | "(" "opaque" '"' ident '"' ")"
+//!            | "(" "add" kind expr expr ")" | "(" "sub" kind expr expr ")"
+//!            | "(" "mul" kind expr expr ")" | "(" "div" kind expr expr ")"
+//!            | "(" "mod" kind expr expr ")" | "(" "shl" kind expr expr ")"
+//!            | "(" "shr" kind expr expr ")" | "(" "pow" kind expr expr ")"
+//!            | "(" "neg" kind expr ")"
+//!            | "(" "opaque" '"' ident '"' ")"
 //!            | "(" "eq" expr expr ")" | "(" "lt" expr expr ")" | "(" "le" expr expr ")"
 //!            | "(" "gt" expr expr ")" | "(" "if" expr expr expr ")" | "(" "let" ident expr expr ")"
 //!            | "(" "call" ident expr* ")"
@@ -32,7 +35,7 @@
 //! comment  ::= ";;" ... end-of-line                       ; skipped as whitespace
 //! ```
 
-use super::{Alt, CtorDecl, Definition, Expr, Module, Type, TypeDecl};
+use super::{Alt, CtorDecl, Definition, Expr, Module, NumKind, Type, TypeDecl};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -170,6 +173,20 @@ fn parse_alt(input: &str) -> IResult<&str, Alt> {
     )(input)
 }
 
+/// `Nat | Int | U8 | U16 | U32 | U64` — the numeric kind tag on an
+/// arithmetic node. No prefix collisions among these, so no delimiter guard
+/// is needed (unlike `le`, which prefix-matches `let`).
+fn parse_num_kind(input: &str) -> IResult<&str, NumKind> {
+    ws(alt((
+        value(NumKind::Nat, tag("Nat")),
+        value(NumKind::Int, tag("Int")),
+        value(NumKind::U8, tag("U8")),
+        value(NumKind::U16, tag("U16")),
+        value(NumKind::U32, tag("U32")),
+        value(NumKind::U64, tag("U64")),
+    )))(input)
+}
+
 /// `(default <body>)`
 fn parse_default(input: &str) -> IResult<&str, Expr> {
     map(
@@ -204,36 +221,40 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                     Expr::Param(idx as usize)
                 }),
                 map(
-                    tuple((tag("add"), ws(parse_expr), ws(parse_expr))),
-                    |(_, a, b)| Expr::Add(Box::new(a), Box::new(b)),
+                    tuple((tag("add"), parse_num_kind, ws(parse_expr), ws(parse_expr))),
+                    |(_, k, a, b)| Expr::Add(k, Box::new(a), Box::new(b)),
                 ),
                 map(
-                    tuple((tag("sub"), ws(parse_expr), ws(parse_expr))),
-                    |(_, a, b)| Expr::Sub(Box::new(a), Box::new(b)),
+                    tuple((tag("sub"), parse_num_kind, ws(parse_expr), ws(parse_expr))),
+                    |(_, k, a, b)| Expr::Sub(k, Box::new(a), Box::new(b)),
                 ),
                 map(
-                    tuple((tag("mul"), ws(parse_expr), ws(parse_expr))),
-                    |(_, a, b)| Expr::Mul(Box::new(a), Box::new(b)),
+                    tuple((tag("mul"), parse_num_kind, ws(parse_expr), ws(parse_expr))),
+                    |(_, k, a, b)| Expr::Mul(k, Box::new(a), Box::new(b)),
                 ),
                 map(
-                    tuple((tag("div"), ws(parse_expr), ws(parse_expr))),
-                    |(_, a, b)| Expr::Div(Box::new(a), Box::new(b)),
+                    tuple((tag("div"), parse_num_kind, ws(parse_expr), ws(parse_expr))),
+                    |(_, k, a, b)| Expr::Div(k, Box::new(a), Box::new(b)),
                 ),
                 map(
-                    tuple((tag("mod"), ws(parse_expr), ws(parse_expr))),
-                    |(_, a, b)| Expr::Mod(Box::new(a), Box::new(b)),
+                    tuple((tag("mod"), parse_num_kind, ws(parse_expr), ws(parse_expr))),
+                    |(_, k, a, b)| Expr::Mod(k, Box::new(a), Box::new(b)),
                 ),
                 map(
-                    tuple((tag("shl"), ws(parse_expr), ws(parse_expr))),
-                    |(_, a, b)| Expr::Shl(Box::new(a), Box::new(b)),
+                    tuple((tag("shl"), parse_num_kind, ws(parse_expr), ws(parse_expr))),
+                    |(_, k, a, b)| Expr::Shl(k, Box::new(a), Box::new(b)),
                 ),
                 map(
-                    tuple((tag("shr"), ws(parse_expr), ws(parse_expr))),
-                    |(_, a, b)| Expr::Shr(Box::new(a), Box::new(b)),
+                    tuple((tag("shr"), parse_num_kind, ws(parse_expr), ws(parse_expr))),
+                    |(_, k, a, b)| Expr::Shr(k, Box::new(a), Box::new(b)),
                 ),
                 map(
-                    tuple((tag("pow"), ws(parse_expr), ws(parse_expr))),
-                    |(_, a, b)| Expr::Pow(Box::new(a), Box::new(b)),
+                    tuple((tag("pow"), parse_num_kind, ws(parse_expr), ws(parse_expr))),
+                    |(_, k, a, b)| Expr::Pow(k, Box::new(a), Box::new(b)),
+                ),
+                map(
+                    tuple((tag("neg"), parse_num_kind, ws(parse_expr))),
+                    |(_, k, a)| Expr::Neg(k, Box::new(a)),
                 ),
                 map(
                     tuple((tag("eq"), ws(parse_expr), ws(parse_expr))),
@@ -491,11 +512,12 @@ mod tests {
 
     #[test]
     fn test_parse_expr_add() {
-        let input = r#"(add (mul (param 0) (proj "UorAtlas.Instance" "O" (param 1))) (param 2))"#;
+        let input =
+            r#"(add Nat (mul Nat (param 0) (proj "UorAtlas.Instance" "O" (param 1))) (param 2))"#;
         let (rest, expr) = parse_expr(input).unwrap();
         assert!(rest.is_empty());
         match expr {
-            Expr::Add(_, _) => {}
+            Expr::Add(_, _, _) => {}
             _ => panic!("Expected Add, got {:?}", expr),
         }
     }
@@ -505,8 +527,8 @@ mod tests {
         let input = r#"
 (module UorAtlas.Kernel
   (def classIndex ((h2 Nat) (d Nat) (l Nat) (inst (named "UorAtlas.Instance"))) Nat
-    (add (mul (call stride inst) h2)
-         (add (mul (proj "UorAtlas.Instance" "O" inst) d) l)))
+    (add Nat (mul Nat (call stride inst) h2)
+         (add Nat (mul Nat (proj "UorAtlas.Instance" "O" inst) d) l)))
 )
 "#;
         let (rest, module) = parse_module(input).unwrap();
@@ -528,7 +550,7 @@ mod tests {
     fn test_parse_cases() {
         let input = r#"(cases (param 0)
             (alt "Some" (v) v)
-            (alt "Pair" (a b) (add a b))
+            (alt "Pair" (a b) (add Nat a b))
             (default 0))"#;
         let (rest, expr) = parse_expr(input).unwrap();
         assert!(rest.is_empty());
@@ -576,7 +598,8 @@ mod tests {
     #[test]
     fn test_parse_jp_jmp() {
         let (rest, expr) =
-            parse_expr(r#"(jp loop (i acc) (if (lt i 10) (jmp loop (add i 1) acc) acc))"#).unwrap();
+            parse_expr(r#"(jp loop (i acc) (if (lt i 10) (jmp loop (add Nat i 1) acc) acc))"#)
+                .unwrap();
         assert!(rest.is_empty());
         match expr {
             Expr::Jp { name, params, body } => {
@@ -597,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_parse_shr() {
-        let (rest, expr) = parse_expr("(shr n 1)").unwrap();
+        let (rest, expr) = parse_expr("(shr Nat n 1)").unwrap();
         assert!(rest.is_empty());
         assert!(matches!(expr, Expr::Shr(..)));
     }
@@ -611,10 +634,12 @@ mod tests {
 
     #[test]
     fn test_parse_pow() {
-        let (rest, expr) = parse_expr("(pow 2 (sub (proj \"Instance\" \"o\" i) 1))").unwrap();
+        let (rest, expr) =
+            parse_expr("(pow Nat 2 (sub Nat (proj \"Instance\" \"o\" i) 1))").unwrap();
         assert!(rest.is_empty());
         match expr {
-            Expr::Pow(a, b) => {
+            Expr::Pow(k, a, b) => {
+                assert_eq!(k, NumKind::Nat);
                 assert_eq!(*a, Expr::Nat(2));
                 assert!(matches!(*b, Expr::Sub(..)));
             }
@@ -709,5 +734,66 @@ mod tests {
             Some("type parameters")
         );
         assert!(module.types[0].ctors.is_empty());
+    }
+
+    #[test]
+    fn test_parse_kind_tagged_arithmetic() {
+        let (rest, expr) = parse_expr("(add Nat a b)").unwrap();
+        assert!(rest.is_empty());
+        match expr {
+            Expr::Add(kind, _, _) => assert_eq!(kind, NumKind::Nat),
+            _ => panic!("expected Add, got {:?}", expr),
+        }
+        assert!(matches!(
+            parse_expr("(mul Int a b)").unwrap().1,
+            Expr::Mul(NumKind::Int, _, _)
+        ));
+        assert!(matches!(
+            parse_expr("(sub U8 a b)").unwrap().1,
+            Expr::Sub(NumKind::U8, _, _)
+        ));
+    }
+
+    #[test]
+    fn test_parse_every_num_kind() {
+        for (text, expected) in [
+            ("Nat", NumKind::Nat),
+            ("Int", NumKind::Int),
+            ("U8", NumKind::U8),
+            ("U16", NumKind::U16),
+            ("U32", NumKind::U32),
+            ("U64", NumKind::U64),
+        ] {
+            let ir = alloc::format!("(add {} a b)", text);
+            match parse_expr(&ir).unwrap().1 {
+                Expr::Add(kind, _, _) => assert_eq!(kind, expected, "for {}", text),
+                other => panic!("expected Add for {}, got {:?}", text, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_untagged_arithmetic_no_longer_parses() {
+        // The tag is mandatory. An untagged node would have to mean something by
+        // default, and "add means Nat" implicitly is exactly what this removes.
+        // No arm of `parse_paren_expr` matches `(add a b)` once `add` requires a
+        // kind, so the whole expression fails rather than parsing as something
+        // else.
+        assert!(parse_expr("(add a b)").is_err());
+    }
+
+    #[test]
+    fn test_parse_neg() {
+        match parse_expr("(neg Int a)").unwrap().1 {
+            Expr::Neg(kind, _) => assert_eq!(kind, NumKind::Int),
+            other => panic!("expected Neg, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_comparisons_are_not_kind_tagged() {
+        // Both operands share a Rust type and `<` works for every kind, so a tag
+        // here would be noise.
+        assert!(matches!(parse_expr("(lt a b)").unwrap().1, Expr::Lt(_, _)));
     }
 }

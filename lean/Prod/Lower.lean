@@ -19,11 +19,13 @@ corresponding IR nodes. Design decisions:
   `let` bindings with `LetValue.erased` values (proofs) register their binder
   name but emit no binding and no opaque marker — proofs are erased by design.
 - **Operator whitelist**: `Nat.add/sub/mul/div/mod/shiftLeft/shiftRight/pow`
-  map to the IR binary ops (`pow` was added to prod-ir in M3 for `belt`;
-  `shiftRight` maps to `shr`, a total/infallible IR node distinct from `shl`
-  — `a >>> b = 0` for `b ≥ 64` since `Nat` is unbounded, so there is no
-  overflow case to report). `Nat.shiftRight` reaches lowering both from `>>>`
-  written directly and from LCNF's `n / 2` peephole (division by a
+  map to the IR binary ops, each tagged with its numeric kind — `(add Nat a
+  b)`, not bare `(add a b)` — since the IR grammar carries the kind
+  explicitly rather than inferring it (`pow` was added to prod-ir in M3 for
+  `belt`; `shiftRight` maps to `shr`, a total/infallible IR node distinct
+  from `shl` — `a >>> b = 0` for `b ≥ 64` since `Nat` is unbounded, so there
+  is no overflow case to report). `Nat.shiftRight` reaches lowering both from
+  `>>>` written directly and from LCNF's `n / 2` peephole (division by a
   power-of-two literal); either way it is just another whitelisted name by
   the time lowering sees it. Any other constant becomes an *unresolved
   call*: if the callee is `@[prod]`-tagged it is `(call <last-component>
@@ -65,8 +67,9 @@ structure LowerCtx where
 structure LowerState where
   names   : Std.HashMap Name String := {}  -- keyed on `FVarId.name`
   used    : Std.HashSet String := {}
-  /-- Compiler-generated Nat dictionaries which are semantically operators. -/
-  knownOps : Std.HashMap String String := {}
+  /-- Compiler-generated Nat dictionaries which are semantically operators,
+      as (IR op, IR kind). -/
+  knownOps : Std.HashMap String (String × String) := {}
   counter : Nat := 0
   opaques : Array String := #[]            -- opaque markers emitted
   externs : Array String := #[]            -- non-tagged, non-whitelisted calls
@@ -110,35 +113,38 @@ def registerFVar (fvarId : FVarId) (binderName : Name) : LowerM String := do
 def lookupFVar (fvarId : FVarId) : LowerM String :=
   registerFVar fvarId fvarId.name
 
-/-- Names used by Lean's Nat typeclass dictionaries in pure LCNF output. -/
-def natDictOp : Name → Option String
-  | `instAddNat => some "add"
-  | `instSubNat => some "sub"
-  | `instMulNat => some "mul"
-  | `instDiv => some "div"
-  | `instMod => some "mod"
-  | `instNatPowNat => some "pow"
-  | `Nat.add => some "add"
-  | `Nat.sub => some "sub"
-  | `Nat.mul => some "mul"
-  | `Nat.div => some "div"
-  | `Nat.mod => some "mod"
-  | `Nat.pow => some "pow"
+/-- Names used by Lean's Nat typeclass dictionaries in pure LCNF output.
+    Every one of these is a `Nat` dictionary, so the kind is always `"Nat"`. -/
+def natDictOp : Name → Option (String × String)
+  | `instAddNat => some ("add", "Nat")
+  | `instSubNat => some ("sub", "Nat")
+  | `instMulNat => some ("mul", "Nat")
+  | `instDiv => some ("div", "Nat")
+  | `instMod => some ("mod", "Nat")
+  | `instNatPowNat => some ("pow", "Nat")
+  | `Nat.add => some ("add", "Nat")
+  | `Nat.sub => some ("sub", "Nat")
+  | `Nat.mul => some ("mul", "Nat")
+  | `Nat.div => some ("div", "Nat")
+  | `Nat.mod => some ("mod", "Nat")
+  | `Nat.pow => some ("pow", "Nat")
   | _ => none
 
-/-- Lift a Nat dictionary through its overloaded-operation wrapper. -/
-def natHDictOp : Name → Option String
-  | `instHAdd => some "add"
-  | `instHSub => some "sub"
-  | `instHMul => some "mul"
-  | `instHDiv => some "div"
-  | `instHMod => some "mod"
-  | `instHPow => some "pow"
-  | `instPowNat => some "pow"
+/-- Lift a Nat dictionary through its overloaded-operation wrapper. Every one
+    of these is a `Nat` dictionary too, so the kind is always `"Nat"`. -/
+def natHDictOp : Name → Option (String × String)
+  | `instHAdd => some ("add", "Nat")
+  | `instHSub => some ("sub", "Nat")
+  | `instHMul => some ("mul", "Nat")
+  | `instHDiv => some ("div", "Nat")
+  | `instHMod => some ("mod", "Nat")
+  | `instHPow => some ("pow", "Nat")
+  | `instPowNat => some ("pow", "Nat")
   | _ => none
 
-/-- The operation represented by an already-lowered local value. -/
-def knownOpOf (v : LetValue .pure) : LowerM (Option String) := do
+/-- The operation (IR op, IR kind) represented by an already-lowered local
+    value. -/
+def knownOpOf (v : LetValue .pure) : LowerM (Option (String × String)) := do
   let st ← get
   match v with
   | .const n _ args =>
@@ -183,21 +189,28 @@ def lowerArgs (args : Array (Arg .pure)) : LowerM (Array String) := do
 private def spaced (xs : Array String) : String :=
   if xs.isEmpty then "" else " " ++ String.intercalate " " xs.toList
 
-/-- `.const` operator whitelist as an (LCNF constant name, IR binary op)
-    association list. Single source of truth for both `opWhitelist` (what the
-    lowerer accepts) and `subsetJson` (the published contract, `Prod.Emit`) —
-    extracted so the two cannot drift apart. `pow` was added to prod-ir in M3
-    for `belt`; `shiftRight` maps to `shr`, a total/infallible IR node
-    distinct from `shl` — `a >>> b = 0` for `b ≥ 64` since `Nat` is unbounded,
-    so there is no overflow case to report. -/
-def natOpNames : List (Name × String) :=
-  [ (`Nat.add, "add"), (`Nat.sub, "sub"), (`Nat.mul, "mul"), (`Nat.div, "div"),
-    (`Nat.mod, "mod"), (`Nat.shiftLeft, "shl"), (`Nat.shiftRight, "shr"),
-    (`Nat.pow, "pow") ]
+/-- `.const` operator whitelist as an (LCNF constant name, IR operator, IR
+    numeric kind) association list. Single source of truth for both
+    `opWhitelist` (what the lowerer accepts) and `subsetJson` (the published
+    contract, `Prod.Emit`) — extracted so the two cannot drift apart. `pow`
+    was added to prod-ir in M3 for `belt`; `shiftRight` maps to `shr`, a
+    total/infallible IR node distinct from `shl` — `a >>> b = 0` for `b ≥ 64`
+    since `Nat` is unbounded, so there is no overflow case to report.
 
-/-- `.const` operator whitelist: Lean kernel Nat ops → IR binary ops. -/
-def opWhitelist (n : Name) : Option String :=
-  (natOpNames.find? (fun p => p.1 == n)).map (·.2)
+    Sized-integer rows are generated rather than typed out: every `UIntN`
+    shares the same operation names, so listing them by hand would be four
+    near-identical blocks that can drift. -/
+def natOpRows : List (Name × String × String) :=
+  [ (`Nat.add, "add", "Nat"), (`Nat.sub, "sub", "Nat"), (`Nat.mul, "mul", "Nat"),
+    (`Nat.div, "div", "Nat"), (`Nat.mod, "mod", "Nat"),
+    (`Nat.shiftLeft, "shl", "Nat"), (`Nat.shiftRight, "shr", "Nat"),
+    (`Nat.pow, "pow", "Nat") ]
+
+def numOpNames : List (Name × String × String) := natOpRows
+
+/-- `.const` operator whitelist: Lean constant → (IR operator, IR kind). -/
+def opWhitelist (n : Name) : Option (String × String) :=
+  (numOpNames.find? (fun p => p.1 == n)).map (fun p => (p.2.1, p.2.2))
 
 private def isCtorName (env : Environment) (n : Name) : Bool :=
   match env.find? n with
@@ -233,9 +246,9 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     if isCtorName env declName then
       return s!"(ctor \"{declName}\"{spaced args'})"
     match opWhitelist declName with
-    | some op =>
+    | some (op, kind) =>
       if args'.size == 2 then
-        return s!"({op} {args'[0]!} {args'[1]!})"
+        return s!"({op} {kind} {args'[0]!} {args'[1]!})"
       -- partial/unusual application of a whitelisted op: not a 2-arg operator
       -- use, and not necessarily `@[prod]`-tagged either, so it is the same
       -- kind of unresolved callee as the `none` case below.
@@ -253,8 +266,8 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     let nm ← lookupFVar f
     let args' ← lowerArgs args
     match (← get).knownOps[nm]? with
-    | some op =>
-      if args'.size == 2 then return s!"({op} {args'[0]!} {args'[1]!})"
+    | some (op, kind) =>
+      if args'.size == 2 then return s!"({op} {kind} {args'[0]!} {args'[1]!})"
       return s!"(call {nm}{spaced args'})"
     | none => return s!"(call {nm}{spaced args'})"
   | _ => opaqueNode "letvalue"  -- impure-phase-only constructors

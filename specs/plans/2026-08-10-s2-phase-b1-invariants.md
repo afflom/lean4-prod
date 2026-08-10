@@ -742,46 +742,27 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 6: Migrate the construction sites and tell the truth in the contract
+### Task 6: Close the inversion hole and stop the contract saying the opposite
 
-This is the blast radius. All of it is compiler-caught.
+**Steps 1 and 2 of this task were already done by Task 5** and are struck from it here. `cargo test --workspace` is a pre-commit gate, so making the fields `pub(crate)` broke every external construction site in the same commit that introduced it; Task 5 had no way to land without migrating them. What it did NOT do is the part that has independent value: the test that would catch an inverted invariant, and the documentation that currently states the opposite of what ships.
+
+Already done, for context — do not redo:
+- `rust/prod-core/tests/macro_generation.rs` and `no_alloc.rs`: consts replaced by per-test `Instance::new(..)?`, field reads moved to accessors, construction moved outside the measured no-alloc regions with an added measurement *of* `Instance::new`.
+- `rust/prod-codegen-compile-tests/tests/smoke.rs`: `MidProp` literals moved to `::new(..)?`.
+- `rust/prod-core/src/spectral.rs`: in-crate, needed no change.
 
 **Files:**
-- Modify: `rust/prod-core/tests/macro_generation.rs`, `rust/prod-core/tests/no_alloc.rs`
-- Modify: `rust/prod-codegen-compile-tests/tests/smoke.rs`
-- Modify: `lean/Prod/Emit.lean` (contract prose), `specs/lean-for-production.md` (regenerated)
+- Modify: `rust/prod-core/tests/macro_generation.rs`
+- Modify: `rust/prod-cli/src/main.rs` (the contract prose — **NOT** `lean/Prod/Emit.lean`, which does not contain it)
+- Modify: `specs/lean-for-production.md` (regenerated, never hand-edited)
 - Modify: `AGENTS.md`, `specs/designs/2026-08-09-s2-scalar-completeness-and-invariants.md`
 
 **Interfaces:**
-- Consumes: `Instance::new`, `Instance::q()/T()/O()`, `MidProp::new` from Task 5.
+- Consumes: `Instance::new`, `Instance::q()/T()/O()`, `ComputeError::InvariantViolated` from Task 5.
 
-- [ ] **Step 1: Migrate `prod-core`'s tests**
+- [ ] **Step 1: Assert the invariant is not inverted, against the REAL exported type**
 
-`const CANONICAL: Instance = Instance { q: 4, T: 3, O: 8 };` no longer compiles — fields are `pub(crate)` and these are integration tests, which are external. A `const` cannot call a fallible constructor either.
-
-Replace the three consts with per-test construction. Every test in the file already returns `Result<(), ComputeError>`, so use `?`:
-
-```rust
-    let canonical = Instance::new(4, 3, 8)?;
-    let demo_small = Instance::new(2, 2, 4)?;
-    let third = Instance::new(5, 1, 3)?;
-```
-
-`prod-core` denies `clippy::{unwrap_used, expect_used, panic}` in test targets too, so `?` is the only option — do not reach for `.unwrap()`.
-
-Field reads become accessor calls: `inst.q` → `inst.q()`, `inst.T` → `inst.T()`, `inst.O` → `inst.O()`. `spectral.rs` is in-crate and needs no change; confirm that rather than assuming it.
-
-`no_alloc.rs` has the same `CANONICAL` const and, additionally, constructs the degenerate `Instance { q: 1, t: 1, o: 70 }`-style values for the overflow tests. Those now go through `new` too — and `Instance::new(1, 1, 70)` **succeeds**, since `70 ≥ 1`, so the overflow assertions still hold.
-
-**Watch for one thing:** `no_alloc.rs` asserts zero heap activity. Adding a constructor call inside the measured region would measure the constructor too. Construct outside `assert_no_allocation`, and add one measurement *of* `Instance::new` to prove the invariant check itself allocates nothing.
-
-- [ ] **Step 2: Migrate `smoke.rs`**
-
-`MidProp { first: 1, second: 2, third: 3 }` becomes `MidProp::new(1, 2, 3)?`. That test returns `Result`, so `?` works.
-
-- [ ] **Step 3: Assert the invariant is not inverted, against the REAL exported type**
-
-Tasks 4 and 5 are each verified against hand-written IR or by reading the export. Neither one *asserts*, in a test, that Lean's `q ≥ 1` became `1 <= q` and not `q <= 1`. A reversed comparison compiles, returns a `bool`, and rejects exactly the inputs it should accept — the same silent-wrongness shape as the shift defect this project already shipped. Close it here, where `Instance` comes from the real `kernel.ir` rather than a fixture.
+Tasks 4 and 5 were each verified by reading exported text. Neither *asserts*, in a test, that Lean's `q ≥ 1` became `1 <= q` and not `q <= 1`. A reversed comparison compiles, returns a `bool`, and rejects exactly the inputs it should accept — the same silent-wrongness shape as the shift defect this project already shipped. Close it here, where `Instance` comes from the real `kernel.ir` rather than a fixture.
 
 In `rust/prod-core/tests/macro_generation.rs`:
 
@@ -812,35 +793,48 @@ fn checked_constructor_accepts_valid_and_rejects_each_violation() -> Result<(), 
 
 If the payload string the export produces is not `"UorAtlas.Instance"`, use whatever `decl.name` actually holds — read it from `kernel.ir` rather than guessing, and say in your report which it was.
 
-- [ ] **Step 4: Rewrite the contract's erased-invariants section**
+Additionally, add the same shape of test for **`MixedCompare`** in `rust/prod-codegen-compile-tests/tests/smoke.rs`. `Instance`'s three conjuncts all point the same direction, so it cannot distinguish a blanket operand swap from a correct per-operator one. `MixedCompare`'s invariant is `lo ≥ 2 ∧ hi ≤ 7 ∧ lo < hi`, which can: pick values that satisfy it, then one counterexample per conjunct — including a case that violates only `hi ≤ 7`, which a blanket swap would wrongly accept. Read the field names and the exact type name from `lean/Conformance/golden.ir`.
 
-`lean/Prod/Emit.lean`'s `subsetJson` currently states that `Prop` fields are erased and the generated struct does **not** enforce the invariant, so callers must re-check. **That is now backwards for every lowerable case** and must be rewritten, not appended to — this project has already shipped one documentation section that survived the change it described.
+- [ ] **Step 2: Rewrite the contract's erased-invariants section**
 
-The replacement must say: `Prop` fields are still erased, because they are proofs; but when the proposition is lowerable, the struct's fields become `pub(crate)` and a checked `new` re-checks it at the crate boundary, with accessors for reading. When the proposition is not lowerable — quantifiers, arbitrary predicates, anything outside the structure's own fields — the type keeps public fields and the invariant genuinely is not enforced, exactly as before. Name which of the two a reader gets and how to tell.
+The prose lives in `rust/prod-cli/src/main.rs` at approximately lines 84-91, in the string that renders `specs/lean-for-production.md`. It currently says the generated struct does **not** enforce the invariant and that callers must re-check it, illustrated with `Instance { q: 0, T: 0, ... }`. **That is now backwards, and the illustration no longer compiles as written** — the fields are `pub(crate)`.
 
-- [ ] **Step 5: Update `AGENTS.md` and the design doc**
+Rewrite it rather than appending to it. This project has already shipped one documentation section that survived the change it described; a second one in the same branch that fixes the first would be its own kind of defect. The replacement must say:
 
-`AGENTS.md`: record that invariant-carrying types exist, that generated code bypasses the check by design and why, and that the lowerable fragment is conjunction/disjunction/negation/comparisons.
+- `Prop` fields are still erased, because they are proofs.
+- When the proposition is lowerable, the struct's fields become `pub(crate)`, a checked `new` re-checks it at the crate boundary, and accessors read the fields.
+- When it is not lowerable, the type keeps public fields and no constructor, and the invariant genuinely is not enforced — as before.
+- **How a reader tells which they got**, since both shapes are published.
+- The lowerable fragment: conjunction, disjunction, negation, and comparisons — the latter only on `Nat`, `Int` and the sized kinds. `Bool` equality is deliberately excluded, so a structure whose only `Prop` field compares `Bool`s gets no constructor.
 
-The design doc: mark Phase B1 done, and note that Phase B2 (`Fin` literal specialisation) is now unblocked and should be planned against the machinery as it shipped.
+Then regenerate: `cd rust && cargo run -p prod-cli -- subset ../subset.json --output ../specs/lean-for-production.md`. Never hand-edit the rendered file.
 
-- [ ] **Step 6: Full gates and commit**
+`rust/prod-core/src/spectral.rs`'s doc comment makes the same claim. It is still literally true in-crate but misleading now; fix it while you are there.
 
-Run: `nix develop path:/Users/auser/work/rust/mine/lean4-prod --command just prod`, then clippy, fmt and the wasm32 build from `rust/`.
+- [ ] **Step 3: Update `AGENTS.md` and the design doc**
+
+`AGENTS.md`: record that invariant-carrying types exist; that generated code bypasses the check by design, and why; and the exact lowerable fragment including the `propCmpKinds` numeric-kind restriction (`Nat`, `Int`, sized kinds — not `Bool`), which no document currently states.
+
+The design doc `specs/designs/2026-08-09-s2-scalar-completeness-and-invariants.md`: mark Phase B1 done, and note that Phase B2 (`Fin` literal specialisation) is unblocked and should be planned against the machinery as it shipped.
+
+- [ ] **Step 4: Full gates and commit**
+
+Run: `nix develop path:/Users/auser/work/rust/mine/lean4-prod --command just prod`, then from `rust/`: `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and the wasm32 build.
 
 ```bash
 git add -A
-git commit -m "Migrate construction sites; the contract stops saying the opposite
+git commit -m "Test the invariant is not inverted; the contract stops saying the opposite
 
-Instance and MidProp now have pub(crate) fields, so every external
-construction site moves to the checked constructor and every external
-field read moves to an accessor. spectral.rs is in-crate and unaffected.
+Nothing asserted that Lean's q >= 1 became 1 <= q rather than q <= 1. A
+reversed comparison compiles, returns a bool, and rejects exactly the
+inputs it should accept. Instance alone cannot catch a blanket operand
+swap — all three of its conjuncts point the same way — so MixedCompare
+carries that half of the test.
 
-The contract's erased-invariants section said the generated struct does
-NOT enforce the invariant and callers must re-check. That is backwards
-for every lowerable case now, so it is rewritten rather than appended
-to — a stale section that survives the change it describes is a defect
-this project has already shipped once.
+The contract said the generated struct does NOT enforce the invariant
+and that callers must re-check, illustrated with a struct literal that
+no longer compiles. That is backwards for every lowerable case now, so
+it is rewritten rather than appended to.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```

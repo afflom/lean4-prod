@@ -74,6 +74,14 @@
   (def c_list_build ((fuel Nat) (n Nat)) (List Nat)
     (cases fuel (alt "Nat.zero" () (let _x_50 (ctor "List.nil") _x_50)) (alt "Nat.succ" (n_27) (let _x_51 2 (if (lt n _x_51) (let _x_60 (ctor "List.nil") (let _x_61 (ctor "List.cons" n _x_60) _x_61)) (let _x_54 (mod n _x_51) (let _x_55 1 (let _x_56 (shr n _x_55) (let _x_57 (call c_list_build n_27 _x_56) (let _x_58 (ctor "List.cons" _x_54 _x_57) _x_58))))))))))
 
+  ;; full: Conformance.c_bool_or
+  (def c_bool_or ((a Nat) (b Nat)) Bool
+    (let _x_12 (lt a b) (cases _x_12 (alt "Bool.false" () (let _x_23 10 (let _x_25 (lt b _x_23) _x_25))) (alt "Bool.true" () _x_12))))
+
+  ;; full: Conformance.c_bool_not
+  (def c_bool_not ((a Nat) (b Nat)) Bool
+    (let _x_2 (lt a b) (cases _x_2 (alt "Bool.false" () (let _x_5 (ctor "Bool.true") _x_5)) (alt "Bool.true" () (let _x_6 (ctor "Bool.false") _x_6)))))
+
   ;; full: Conformance.c_nat_div
   (def c_nat_div ((a Nat) (b Nat)) Nat
     (let _x_11 (div a b) _x_11))
@@ -81,6 +89,10 @@
   ;; full: Conformance.c_guard_eq
   (def c_guard_eq ((a Nat) (b Nat)) Nat
     (if (eq a b) (let _x_7 1 _x_7) (let _x_3 0 _x_3)))
+
+  ;; full: Conformance.c_bool_and
+  (def c_bool_and ((a Nat) (b Nat)) Bool
+    (let _x_12 (lt a b) (cases _x_12 (alt "Bool.false" () _x_12) (alt "Bool.true" () (let _x_23 10 (let _x_25 (lt b _x_23) _x_25))))))
 
   ;; full: Conformance.c_nat_shr
   (def c_nat_shr ((a Nat) (b Nat)) Nat

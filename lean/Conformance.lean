@@ -43,4 +43,12 @@ namespace Conformance
   | [] => 0
   | h :: t => h + c_list_consume t
 
+-- Bool connectives. `&&`/`||` are `@[macro_inline]` in Lean and elaborate
+-- through `match`, so the expectation is that they reach LCNF as `cases` on
+-- `Bool.true`/`Bool.false` and need no IR node at all. These pin whichever
+-- answer is true.
+@[prod] def c_bool_and (a b : Nat) : Bool := (a < b) && (b < 10)
+@[prod] def c_bool_or  (a b : Nat) : Bool := (a < b) || (b < 10)
+@[prod] def c_bool_not (a b : Nat) : Bool := !(a < b)
+
 end Conformance

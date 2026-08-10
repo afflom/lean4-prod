@@ -164,6 +164,10 @@ they most likely reach LCNF as `cases` on `Bool.true`/`Bool.false`, which
 codegen already renders. **The plan's first step is an empirical probe**, and a
 node is added only if the probe shows one is needed.
 
+RESOLVED (Task 1): Bool connectives lower to cases over existing nodes.
+Evidence: `c_bool_and`/`c_bool_or`/`c_bool_not` in
+lean/Conformance/golden.ir. No IR change is needed.
+
 ## Phase B — invariant-carrying types
 
 ### The rule

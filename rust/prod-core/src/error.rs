@@ -92,6 +92,7 @@ impl core::error::Error for ComputeError {}
 #[cfg(test)]
 mod tests {
     use super::ComputeError;
+    use core::fmt::{self, Write};
 
     #[test]
     fn display_is_allocation_free_and_distinct() {
@@ -115,5 +116,72 @@ mod tests {
                 assert_ne!(a.as_str(), b.as_str());
             }
         }
+    }
+
+    /// A `fmt::Write` sink over a fixed buffer.
+    ///
+    /// This crate has no `extern crate alloc` on purpose, so there is no
+    /// `String` to format into — and that is the right constraint here rather
+    /// than an obstacle: `Display` is specified to write straight into the
+    /// formatter, and a test that needed a heap to observe it would be
+    /// observing something else.
+    struct Buf {
+        bytes: [u8; 64],
+        len: usize,
+    }
+
+    impl Buf {
+        fn as_str(&self) -> &str {
+            core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("<invalid utf-8>")
+        }
+    }
+
+    impl Write for Buf {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            let end = self.len + s.len();
+            if end > self.bytes.len() {
+                return Err(fmt::Error);
+            }
+            self.bytes[self.len..end].copy_from_slice(s.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+
+    fn render(e: ComputeError) -> Result<Buf, fmt::Error> {
+        let mut buf = Buf {
+            bytes: [0; 64],
+            len: 0,
+        };
+        write!(buf, "{}", e)?;
+        Ok(buf)
+    }
+
+    #[test]
+    fn invariant_violated_display_names_the_type() -> Result<(), fmt::Error> {
+        // The one variant whose `Display` is not its `as_str`. The test above
+        // compares `as_str()` only — deliberately payload-free — so nothing
+        // ever ran the `write!` arm, and the type name it exists to surface
+        // could have been dropped, doubled or transposed with the message
+        // without a single failing assertion. It is the only entirely-new
+        // behaviour on the invariants branch, so it is the last thing that
+        // should go unexecuted.
+        let violated = render(ComputeError::InvariantViolated("UorAtlas.Instance"))?;
+        assert_eq!(
+            violated.as_str(),
+            "structure invariant violated for `UorAtlas.Instance`"
+        );
+        // The payload really is what varies: same variant, different name.
+        assert_ne!(
+            violated.as_str(),
+            render(ComputeError::InvariantViolated("Other.Type"))?.as_str()
+        );
+        // Every other variant's `Display` is exactly its `as_str` — which is
+        // what makes the case above the sole exception rather than one of two.
+        assert_eq!(
+            render(ComputeError::AddOverflow)?.as_str(),
+            ComputeError::AddOverflow.as_str()
+        );
+        Ok(())
     }
 }

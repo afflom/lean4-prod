@@ -254,6 +254,18 @@ carry forward:
    (`lo ≥ 2 ∧ hi ≤ 7 ∧ lo < hi`) exists because `UorAtlas.Instance`'s three
    same-direction conjuncts cannot distinguish a blanket operand swap from a
    correct per-operator one. Any B2 bound needs the same treatment.
+3. **`Fin`'s bound is a type parameter, and that is a case `lowerProp` has
+   never been given.** Every `bvar` inside a proposition today is an earlier
+   *field*, because `lowerTypeDecl` rejects `numParams != 0` before it walks
+   the telescope. `Fin n`'s `isLt : val < n` references `n`, a binder outside
+   the field telescope, so B2 is the first input where an index can point past
+   the fields. `lowerPropOperand` now declines such an index explicitly; before
+   this branch's final wave it computed `depth - 1 - i` unguarded, and `Nat`
+   subtraction truncates, so `n` would have resolved to `fields[0]` — which for
+   `Fin` is `val`, lowering `val < n` to `(lt val val)`: a comparison that
+   compiles, returns a `bool`, and is always false. B2 must *supply* the bound
+   (recognise `Fin`'s parameter and substitute the literal), not rely on the
+   telescope walk to find it.
 
 Plan B2 against what actually shipped, not this design's prediction of it.
 

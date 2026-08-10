@@ -618,6 +618,19 @@ partial def lowerPropOperand (e : Expr) (fields : Array String) (depth : Nat)
     : LowerM (Option String) := do
   match e with
   | .bvar i =>
+    -- Decline an index at or beyond the binder depth BEFORE computing `idx`.
+    -- `Nat` subtraction truncates, so `depth - 1 - i` silently yields `0` for
+    -- every such index and resolves to `fields[0]` instead of declining —
+    -- a comparison that compiles, returns a `bool`, and is wrong.
+    --
+    -- Unreachable today: `lowerTypeDecl` rejects `numParams != 0` before the
+    -- telescope walk, so every `bvar` in a field type is an earlier field.
+    -- It stops being unreachable the moment a proposition may mention a type
+    -- parameter, which is exactly Phase B2: `Fin n`'s `isLt : val < n`
+    -- references `n`, a binder outside the field telescope. For `Fin`,
+    -- `fields[0]` is `val`, so the truncated read would lower `val < n` to
+    -- `(lt val val)` — always false, and green everywhere.
+    if i ≥ depth then return none
     let idx := depth - 1 - i
     match fields[idx]? with
     | some name => return some name

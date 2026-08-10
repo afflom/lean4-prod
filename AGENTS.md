@@ -55,7 +55,9 @@ What that means in practice, and what you must not regress:
   drifted regeneration shows up as a reviewable diff instead of silently not
   existing: `lean/Conformance/golden.ir` (pinned by `just conformance`,
   rewritten and accepted with `just conformance-bless` — review the diff
-  first) and `specs/lean-for-production.md` (pinned by `just subset-check`,
+  first, then commit; the gate diffs against `HEAD`, not the index, so
+  staging alone will not make `just prod` pass) and
+  `specs/lean-for-production.md` (pinned by `just subset-check`,
   part of `just prod`; there is no bless step, just rerun `just subset` and
   review+commit the diff). Never hand-edit either.
 - Every golden in `goldens.ir` must be **consumed**. `goldenEntries`

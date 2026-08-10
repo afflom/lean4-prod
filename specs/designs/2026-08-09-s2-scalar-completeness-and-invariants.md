@@ -242,7 +242,7 @@ B1 built on it as predicted — `lowerProp` is a straight recursive match over
 `And`/`Or`/`Not` and a comparison table, with `propCmpKinds = [Nat, Int] ++
 sizedKinds` gating which kinds a comparison may be lowered on (`Bool` is
 excluded on purpose, so a `Bool` equality invariant is simply not enforced).
-Two things B1 learned that this design did not anticipate, and that B2 should
+Three things B1 learned that this design did not anticipate, and that B2 should
 carry forward:
 
 1. **The fields are `pub(crate)`, not private.** Generated code inside the

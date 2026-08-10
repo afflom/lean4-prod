@@ -371,3 +371,57 @@ Green tree at every step.
 - **Silent wrongness is concentrated in `Int`.** Euclidean-versus-truncating is
   invisible to any test that avoids negative operands, which is why the
   negative-operand goldens are called out as a requirement rather than a nicety.
+
+---
+
+## Phase A follow-ups (from the whole-branch review, 2026-08-09)
+
+Recorded here rather than in scratch, because the first two shape Phase B.
+
+**Do before Phase B, in this order:**
+
+1. **Generate the golden assertions from the same table that generates the
+   values.** Oracle coverage of the conformance corpus is 5 of 40 definitions:
+   16 are asserted only against hand-written literals, and 19 — including
+   `c_nat_shl`, `c_nat_pow`, `c_int_add`, `c_int_mul`, `c_u8_sub` — are compiled
+   but never executed. `tests/goldens_consumed.rs` now makes an *unconsumed*
+   golden a build failure, which is the guard that would have caught this
+   milestone's one shipped defect, but it cannot create coverage that was never
+   written. The systematic fix is to restructure `goldenEntries` into per-signature
+   sample-input tables and map each table twice in one pass — into `goldens.ir`
+   and into a generated `tests/conformance_goldens.rs` — so the two sides cannot
+   drift. `prod-export` already writes seven files; an eighth costs nothing.
+2. **De-duplicate the builtin-type knowledge.** It lives in three places:
+   `lowerType`, `collectTypeDecls`'s exclusion list, and `subsetJson`'s
+   hand-written `types` prose. Flagged three times across two milestones. Phase B
+   adds `Fin`, a new builtin type, and will have to touch all three — this is the
+   last cheap moment.
+3. **Add a `U64` conformance case.** `U16`/`U32`/`U64` have no end-to-end coverage
+   at all, and `U64` is the one width whose `rust_type()` is `"u64"`, identical to
+   `Nat`'s — so a mis-tagged kind there compiles cleanly and silently turns a
+   wrapping operation into a checked one. Every other width's mis-tag is a rustc
+   error the compile-tests crate catches.
+
+**Known and accepted, not scheduled:**
+
+- The dictionary path (`natDictOp`/`natHDictOp`/`knownOpOf`) is a second
+  operator-acceptance route accepting thirteen constants, all hard-mapped to kind
+  `"Nat"`, six of which are polymorphic in `α` in Lean. It does not misfire today
+  and is documented in `AGENTS.md`; item 3 above covers the one case where a
+  misfire would not be caught by the compiler. Also: `instDiv`/`instMod` in
+  `natDictOp` are dead rows (Lean 4.30 names them `Nat.instDiv`/`Nat.instMod`),
+  and unlike `deciderNames` these are single-backticked so the build does not
+  check them.
+- `Nat` `shl`/`pow` report an error for inputs Lean answers totally — `0 <<< 64`
+  is `0` in Lean but `Err(ShiftOverflow)` here, because Rust's `checked_shl` is
+  `None` for any amount ≥ width regardless of value. Pre-existing since S0/S1,
+  and an `Err` is not a panic, but it is a faithfulness gap.
+- `Int` add/mul/pow reuse `AddOverflow`/`MulOverflow`/`PowOverflow`, whose
+  messages still say "Nat … u64". Fix the strings; do not split the variants —
+  the failure is identical and the enum is deliberately `Copy` and payload-free.
+- `op_is_fallible`'s agreement with every rendering arm holds across all 54
+  (operation, kind) cells, but by construction and review rather than by test.
+  A table test over all pairs would make it permanent.
+- `tests/goldens_consumed.rs` is a name-mention check, not a semantic one: a
+  golden bound to a variable and never compared would pass. Adequate for the
+  failure it targets (a golden nobody reads), and honestly documented as such.

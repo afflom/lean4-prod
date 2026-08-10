@@ -962,3 +962,39 @@ fn test_int_literal_ctors_render_not_unresolved() {
         "pub fn f(n: u64) -> i64 {\n    (-((n) as i64) - 1)\n}\n\n"
     );
 }
+
+#[test]
+fn test_sized_arithmetic_wraps_and_is_infallible() {
+    // Lean's UInt8.add is BitVec addition — wrapping IS the semantics, not a
+    // failure. So sized definitions keep a plain return type.
+    let ir = r#"(module M (def f ((a U8) (b U8)) U8 (add U8 a b)))"#;
+    let out = generate(ir);
+    assert!(out.contains("(a) as u8).wrapping_add(b)"), "got: {}", out);
+    assert!(
+        out.contains("-> u8 {"),
+        "sized arithmetic must be infallible"
+    );
+    assert!(!out.contains("ComputeError"));
+}
+
+#[test]
+fn test_sized_shift_truncates_rather_than_masking() {
+    // wrapping_shl would be WRONG: it masks the amount, so 1u8 << 8 == 1.
+    // Lean's BitVec shift gives 0 for any amount at or beyond the width.
+    let ir = r#"(module M (def f ((a U8) (b U8)) U8 (shl U8 a b)))"#;
+    let out = generate(ir);
+    assert!(out.contains("checked_shl"), "got: {}", out);
+    assert!(
+        !out.contains("wrapping_shl"),
+        "wrapping_shl masks the amount"
+    );
+    assert!(out.contains("unwrap_or(0)"));
+}
+
+#[test]
+fn test_sized_division_is_total() {
+    let ir = r#"(module M (def f ((a U8) (b U8)) U8 (div U8 a b)))"#;
+    let out = generate(ir);
+    assert!(out.contains("if (b) == 0 { 0 }"));
+    assert!(!out.contains("ComputeError"));
+}

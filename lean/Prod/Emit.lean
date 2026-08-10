@@ -72,6 +72,7 @@ def subsetJson : String :=
   -- erased) — the only shape the conformance suite exercises
   -- (`Conformance.MidProp`, `Conformance.NoProp`, `UorAtlas.Instance`).
   let types := ["Nat", "Bool", "Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int)",
+                "UInt8, UInt16, UInt32, UInt64 (render as u8/u16/u32/u64; wrapping add/sub/mul/pow, total div/mod/shl/shr — arithmetic on these cannot fail)",
                 "Prod", "List", "Option",
                 "parameterless, non-recursive, single-constructor structures (Prop fields erased)"]
   let quoted (xs : List String) : String :=
@@ -90,9 +91,16 @@ def collectTypeDecls (ctx : LowerCtx) (extracted : Array ExtractedDef)
   for ed in extracted do
     if let some decl := ed.decl? then
       for n in declTypeNames env decl do
-        -- Builtins already have IR types; only user inductives need declaring.
+        -- Builtins already have IR types; only user inductives need
+        -- declaring. Sized integers are structures wrapping `BitVec` (per
+        -- `UInt8.ofBitVec`), so without this exclusion they would be
+        -- collected as ordinary user inductives and `lowerTypeDecl` would
+        -- try (and fail) to describe their `toBitVec : BitVec 8` field —
+        -- `sizedKinds` is the same list `lowerType` uses to map them to
+        -- `U8`…`U64` instead.
+        let isSized := sizedKinds.any fun p => p.1 == n
         if n != ``Nat && n != ``Bool && n != ``Int && n != ``Prod
-            && n != ``List && n != ``Option && !wanted.contains n then
+            && n != ``List && n != ``Option && !isSized && !wanted.contains n then
           if (env.find? n).isSome && !wanted.contains n then
             wanted := wanted.push n
   let sorted := wanted.qsort fun a b => Name.quickCmp a b == .lt
@@ -213,6 +221,14 @@ def goldenEntries : Array GoldenEntry := Id.run do
                     value := toString (Conformance.c_int_ediv (-12) 7) }
   out := out.push { name := "golden_int_emod_neg_12_7", ret := "Int",
                     value := toString (Conformance.c_int_emod (-12) 7) }
+  -- Sized integers wrap: both goldens are boundary cases computed by calling
+  -- the compiled `UInt8` `+`/`<<<` instances themselves, so a checked or
+  -- masking rendering would visibly disagree with Lean's own answer (0, not
+  -- 256 or 1).
+  out := out.push { name := "golden_u8_add_255_1", ret := "U8",
+                    value := toString (Conformance.c_u8_add 255 1) }
+  out := out.push { name := "golden_u8_shl_1_8", ret := "U8",
+                    value := toString (Conformance.c_u8_shl 1 8) }
   return out
 
 /-- Assemble the `goldens.ir` text: one zero-arg def per golden. -/

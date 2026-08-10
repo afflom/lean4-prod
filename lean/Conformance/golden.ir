@@ -13,9 +13,17 @@
   (def c_guard_le ((a Nat) (b Nat)) Nat
     (if (le a b) (let _x_7 1 _x_7) (let _x_3 0 _x_3)))
 
+  ;; full: Conformance.c_u8_add
+  (def c_u8_add ((a U8) (b U8)) U8
+    (let _x_11 (add U8 a b) _x_11))
+
   ;; full: Conformance.c_list_consume
   (def c_list_consume ((x_1 (List Nat))) Nat
     (cases x_1 (alt "List.nil" () (let _x_31 0 _x_31)) (alt "List.cons" (head_16 tail_17) (let _x_32 (call c_list_consume tail_17) (let _x_33 (add Nat head_16 _x_32) _x_33)))))
+
+  ;; full: Conformance.c_u8_sub
+  (def c_u8_sub ((a U8) (b U8)) U8
+    (let _x_11 (sub U8 a b) _x_11))
 
   ;; full: Conformance.c_proj_no_prop
   ;; arity: 2 erased/type args dropped
@@ -60,6 +68,10 @@
   (def c_proj_middle_prop ((m (named "Conformance.MidProp"))) (Tuple Nat (Tuple Nat Nat))
     (let _x_1 (proj "Conformance.MidProp" "first" m) (let _x_2 (proj "Conformance.MidProp" "second" m) (let _x_3 (proj "Conformance.MidProp" "third" m) (let _x_4 (ctor "Prod.mk" _x_2 _x_3) (let _x_5 (ctor "Prod.mk" _x_1 _x_4) _x_5))))))
 
+  ;; full: Conformance.c_u8_div
+  (def c_u8_div ((a U8) (b U8)) U8
+    (let _x_11 (div U8 a b) _x_11))
+
   ;; full: Conformance.c_int_add
   (def c_int_add ((a Int) (b Int)) Int
     (let _x_11 (add Int a b) _x_11))
@@ -94,9 +106,17 @@
   (def c_bool_or ((a Nat) (b Nat)) Bool
     (let _x_12 (lt a b) (cases _x_12 (alt "Bool.false" () (let _x_23 10 (let _x_25 (lt b _x_23) _x_25))) (alt "Bool.true" () _x_12))))
 
+  ;; full: Conformance.c_u8_mul
+  (def c_u8_mul ((a U8) (b U8)) U8
+    (let _x_11 (mul U8 a b) _x_11))
+
   ;; full: Conformance.c_int_sub
   (def c_int_sub ((a Int) (b Int)) Int
     (let _x_11 (sub Int a b) _x_11))
+
+  ;; full: Conformance.c_u8_shl
+  (def c_u8_shl ((a U8) (b U8)) U8
+    (let _x_11 (shl U8 a b) _x_11))
 
   ;; full: Conformance.c_int_neg
   (def c_int_neg ((a Int)) Int

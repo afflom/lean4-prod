@@ -63,4 +63,13 @@ namespace Conformance
 @[prod] def c_int_guard_lt (a b : Int) : Int := if a < b then 1 else 0
 @[prod] def c_int_guard_eq (a b : Int) : Int := if a = b then 1 else 0
 
+-- Sized integers. The boundary cases are the point: wrapping is Lean's
+-- semantics (BitVec arithmetic), so a case that stays in range would pass
+-- under a checked rendering too.
+@[prod] def c_u8_add (a b : UInt8) : UInt8 := a + b
+@[prod] def c_u8_sub (a b : UInt8) : UInt8 := a - b
+@[prod] def c_u8_mul (a b : UInt8) : UInt8 := a * b
+@[prod] def c_u8_div (a b : UInt8) : UInt8 := a / b
+@[prod] def c_u8_shl (a b : UInt8) : UInt8 := a <<< b
+
 end Conformance

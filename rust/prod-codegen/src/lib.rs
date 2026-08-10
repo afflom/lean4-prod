@@ -604,6 +604,7 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
         Type::Nat => String::from("u64"),
         Type::Int => String::from("i64"),
         Type::Bool => String::from("bool"),
+        Type::UInt(k) => String::from(k.rust_type()),
         Type::Named(n) => format!("crate::{}", rust_ident(last_component(n))),
         Type::Option(inner) => format!("Option<{}>", type_to_rust(inner)?),
         Type::Tuple(items) => {
@@ -929,8 +930,22 @@ impl<'m> Renderer<'_, 'm> {
                 .get(*index)
                 .map(|(name, _)| name.clone())
                 .ok_or(Error::ParamOutOfBounds(*index)),
-            Expr::Add(k, a, b) => self.checked_binop(*k, a, b, "checked_add", "AddOverflow"),
-            Expr::Mul(k, a, b) => self.checked_binop(*k, a, b, "checked_mul", "MulOverflow"),
+            // `Nat`/`Int` are checked (overflow is a real failure); sized
+            // integers wrap (`UInt8.add a b = ⟨a.toBitVec + b.toBitVec⟩` —
+            // wrapping IS the semantics), so they must not emit a `?` that
+            // `op_is_fallible` already promised does not exist.
+            Expr::Add(k, a, b) => match k {
+                NumKind::Nat | NumKind::Int => {
+                    self.checked_binop(*k, a, b, "checked_add", "AddOverflow")
+                }
+                _ => self.wrapping_binop(*k, a, b, "wrapping_add"),
+            },
+            Expr::Mul(k, a, b) => match k {
+                NumKind::Nat | NumKind::Int => {
+                    self.checked_binop(*k, a, b, "checked_mul", "MulOverflow")
+                }
+                _ => self.wrapping_binop(*k, a, b, "wrapping_mul"),
+            },
             Expr::Sub(k, a, b) => match k {
                 NumKind::Nat => Ok(format!(
                     "(({}) as u64).saturating_sub({})",
@@ -970,14 +985,17 @@ impl<'m> Renderer<'_, 'm> {
                 ))),
                 _ => self.total_shift(*k, a, b, "checked_shr"),
             },
-            Expr::Pow(k, a, b) => self.checked_exponent_op(
-                *k,
-                a,
-                b,
-                "checked_pow",
-                "PowExponentTooLarge",
-                "PowOverflow",
-            ),
+            Expr::Pow(k, a, b) => match k {
+                NumKind::Nat | NumKind::Int => self.checked_exponent_op(
+                    *k,
+                    a,
+                    b,
+                    "checked_pow",
+                    "PowExponentTooLarge",
+                    "PowOverflow",
+                ),
+                _ => self.wrapping_exponent_op(*k, a, b, "wrapping_pow"),
+            },
             Expr::Neg(k, a) => {
                 if *k == NumKind::Int {
                     Ok(format!(
@@ -1397,6 +1415,29 @@ impl<'m> Renderer<'_, 'm> {
     ) -> Result<String, Error> {
         Ok(format!(
             "(({}) as {}).{}({})",
+            self.value(a)?,
+            kind.rust_type(),
+            method,
+            self.value(b)?
+        ))
+    }
+
+    /// `wrapping_pow`: like `wrapping_binop`, but the exponent is a separate
+    /// `u32` argument (Rust's `wrapping_pow` signature), so it needs the same
+    /// `u32::try_from(..).unwrap_or(u32::MAX)` narrowing `total_shift` uses —
+    /// written as its own helper rather than forced through `wrapping_binop`,
+    /// which assumes both operands share the receiver's type. Unlike
+    /// `checked_exponent_op`, this can never fail: it wraps, so there is no
+    /// `ComputeError` to report.
+    fn wrapping_exponent_op(
+        &self,
+        kind: NumKind,
+        a: &'m Expr,
+        b: &'m Expr,
+        method: &str,
+    ) -> Result<String, Error> {
+        Ok(format!(
+            "(({}) as {}).{}(u32::try_from({}).unwrap_or(u32::MAX))",
             self.value(a)?,
             kind.rust_type(),
             method,

@@ -60,6 +60,15 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
                                       // `Int`'s `emod_zero : a % 0 = a` (doctest `(7 : Int) % (0 : Int) = 7`):
                                       // modulo by zero is the dividend, not zero, same as `Nat` above.
     assert_eq!(c_int_emod(7, 0)?, 7);
+
+    // Sized integers. Lean's `UInt8.add` is BitVec addition, so overflow
+    // wraps rather than erroring — the opposite of `Nat`/`Int`.
+    // Wrapping is the semantics, not a failure — and no Result in sight.
+    assert_eq!(c_u8_add(255, 1), 0);
+    assert_eq!(c_u8_mul(16, 16), 0);
+    assert_eq!(c_u8_div(5, 0), 0); // total
+                                   // The shift truncates rather than masking: wrapping_shl would give 1.
+    assert_eq!(c_u8_shl(1, 8), 0);
     Ok(())
 }
 

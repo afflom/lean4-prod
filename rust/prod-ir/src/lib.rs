@@ -42,6 +42,9 @@ pub enum Type {
     /// `prod_codegen` for the lowering.
     List(Box<Type>),
     Tuple(Vec<Type>),
+    /// A Lean sized integer (`UInt8`…`UInt64`), rendered as the corresponding
+    /// Rust unsigned type. Arithmetic on these wraps and is infallible.
+    UInt(NumKind),
     /// Unmapped or complex type requiring manual handling
     Opaque(String),
 }

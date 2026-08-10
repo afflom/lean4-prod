@@ -99,11 +99,25 @@ fn parse_i64(input: &str) -> IResult<&str, i64> {
     )(input)
 }
 
+/// `U8 | U16 | U32 | U64` — the sized-integer type tag. Deliberately
+/// distinct from `parse_num_kind`: it excludes `Nat`/`Int`, so
+/// `Type::UInt(NumKind::Nat)`/`Type::UInt(NumKind::Int)` are unrepresentable
+/// rather than parseable-then-rejected.
+fn parse_sized_kind(input: &str) -> IResult<&str, NumKind> {
+    ws(alt((
+        value(NumKind::U8, tag("U8")),
+        value(NumKind::U16, tag("U16")),
+        value(NumKind::U32, tag("U32")),
+        value(NumKind::U64, tag("U64")),
+    )))(input)
+}
+
 fn parse_type(input: &str) -> IResult<&str, Type> {
     ws(alt((
         value(Type::Nat, tag("Nat")),
         value(Type::Int, tag("Int")),
         value(Type::Bool, tag("Bool")),
+        map(parse_sized_kind, Type::UInt),
         map(
             delimited(char('('), tuple((tag("Option"), parse_type)), char(')')),
             |(_, t)| Type::Option(Box::new(t)),

@@ -198,13 +198,33 @@ private def spaced (xs : Array String) : String :=
     since `Nat` is unbounded, so there is no overflow case to report.
 
     Sized-integer rows are generated rather than typed out: every `UIntN`
-    shares the same operation names, so listing them by hand would be four
-    near-identical blocks that can drift. -/
+    shares the same operation names (`sizedOpRows` below), so listing them by
+    hand would be four near-identical blocks that can drift. -/
 def natOpRows : List (Name × String × String) :=
   [ (`Nat.add, "add", "Nat"), (`Nat.sub, "sub", "Nat"), (`Nat.mul, "mul", "Nat"),
     (`Nat.div, "div", "Nat"), (`Nat.mod, "mod", "Nat"),
     (`Nat.shiftLeft, "shl", "Nat"), (`Nat.shiftRight, "shr", "Nat"),
     (`Nat.pow, "pow", "Nat") ]
+
+/-- Operation suffixes shared by every sized integer type: `UInt8.add`,
+    `UInt16.add`, … all exist under the same suffix, so this is the shared
+    half of `sizedOpRows`'s generation rather than typed out four times. -/
+def sizedOpSuffixes : List (Name × String) :=
+  [ (`add, "add"), (`sub, "sub"), (`mul, "mul"), (`div, "div"), (`mod, "mod"),
+    (`shiftLeft, "shl"), (`shiftRight, "shr") ]
+
+/-- Lean sized-integer types and their IR kind tags. Also used by `lowerType`
+    (mapping `UInt8`…`UInt64` to `U8`…`U64`) and `deciderNames` below, so a
+    fifth sized kind would only need adding here. -/
+def sizedKinds : List (Name × String) :=
+  [ (`UInt8, "U8"), (`UInt16, "U16"), (`UInt32, "U32"), (`UInt64, "U64") ]
+
+/-- The cross product of `sizedKinds` and `sizedOpSuffixes`: every
+    sized-integer operator row, e.g. `UInt8.add` ↦ `("add", "U8")`. This is
+    what makes the "generated rather than typed out" claim above true. -/
+def sizedOpRows : List (Name × String × String) :=
+  sizedKinds.flatMap fun (ty, kind) =>
+    sizedOpSuffixes.map fun (suffix, ir) => (ty ++ suffix, ir, kind)
 
 /-- `Int` operator whitelist. `Int.ediv`/`Int.emod` are the actual `Div
     Int`/`Mod Int` instance implementations (Euclidean, not truncating —
@@ -218,7 +238,7 @@ def intOpRows : List (Name × String × String) :=
     (`Int.ediv, "div", "Int"), (`Int.emod, "mod", "Int"),
     (`Int.neg, "neg", "Int"), (`Int.pow, "pow", "Int") ]
 
-def numOpNames : List (Name × String × String) := natOpRows ++ intOpRows
+def numOpNames : List (Name × String × String) := natOpRows ++ intOpRows ++ sizedOpRows
 
 /-- `.const` operator whitelist: Lean constant → (IR operator, IR kind). -/
 def opWhitelist (n : Name) : Option (String × String) :=
@@ -300,12 +320,31 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     `instDecidableEqInt`: Lean drops the redundant `Int` argument suffix
     because the instance already sits inside `namespace Int` (confirmed by
     enumerating the environment's constants — `instDecidableEqInt` does not
-    exist and fails the build with `unknown constant`). -/
+    exist and fails the build with `unknown constant`).
+
+    The sized-integer types are the opposite case from `Int`: their
+    `instance : DecidableEq UIntN := UIntN.decEq` declarations sit at the top
+    level of `Init/Prelude.lean`, with no enclosing `namespace UIntN` block
+    (confirmed by grepping for `^namespace` in that file — none precedes any
+    of the `UInt8`…`UInt64` declarations). So, like `Nat`, the auto-generated
+    name keeps the full `UIntN` suffix: `instDecidableEqUInt8`, not
+    `UInt8.instDecidableEq`. Confirmed by `#check`ing all sixteen sized names
+    directly against the toolchain (`UInt8.decLt`/`decLe`/`decEq` … `UInt64.…`
+    plus `instDecidableEqUInt8` … `instDecidableEqUInt64`) — every one
+    resolves, unlike `instDecidableEqInt`. -/
 def deciderNames : List (Name × String) :=
   [ (``Nat.decLt, "lt"), (``Nat.decLe, "le"), (``Nat.decEq, "eq"),
     (``instDecidableEqNat, "eq"),
     (``Int.decLt, "lt"), (``Int.decLe, "le"), (``Int.decEq, "eq"),
-    (``Int.instDecidableEq, "eq") ]
+    (``Int.instDecidableEq, "eq"),
+    (``UInt8.decLt, "lt"), (``UInt8.decLe, "le"), (``UInt8.decEq, "eq"),
+    (``instDecidableEqUInt8, "eq"),
+    (``UInt16.decLt, "lt"), (``UInt16.decLe, "le"), (``UInt16.decEq, "eq"),
+    (``instDecidableEqUInt16, "eq"),
+    (``UInt32.decLt, "lt"), (``UInt32.decLe, "le"), (``UInt32.decEq, "eq"),
+    (``instDecidableEqUInt32, "eq"),
+    (``UInt64.decLt, "lt"), (``UInt64.decLe, "le"), (``UInt64.decEq, "eq"),
+    (``instDecidableEqUInt64, "eq") ]
 
 /-- The decider constants recognized by `decidableIf?`, mapped to their IR
     comparison operator. -/
@@ -428,6 +467,11 @@ partial def lowerType (e : Expr) : LowerM String := do
   | .const ``Bool _ => return "Bool"
   | .const ``Int _ => return "Int"
   | .const n _ =>
+    -- `sizedKinds` doubles as the `UInt8`…`UInt64` → `U8`…`U64` type map, so
+    -- a fifth sized kind would only need adding there.
+    match sizedKinds.find? (fun p => p.1 == n) with
+    | some (_, tag) => return tag
+    | none =>
     match (← getEnv).find? n with
     | some (.inductInfo _) => return s!"(named \"{n}\")"
     | _ => opaqueType n

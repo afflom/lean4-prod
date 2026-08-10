@@ -11,6 +11,7 @@ named error rather than silently mis-compiled.
 - `Nat`
 - `Bool`
 - `Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int)`
+- `UInt8, UInt16, UInt32, UInt64 (render as u8/u16/u32/u64; wrapping add/sub/mul/pow, total div/mod/shl/shr — arithmetic on these cannot fail)`
 - `Prod`
 - `List`
 - `Option`
@@ -43,6 +44,34 @@ generated struct is a plain data carrier, not a refinement type.
 - `Int.emod`
 - `Int.neg`
 - `Int.pow`
+- `UInt8.add`
+- `UInt8.sub`
+- `UInt8.mul`
+- `UInt8.div`
+- `UInt8.mod`
+- `UInt8.shiftLeft`
+- `UInt8.shiftRight`
+- `UInt16.add`
+- `UInt16.sub`
+- `UInt16.mul`
+- `UInt16.div`
+- `UInt16.mod`
+- `UInt16.shiftLeft`
+- `UInt16.shiftRight`
+- `UInt32.add`
+- `UInt32.sub`
+- `UInt32.mul`
+- `UInt32.div`
+- `UInt32.mod`
+- `UInt32.shiftLeft`
+- `UInt32.shiftRight`
+- `UInt64.add`
+- `UInt64.sub`
+- `UInt64.mul`
+- `UInt64.div`
+- `UInt64.mod`
+- `UInt64.shiftLeft`
+- `UInt64.shiftRight`
 
 ## Decidable guards
 
@@ -54,6 +83,22 @@ generated struct is a plain data carrier, not a refinement type.
 - `Int.decLe`
 - `Int.decEq`
 - `Int.instDecidableEq`
+- `UInt8.decLt`
+- `UInt8.decLe`
+- `UInt8.decEq`
+- `instDecidableEqUInt8`
+- `UInt16.decLt`
+- `UInt16.decLe`
+- `UInt16.decEq`
+- `instDecidableEqUInt16`
+- `UInt32.decLt`
+- `UInt32.decLe`
+- `UInt32.decEq`
+- `instDecidableEqUInt32`
+- `UInt64.decLt`
+- `UInt64.decLe`
+- `UInt64.decEq`
+- `instDecidableEqUInt64`
 
 ## Rejections
 

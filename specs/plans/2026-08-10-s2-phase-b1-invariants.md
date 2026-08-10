@@ -100,7 +100,9 @@ cd /Users/auser/work/rust/mine/lean4-prod/lean && nix develop path:/Users/auser/
 cd /Users/auser/work/rust/mine/lean4-prod/lean && nix develop path:/Users/auser/work/rust/mine/lean4-prod --command lake exe prod-export
 ```
 
-`git diff specs/lean-for-production.md` should be **empty or purely cosmetic** — this task moves where the strings live, not what they say. A content change means an annotation was altered in transit; fix it rather than accepting it.
+`git diff specs/lean-for-production.md` **will show real content changes, and that is expected.** Deriving the list from `sizedKinds` cannot reproduce the old combined `UInt8, UInt16, UInt32, UInt64 (render as u8/u16/u32/u64; …)` line — a `map` produces one line per kind — so the four sized kinds each get their own entry with singular wording. `Prod` and `List` also gain the annotations Step 1 gives them, which they should always have carried.
+
+What must NOT change: the `Nat`, `Bool` and `Int` entries (the `Int` one is long and detailed — the likeliest place for an accidental transcription error), and any non-builtin entries such as the "parameterless, non-recursive, single-constructor structures" line, which must still appear after the derived list. Quote the committed `UInt8` line in full in your report, and confirm those two points explicitly.
 
 - [ ] **Step 5: Gates and commit**
 

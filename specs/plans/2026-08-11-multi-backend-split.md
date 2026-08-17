@@ -1084,6 +1084,10 @@ This blocks Task 7, which proves `NotYetLowered` unreachable across the whole co
 
 Add the arms to `Lowering::expr`. All seven are **total** — none can fail under any profile — so each yields a `TExpr` directly and never a `TryLet`. Render them in `prod-emit-rust` as `==`, `<`, `<=`, `>`, `&&`, `||`, `!`, matching the current `Renderer` exactly. Test at least one comparison and one connective end to end, and check the operand order is preserved: `Lt(a, b)` must render `a < b`, not `b < a`.
 
+**Also add `Expr::Convert`, which has no Target IR node at all.** Found during Task 5. `TExpr` has no conversion form, so `(convert Nat Int x)` cannot lower in a body *or* an invariant. `lean/Conformance/golden.ir` contains three of them, so Task 7's proof that `NotYetLowered` is unreachable across the corpus **will fail** without this.
+
+This means adding a node to `rust/prod-lower/src/target.rs`, which Task 3 created — the one place this task reaches outside its own files. Conversions are total (the whitelist is the lossless set: `Nat<->Int`, `UIntN->Nat`, `Nat->UIntN`), so it is a `TExpr`, not a `FallibleOp`. Port `prod-codegen`'s existing rendering unchanged, including its rejection of the pairs that have none — every sized-to-sized pair and every `Int`-to-sized pair are deliberate non-goals and must stay `UnsupportedKind`, not silently render a cast.
+
 - [ ] **Step 5: Implement the list lowering**
 
 Under `ListStrategy::CallerBuffer`, each element lowers to an `If` comparing the running index against the buffer length, whose else-branch is `Stmt::Fail(ErrorCode::OutputTooSmall)`, followed by `Stmt::Push`. Under `NativeSequence`, just `Stmt::Push` — write that arm now even though no backend uses it yet: it is three lines, and an abstraction with one implementation is not one.

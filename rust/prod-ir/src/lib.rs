@@ -77,23 +77,6 @@ pub enum NumKind {
     U64,
 }
 
-impl NumKind {
-    /// The Rust type this kind renders as. Also the cast used to pin an
-    /// arithmetic receiver's type — LCNF emits let-bound integer literals
-    /// whose type is ambiguous, and a method call on `{integer}` fails
-    /// resolution (E0689).
-    pub const fn rust_type(self) -> &'static str {
-        match self {
-            NumKind::Nat => "u64",
-            NumKind::Int => "i64",
-            NumKind::U8 => "u8",
-            NumKind::U16 => "u16",
-            NumKind::U32 => "u32",
-            NumKind::U64 => "u64",
-        }
-    }
-}
-
 /// Expression AST — a simplified lambda calculus with constants,
 /// extended with LCNF-flavored nodes (cases/ctor/proj/jp/jmp/unreachable)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

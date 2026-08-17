@@ -1,5 +1,5 @@
 [package]
-name = "prod-codegen"
+name = "prod-emit-rust"
 version = "0.1.0"
 edition = "2021"
 authors = ["UOR Foundation"]
@@ -9,6 +9,5 @@ license = "MIT"
 workspace = true
 
 [dependencies]
-prod-emit-rust = { path = "../prod-emit-rust" }
 prod-ir = { path = "../prod-ir" }
 prod-lower = { path = "../prod-lower" }

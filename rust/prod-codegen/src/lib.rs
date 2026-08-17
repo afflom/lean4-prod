@@ -110,6 +110,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
+use prod_emit_rust::rust_type;
 use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, NumKind, Type, TypeDecl};
 use prod_lower::names::{NameError, NamePolicy, NameTable};
 use prod_lower::profile::TargetProfile;
@@ -659,7 +660,7 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
         Type::Nat => String::from("u64"),
         Type::Int => String::from("i64"),
         Type::Bool => String::from("bool"),
-        Type::UInt(k) => String::from(k.rust_type()),
+        Type::UInt(k) => String::from(rust_type(*k)),
         Type::Named(n) => format!("crate::{}", rust_ident(n)),
         Type::Option(inner) => format!("Option<{}>", type_to_rust(inner)?),
         Type::Tuple(items) => {
@@ -1109,7 +1110,7 @@ impl<'m> Renderer<'_, 'm> {
                     (Int, Nat) => Ok(format!("(({}).max(0) as u64)", v)),
                     // Lean's Nat.toUIntN truncates, matching BitVec.
                     (Nat, U8) | (Nat, U16) | (Nat, U32) | (Nat, U64) => {
-                        Ok(format!("(({}) as {})", v, to.rust_type()))
+                        Ok(format!("(({}) as {})", v, rust_type(*to)))
                     }
                     // UIntN → Nat widens.
                     (U8, Nat) | (U16, Nat) | (U32, Nat) | (U64, Nat) => {
@@ -1445,7 +1446,7 @@ impl<'m> Renderer<'_, 'm> {
         Ok(format!(
             "(({}) as {}).{}({}).ok_or(crate::ComputeError::{})?",
             self.value(a)?,
-            kind.rust_type(),
+            rust_type(kind),
             method,
             self.value(b)?,
             error
@@ -1466,7 +1467,7 @@ impl<'m> Renderer<'_, 'm> {
         Ok(format!(
             "(({}) as {}).{}(u32::try_from({}).map_err(|_| crate::ComputeError::{})?).ok_or(crate::ComputeError::{})?",
             self.value(a)?,
-            kind.rust_type(),
+            rust_type(kind),
             method,
             self.value(b)?,
             exponent_error,
@@ -1533,7 +1534,7 @@ impl<'m> Renderer<'_, 'm> {
         Ok(format!(
             "(({}) as {}).{}({})",
             self.value(a)?,
-            kind.rust_type(),
+            rust_type(kind),
             method,
             self.value(b)?
         ))
@@ -1559,7 +1560,7 @@ impl<'m> Renderer<'_, 'm> {
         Ok(format!(
             "(({}) as {}).{}(u32::try_from({}).unwrap_or(u32::MAX)).unwrap_or(0)",
             self.value(a)?,
-            kind.rust_type(),
+            rust_type(kind),
             method,
             self.value(b)?
         ))
@@ -1598,7 +1599,7 @@ impl<'m> Renderer<'_, 'm> {
         Ok(format!(
             "(({}) as {}).{}(({}) as u32)",
             self.value(a)?,
-            kind.rust_type(),
+            rust_type(kind),
             method,
             self.value(b)?
         ))

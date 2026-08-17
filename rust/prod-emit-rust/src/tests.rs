@@ -5,7 +5,7 @@
 use super::*;
 use alloc::boxed::Box;
 use alloc::vec;
-use prod_ir::{Definition, Expr, NumKind, Type};
+use prod_ir::{Alt, Definition, Expr, NumKind, Type};
 use prod_lower::error::LowerError;
 use prod_lower::lower::lower_def;
 use prod_lower::profile::TargetProfile;
@@ -395,6 +395,150 @@ fn a_let_shadowing_a_parameter_still_prints_the_parameter_at_the_outer_use() {
     assert!(
         out.contains(".checked_add(x)"),
         "the outer use must still be the parameter: {}",
+        out
+    );
+}
+
+/// The printed form of the no-hoist invariant.
+///
+/// The `?` on the checked add must sit INSIDE the `if c {` block. Printed
+/// above it, the generated function reports an overflow for inputs where
+/// Lean's `if` never evaluates the sum at all.
+#[test]
+fn a_fallible_op_in_one_arm_prints_inside_that_arm() {
+    let def = Definition {
+        name: String::from("f"),
+        params: vec![
+            (String::from("c"), Type::Bool),
+            (String::from("a"), Type::Nat),
+            (String::from("b"), Type::Nat),
+        ],
+        ret: Type::Nat,
+        body: Expr::If(
+            Box::new(Expr::Var(String::from("c"))),
+            Box::new(Expr::Add(
+                NumKind::Nat,
+                Box::new(Expr::Var(String::from("a"))),
+                Box::new(Expr::Var(String::from("b"))),
+            )),
+            Box::new(Expr::Nat(0)),
+        ),
+    };
+    let out = render(&def);
+    let branch = out.find("if c {").expect(&out);
+    let add = out.find("checked_add").expect(&out);
+    assert!(add > branch, "the checked add escaped its branch:\n{}", out);
+    let else_ = out.find("} else {").expect(&out);
+    assert!(
+        add < else_,
+        "the checked add landed in the wrong branch:\n{}",
+        out
+    );
+    assert!(out.contains("return Ok(0);"), "{}", out);
+}
+
+/// A `Switch` prints as a Rust `match`, one block per arm, with the arm's
+/// binders destructured -- and a dead branch as `unreachable!()`, which is
+/// what `prod-codegen` emits for `Expr::Unreachable` today.
+#[test]
+fn a_match_prints_as_a_rust_match_with_its_binders_destructured() {
+    let def = Definition {
+        name: String::from("f"),
+        params: vec![
+            (String::from("x"), Type::Nat),
+            (String::from("o"), Type::Option(Box::new(Type::Nat))),
+        ],
+        ret: Type::Nat,
+        body: Expr::Match {
+            scrut: Box::new(Expr::Var(String::from("o"))),
+            alts: vec![
+                Alt {
+                    ctor: String::from("Option.none"),
+                    binders: vec![],
+                    body: Expr::Unreachable,
+                },
+                Alt {
+                    ctor: String::from("Option.some"),
+                    binders: vec![String::from("v")],
+                    body: Expr::Var(String::from("v")),
+                },
+            ],
+            default: None,
+        },
+    };
+    let out = render(&def);
+    assert!(out.contains("match o {"), "{}", out);
+    assert!(out.contains("None => {"), "{}", out);
+    assert!(out.contains("unreachable!();"), "{}", out);
+    assert!(out.contains("Some(v) => {"), "{}", out);
+    assert!(out.contains("return v;"), "{}", out);
+}
+
+/// LCNF's structural recursion on `Nat`: the zero arm matches first, so the
+/// successor arm's scrutinee is at least 1 and `saturating_sub(1)` is the
+/// exact predecessor.
+#[test]
+fn the_nat_recursion_arms_bind_the_predecessor() {
+    let def = Definition {
+        name: String::from("f"),
+        params: vec![(String::from("n"), Type::Nat)],
+        ret: Type::Nat,
+        body: Expr::Match {
+            scrut: Box::new(Expr::Var(String::from("n"))),
+            alts: vec![
+                Alt {
+                    ctor: String::from("Nat.zero"),
+                    binders: vec![],
+                    body: Expr::Nat(0),
+                },
+                Alt {
+                    ctor: String::from("Nat.succ"),
+                    binders: vec![String::from("k")],
+                    body: Expr::Var(String::from("k")),
+                },
+            ],
+            default: None,
+        },
+    };
+    let out = render(&def);
+    assert!(out.contains("        0 => {"), "{}", out);
+    assert!(out.contains("let k = (n).saturating_sub(1);"), "{}", out);
+}
+
+/// A temporary bound at the top level but READ inside a branch must not be
+/// folded into that branch: the fold would move its `?` behind a condition
+/// that may not hold, changing which inputs fail.
+#[test]
+fn a_temporary_read_only_inside_a_branch_is_not_folded_into_it() {
+    // f(c, a, b) = let s := a + b; if c then s else 0
+    let def = Definition {
+        name: String::from("f"),
+        params: vec![
+            (String::from("c"), Type::Bool),
+            (String::from("a"), Type::Nat),
+            (String::from("b"), Type::Nat),
+        ],
+        ret: Type::Nat,
+        body: Expr::Let(
+            String::from("s"),
+            Box::new(Expr::Add(
+                NumKind::Nat,
+                Box::new(Expr::Var(String::from("a"))),
+                Box::new(Expr::Var(String::from("b"))),
+            )),
+            Box::new(Expr::If(
+                Box::new(Expr::Var(String::from("c"))),
+                Box::new(Expr::Var(String::from("s"))),
+                Box::new(Expr::Nat(0)),
+            )),
+        ),
+    };
+    let out = render(&def);
+    let add = out.find("checked_add").expect(&out);
+    let branch = out.find("if c {").expect(&out);
+    assert!(
+        add < branch,
+        "the sum is computed unconditionally in the source, so it must stay above the branch:\n{}",
         out
     );
 }

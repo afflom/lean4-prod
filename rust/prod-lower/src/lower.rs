@@ -10,9 +10,9 @@
 use crate::error::LowerError;
 use crate::profile::{DivisionSemantics, TargetProfile};
 use crate::shape::{Shape, Signatures};
-use crate::target::{BinOp, Body, FallibleOp, Lit, Stmt, TExpr};
+use crate::target::{Arm, BinOp, Body, ErrorCode, FallibleOp, Lit, Stmt, TExpr};
 use alloc::boxed::Box;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -45,10 +45,13 @@ pub fn lower_def(
         bound: def.params.iter().map(|(n, _)| n.clone()).collect(),
         scope: Vec::new(),
         types: Vec::new(),
+        jps: JpContext::collect(&def.body),
     };
+    // The body is lowered in TAIL position: control flow is a statement here,
+    // so each branch supplies its own terminator rather than yielding a value
+    // for a `Return` this function appends.
     let mut stmts: Vec<Stmt> = Vec::new();
-    let result = lowering.expr(&def.body, &mut stmts)?;
-    stmts.push(Stmt::Return(result));
+    lowering.tail(&def.body, &mut stmts)?;
     Ok(Body {
         name: def.name.clone(),
         params: def.params.clone(),
@@ -105,6 +108,9 @@ struct Lowering<'a> {
     /// Target name -> type, for every binding made. Never popped: target names
     /// are unique, so an entry can never be shadowed.
     types: Vec<(String, Type)>,
+    /// Join-point declarations and their call counts, collected once for the
+    /// whole body.
+    jps: JpContext<'a>,
 }
 
 impl<'a> Lowering<'a> {
@@ -211,18 +217,37 @@ impl<'a> Lowering<'a> {
             // The value is lowered BEFORE the binder is in scope, so a
             // `let x := x + 1` still reads the outer `x` on the right.
             Expr::Let(name, value, body) => {
-                let value = self.expr(value, stmts)?;
-                let ty = self.type_of(&value);
-                let target = self.bind_source(name);
-                stmts.push(Stmt::Let {
-                    name: target.clone(),
-                    ty: ty.clone(),
-                    value,
-                });
-                self.types.push((target.clone(), ty));
-                self.scope.push((name.clone(), target));
+                let bound = self.bind_let(name, value, stmts)?;
                 let out = self.expr(body, stmts);
-                self.scope.pop();
+                if bound {
+                    self.scope.pop();
+                }
+                out
+            }
+
+            // A join point declaration in VALUE position. Its body is the
+            // declaration's value when nothing jumps to it; when something
+            // does, the body belongs at the jump site and the declaration
+            // itself has no value to give. `bind_let` elides the `let` that
+            // LCNF wraps it in, so reaching the second case means the `jp`
+            // sat somewhere a value was actually wanted.
+            Expr::Jp { name, body, .. } => {
+                if self.jps.jmp_count(name) == 0 {
+                    self.expr(body, stmts)
+                } else if self.jps.is_inlineable(name) {
+                    Err(LowerError::NotYetLowered(format!(
+                        "jp `{}` declared outside a `let` binding",
+                        name
+                    )))
+                } else {
+                    Err(LowerError::UnsupportedJoinPoint(name.clone()))
+                }
+            }
+
+            Expr::Jmp(name, args) => {
+                let (body, pushed) = self.inline_jmp(name, args, stmts)?;
+                let out = self.expr(body, stmts);
+                self.scope.truncate(self.scope.len() - pushed);
                 out
             }
 
@@ -246,6 +271,197 @@ impl<'a> Lowering<'a> {
 
             other => Err(LowerError::NotYetLowered(String::from(node_name(other)))),
         }
+    }
+
+    /// Lower `e` in TAIL position: the statements it needs, ending in a
+    /// terminator ([`Stmt::Return`], [`Stmt::If`], [`Stmt::Switch`] or
+    /// [`Stmt::Fail`]).
+    ///
+    /// # Why branches get their own accumulator
+    ///
+    /// **A `TryLet` must never cross a control-flow boundary.** Every branch
+    /// is lowered into a `Vec<Stmt>` of its own, so nothing a branch needs can
+    /// be lifted into the enclosing list. Hoisting a branch's `TryLet` to the
+    /// top would evaluate it even when the branch does not run -- turning a
+    /// short-circuit into eager evaluation, and reporting an overflow where
+    /// Lean, whose `Nat` is unbounded and whose `if` is lazy in its arms, has
+    /// no failure at all. That is not a formatting difference; it is a
+    /// different function.
+    ///
+    /// The scrutinee and the condition are lowered into the ENCLOSING list on
+    /// purpose: they are evaluated unconditionally, whichever way the branch
+    /// goes.
+    fn tail(&mut self, e: &Expr, stmts: &mut Vec<Stmt>) -> Result<(), LowerError> {
+        match e {
+            Expr::If(cond, then_, else_) => {
+                let cond = self.expr(cond, stmts)?;
+                let mut then_stmts: Vec<Stmt> = Vec::new();
+                self.tail(then_, &mut then_stmts)?;
+                let mut else_stmts: Vec<Stmt> = Vec::new();
+                self.tail(else_, &mut else_stmts)?;
+                stmts.push(Stmt::If {
+                    cond,
+                    then: then_stmts,
+                    else_: else_stmts,
+                });
+                Ok(())
+            }
+
+            Expr::Match {
+                scrut,
+                alts,
+                default,
+            } => {
+                let scrut = self.expr(scrut, stmts)?;
+                let mut arms = Vec::with_capacity(alts.len());
+                for alt in alts {
+                    // An alternative's binders are source binders like any
+                    // other: they go through `bind_source`, so one that
+                    // shadows a parameter is renamed, and through `scope`, so
+                    // reads inside the arm resolve to the renamed binder.
+                    // Without both, the printer's `uses()` -- which counts
+                    // reads by name and has no scope of its own -- would pool
+                    // the arm's reads with the parameter's.
+                    let mut binders = Vec::with_capacity(alt.binders.len());
+                    for binder in &alt.binders {
+                        let target = self.bind_source(binder);
+                        self.scope.push((binder.clone(), target.clone()));
+                        binders.push(target);
+                    }
+                    let mut body: Vec<Stmt> = Vec::new();
+                    let out = self.tail(&alt.body, &mut body);
+                    self.scope.truncate(self.scope.len() - alt.binders.len());
+                    out?;
+                    arms.push(Arm {
+                        ctor: alt.ctor.clone(),
+                        binders,
+                        body,
+                    });
+                }
+                let default = match default {
+                    Some(d) => {
+                        let mut body: Vec<Stmt> = Vec::new();
+                        self.tail(d, &mut body)?;
+                        Some(body)
+                    }
+                    None => None,
+                };
+                stmts.push(Stmt::Switch {
+                    scrut,
+                    arms,
+                    default,
+                });
+                Ok(())
+            }
+
+            // A branch LCNF proved dead. It is a terminator, not a value, so
+            // it has no lowering in operand position.
+            Expr::Unreachable => {
+                stmts.push(Stmt::Fail(ErrorCode::Unreachable));
+                Ok(())
+            }
+
+            Expr::Let(name, value, body) => {
+                let bound = self.bind_let(name, value, stmts)?;
+                let out = self.tail(body, stmts);
+                if bound {
+                    self.scope.pop();
+                }
+                out
+            }
+
+            Expr::Jp { name, body, .. } if self.jps.jmp_count(name) == 0 => self.tail(body, stmts),
+
+            Expr::Jmp(name, args) => {
+                let (body, pushed) = self.inline_jmp(name, args, stmts)?;
+                let out = self.tail(body, stmts);
+                self.scope.truncate(self.scope.len() - pushed);
+                out
+            }
+
+            // Everything else is a value: lower it and return it.
+            other => {
+                let value = self.expr(other, stmts)?;
+                stmts.push(Stmt::Return(value));
+                Ok(())
+            }
+        }
+    }
+
+    /// Emit the binding for a source `let` and put it in scope. Returns
+    /// whether a scope entry was pushed, so the caller knows to pop it.
+    ///
+    /// The value is lowered BEFORE the binder is in scope, so a
+    /// `let x := x + 1` still reads the outer `x` on the right.
+    fn bind_let(
+        &mut self,
+        name: &str,
+        value: &Expr,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<bool, LowerError> {
+        // LCNF writes a join point as `let g := jp g (..) ..; <continuation>`.
+        // When the join point is inlined at its jump site the declaration has
+        // nothing left to bind, so the `let` disappears entirely rather than
+        // binding a unit nobody reads.
+        if let Expr::Jp { name: jp, .. } = value {
+            if self.jps.is_inlineable(jp) {
+                return Ok(false);
+            }
+        }
+        let value = self.expr(value, stmts)?;
+        let ty = self.type_of(&value);
+        let target = self.bind_source(name);
+        stmts.push(Stmt::Let {
+            name: target.clone(),
+            ty: ty.clone(),
+            value,
+        });
+        self.types.push((target.clone(), ty));
+        self.scope.push((String::from(name), target));
+        Ok(true)
+    }
+
+    /// Bind a join point's parameters at its jump site and hand back its body
+    /// for the caller to lower in whatever position the `jmp` itself was in,
+    /// plus the number of scope entries to pop afterwards.
+    ///
+    /// Only the single-caller, non-cyclic form is inlined; everything else is
+    /// [`LowerError::UnsupportedJoinPoint`], which is exactly the set
+    /// `prod-codegen` rejects today. Widening that is not this task.
+    ///
+    /// The arguments are all lowered before any parameter is bound: they are
+    /// evaluated in the CALLER's scope, so a later argument must not read a
+    /// parameter this jump is in the middle of binding.
+    fn inline_jmp(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<(&'a Expr, usize), LowerError> {
+        let Some((params, body)) = self.jps.decls.get(name).copied() else {
+            return Err(LowerError::UnsupportedJoinPoint(String::from(name)));
+        };
+        if !self.jps.is_inlineable(name) {
+            return Err(LowerError::UnsupportedJoinPoint(String::from(name)));
+        }
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.expr(arg, stmts)?);
+        }
+        let mut pushed = 0;
+        for (param, value) in params.iter().zip(values) {
+            let ty = self.type_of(&value);
+            let target = self.bind_source(param);
+            stmts.push(Stmt::Let {
+                name: target.clone(),
+                ty: ty.clone(),
+                value,
+            });
+            self.types.push((target.clone(), ty));
+            self.scope.push((param.clone(), target));
+            pushed += 1;
+        }
+        Ok((body, pushed))
     }
 
     /// Lower a binary arithmetic node, hoisting it to a [`Stmt::TryLet`]
@@ -324,6 +540,71 @@ impl<'a> Lowering<'a> {
             TExpr::Call(..) | TExpr::Ctor(..) | TExpr::Proj(..) => unknown_type(),
         }
     }
+}
+
+/// Join-point analysis for one definition body.
+///
+/// Ported unchanged from `prod-codegen`'s renderer, deliberately: the policy
+/// it encodes -- inline the single-caller, non-cyclic form, reject the rest --
+/// is the behaviour the Task 7 cutover has to reproduce byte for byte, so it
+/// moves without being widened.
+struct JpContext<'a> {
+    /// name -> (params, body) of each `jp` declaration in the body
+    decls: BTreeMap<&'a str, (&'a [String], &'a Expr)>,
+    /// name -> total number of `jmp` sites in the body
+    jmp_counts: BTreeMap<&'a str, usize>,
+}
+
+impl<'a> JpContext<'a> {
+    fn collect(body: &'a Expr) -> Self {
+        let mut ctx = JpContext {
+            decls: BTreeMap::new(),
+            jmp_counts: BTreeMap::new(),
+        };
+        ctx.walk(body);
+        ctx
+    }
+
+    fn walk(&mut self, expr: &'a Expr) {
+        match expr {
+            Expr::Jp { name, params, body } => {
+                self.decls.insert(name.as_str(), (params, body));
+            }
+            Expr::Jmp(name, _) => {
+                *self.jmp_counts.entry(name.as_str()).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+        for child in expr.children() {
+            self.walk(child);
+        }
+    }
+
+    fn jmp_count(&self, name: &str) -> usize {
+        self.jmp_counts.get(name).copied().unwrap_or(0)
+    }
+
+    /// A join point is cyclic if a jump to it occurs inside its own body.
+    fn is_cyclic(&self, name: &str) -> bool {
+        match self.decls.get(name) {
+            Some((_, body)) => count_jmps(body, name) > 0,
+            None => false,
+        }
+    }
+
+    /// Inlineable: exactly one caller, and not self-referential.
+    fn is_inlineable(&self, name: &str) -> bool {
+        self.jmp_count(name) == 1 && !self.is_cyclic(name)
+    }
+}
+
+/// Number of `jmp <name>` sites within `expr`.
+fn count_jmps(expr: &Expr, name: &str) -> usize {
+    let self_count = match expr {
+        Expr::Jmp(n, _) if n == name => 1,
+        _ => 0,
+    };
+    self_count + expr.children().map(|c| count_jmps(c, name)).sum::<usize>()
 }
 
 fn kind_type(kind: NumKind) -> Type {
@@ -437,7 +718,7 @@ mod tests {
     use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
-    use prod_ir::{Definition, Expr, NumKind, Type};
+    use prod_ir::{Alt, Definition, Expr, NumKind, Type};
 
     fn def_add() -> Definition {
         Definition {
@@ -793,6 +1074,352 @@ mod tests {
                 );
             }
             other => panic!("expected the hoisted Let, got {:?}", other),
+        }
+    }
+
+    /// The invariant this task exists for.
+    ///
+    /// `if c then (a + b) else 0`. Hoisting the `TryLet` for `a + b` to the
+    /// top would evaluate it even when `c` is false -- turning a short-circuit
+    /// into eager evaluation and producing an overflow error where Lean has
+    /// none. Straight-line lowering cannot see this.
+    #[test]
+    fn a_fallible_op_in_one_arm_stays_in_that_arm() {
+        // `if c then (a + b) else 0`, Nat, Rust profile.
+        //
+        // Hoisting the TryLet for `a + b` to the top would evaluate it even when
+        // `c` is false -- turning a short-circuit into eager evaluation and
+        // producing an overflow error where Lean has none.
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![
+                (String::from("c"), Type::Bool),
+                (String::from("a"), Type::Nat),
+                (String::from("b"), Type::Nat),
+            ],
+            ret: Type::Nat,
+            body: Expr::If(
+                Box::new(Expr::Var(String::from("c"))),
+                Box::new(Expr::Add(
+                    NumKind::Nat,
+                    Box::new(Expr::Var(String::from("a"))),
+                    Box::new(Expr::Var(String::from("b"))),
+                )),
+                Box::new(Expr::Nat(0)),
+            ),
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
+
+        // Nothing fallible before the branch.
+        for s in &body.stmts {
+            if matches!(s, Stmt::If { .. }) {
+                break;
+            }
+            assert!(
+                !matches!(s, Stmt::TryLet { .. }),
+                "a TryLet was hoisted above the If: {:?}",
+                body.stmts
+            );
+        }
+        // And the TryLet is inside the then-branch, not the else.
+        let Some(Stmt::If { then, else_, .. }) =
+            body.stmts.iter().find(|s| matches!(s, Stmt::If { .. }))
+        else {
+            panic!("expected an If, got {:?}", body.stmts)
+        };
+        assert!(
+            then.iter().any(|s| matches!(s, Stmt::TryLet { .. })),
+            "then: {:?}",
+            then
+        );
+        assert!(
+            !else_.iter().any(|s| matches!(s, Stmt::TryLet { .. })),
+            "else: {:?}",
+            else_
+        );
+    }
+
+    /// The same invariant, one level down: a `Match` arm is a control-flow
+    /// boundary too, and the temporary for `a + b` belongs inside the arm that
+    /// asked for it.
+    #[test]
+    fn a_fallible_op_in_one_match_arm_stays_in_that_arm() {
+        // match o with | none => 0 | some _ => a + b
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![
+                (String::from("o"), Type::Option(Box::new(Type::Nat))),
+                (String::from("a"), Type::Nat),
+                (String::from("b"), Type::Nat),
+            ],
+            ret: Type::Nat,
+            body: Expr::Match {
+                scrut: Box::new(Expr::Var(String::from("o"))),
+                alts: vec![
+                    Alt {
+                        ctor: String::from("Option.none"),
+                        binders: vec![],
+                        body: Expr::Nat(0),
+                    },
+                    Alt {
+                        ctor: String::from("Option.some"),
+                        binders: vec![String::from("v")],
+                        body: Expr::Add(
+                            NumKind::Nat,
+                            Box::new(Expr::Var(String::from("a"))),
+                            Box::new(Expr::Var(String::from("b"))),
+                        ),
+                    },
+                ],
+                default: None,
+            },
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
+
+        for s in &body.stmts {
+            assert!(
+                !matches!(s, Stmt::TryLet { .. }),
+                "a TryLet was hoisted above the Switch: {:?}",
+                body.stmts
+            );
+        }
+        let Some(Stmt::Switch { arms, .. }) =
+            body.stmts.iter().find(|s| matches!(s, Stmt::Switch { .. }))
+        else {
+            panic!("expected a Switch, got {:?}", body.stmts)
+        };
+        assert!(
+            !arms[0]
+                .body
+                .iter()
+                .any(|s| matches!(s, Stmt::TryLet { .. })),
+            "none arm: {:?}",
+            arms[0].body
+        );
+        assert!(
+            arms[1]
+                .body
+                .iter()
+                .any(|s| matches!(s, Stmt::TryLet { .. })),
+            "some arm: {:?}",
+            arms[1].body
+        );
+    }
+
+    /// A match binder is a source binder like any other, so it goes through
+    /// `bind_source` and `scope`.
+    ///
+    /// Without that, the arm below would bind a second `x` while the
+    /// parameter `x` is still live, and the printer's `uses()` -- which counts
+    /// reads by NAME, with no scope of its own -- would pool their reads. That
+    /// corrupts the decision to fold a single-use temporary, so a shadowing
+    /// binder changes the SHAPE of the generated code, not only which value it
+    /// reads.
+    #[test]
+    fn a_match_binder_shadowing_a_parameter_is_renamed() {
+        // f(x, o) = match o with | none => x | some x => x
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![
+                (String::from("x"), Type::Nat),
+                (String::from("o"), Type::Option(Box::new(Type::Nat))),
+            ],
+            ret: Type::Nat,
+            body: Expr::Match {
+                scrut: Box::new(Expr::Var(String::from("o"))),
+                alts: vec![
+                    Alt {
+                        ctor: String::from("Option.none"),
+                        binders: vec![],
+                        body: Expr::Var(String::from("x")),
+                    },
+                    Alt {
+                        ctor: String::from("Option.some"),
+                        binders: vec![String::from("x")],
+                        body: Expr::Var(String::from("x")),
+                    },
+                ],
+                default: None,
+            },
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
+
+        let Some(Stmt::Switch { arms, .. }) =
+            body.stmts.iter().find(|s| matches!(s, Stmt::Switch { .. }))
+        else {
+            panic!("expected a Switch, got {:?}", body.stmts)
+        };
+        // The `none` arm reads the PARAMETER.
+        assert_eq!(
+            arms[0].body,
+            vec![Stmt::Return(TExpr::Var(String::from("x")))]
+        );
+        // The `some` arm binds its own, renamed, and reads that one.
+        let bound = arms[1].binders[0].clone();
+        assert_ne!(bound, "x", "the arm binder must be renamed off the param");
+        assert_eq!(
+            arms[1].body,
+            vec![Stmt::Return(TExpr::Var(bound.clone()))],
+            "the arm body must read its OWN binder, got {:?}",
+            arms[1].body
+        );
+    }
+
+    /// `Unreachable` is a terminator, not a value.
+    #[test]
+    fn a_dead_branch_lowers_to_a_fail() {
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![(String::from("c"), Type::Bool)],
+            ret: Type::Nat,
+            body: Expr::If(
+                Box::new(Expr::Var(String::from("c"))),
+                Box::new(Expr::Nat(1)),
+                Box::new(Expr::Unreachable),
+            ),
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
+        let Some(Stmt::If { then, else_, .. }) =
+            body.stmts.iter().find(|s| matches!(s, Stmt::If { .. }))
+        else {
+            panic!("expected an If, got {:?}", body.stmts)
+        };
+        assert_eq!(then, &vec![Stmt::Return(TExpr::Lit(Lit::Nat(1)))]);
+        assert_eq!(else_, &vec![Stmt::Fail(ErrorCode::Unreachable)]);
+    }
+
+    /// `let g := jp g (p) <body>; jmp g arg`, the one join-point form the
+    /// corpus contains and the only one this lowering inlines.
+    fn def_jp(jp_param: &str, jumps: usize, body: Expr) -> Definition {
+        let mut jump: Expr = Expr::Jmp(String::from("g"), vec![Expr::Nat(5)]);
+        for _ in 1..jumps {
+            jump = Expr::Add(
+                NumKind::Nat,
+                Box::new(jump),
+                Box::new(Expr::Jmp(String::from("g"), vec![Expr::Nat(6)])),
+            );
+        }
+        Definition {
+            name: String::from("f"),
+            params: vec![(String::from("x"), Type::Nat)],
+            ret: Type::Nat,
+            body: Expr::Let(
+                String::from("g"),
+                Box::new(Expr::Jp {
+                    name: String::from("g"),
+                    params: vec![String::from(jp_param)],
+                    body: Box::new(body),
+                }),
+                Box::new(jump),
+            ),
+        }
+    }
+
+    /// The single-caller, non-cyclic join point is inlined at its jump site,
+    /// and its parameter goes through `bind_source`/`scope` -- so a parameter
+    /// name that collides with a definition parameter is renamed, exactly as a
+    /// `let` binder would be.
+    #[test]
+    fn a_single_caller_join_point_inlines_and_its_parameter_is_renamed() {
+        // f(x) = let g := jp g (x) (x + 1); jmp g 5
+        let def = def_jp(
+            "x",
+            1,
+            Expr::Add(
+                NumKind::Nat,
+                Box::new(Expr::Var(String::from("x"))),
+                Box::new(Expr::Nat(1)),
+            ),
+        );
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
+
+        // The declaration binds nothing: the body moved to the jump site.
+        let lets: Vec<&Stmt> = body
+            .stmts
+            .iter()
+            .filter(|s| matches!(s, Stmt::Let { .. }))
+            .collect();
+        assert_eq!(lets.len(), 1, "got {:?}", body.stmts);
+        let Stmt::Let { name, value, .. } = lets[0] else {
+            unreachable!()
+        };
+        assert_ne!(name, "x", "the jp parameter must be renamed off the param");
+        assert_eq!(
+            value,
+            &TExpr::Lit(Lit::Nat(5)),
+            "bound to the jump's argument"
+        );
+
+        match &body.stmts[1] {
+            Stmt::TryLet {
+                op: FallibleOp::Arith(_, BinOp::Add, a, _),
+                ..
+            } => assert_eq!(
+                a,
+                &TExpr::Var(name.clone()),
+                "the jp body must read its OWN parameter, got {:?}",
+                a
+            ),
+            other => panic!("expected the inlined add, got {:?}", other),
+        }
+    }
+
+    /// A join point with no jump sites is just its body, in place.
+    #[test]
+    fn a_join_point_nobody_jumps_to_is_its_body() {
+        let mut def = def_jp("p", 1, Expr::Nat(7));
+        // Replace the jump with a plain value: now `g` has no callers.
+        def.body = match def.body {
+            Expr::Let(name, value, _) => Expr::Let(name, value, Box::new(Expr::Nat(9))),
+            other => other,
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
+        assert_eq!(
+            body.stmts,
+            vec![
+                Stmt::Let {
+                    name: String::from("g"),
+                    ty: Type::Nat,
+                    value: TExpr::Lit(Lit::Nat(7)),
+                },
+                Stmt::Return(TExpr::Lit(Lit::Nat(9))),
+            ],
+            "got {:?}",
+            body.stmts
+        );
+    }
+
+    /// Everything that is not the single-caller, non-cyclic form is rejected,
+    /// exactly as `prod-codegen` rejects it today. Widening join-point support
+    /// is not part of this plan, and emitting a plausible-looking skeleton for
+    /// it is how this project previously shipped Rust that did not compile.
+    #[test]
+    fn a_multi_caller_or_cyclic_join_point_is_rejected() {
+        let two_callers = def_jp("p", 2, Expr::Var(String::from("p")));
+        let cyclic = def_jp(
+            "p",
+            1,
+            Expr::Jmp(String::from("g"), vec![Expr::Var(String::from("p"))]),
+        );
+        for def in [two_callers, cyclic] {
+            let defs = vec![def];
+            let shapes = signatures(&defs, &TargetProfile::RUST);
+            assert_eq!(
+                lower_def(&defs[0], &shapes, &TargetProfile::RUST),
+                Err(LowerError::UnsupportedJoinPoint(String::from("g"))),
+            );
         }
     }
 }

@@ -12,5 +12,12 @@ pub enum LowerError {
     /// The printers are total by construction, so a refusal has to happen
     /// here, where the semantics are.
     UnsupportedKind(String),
+    /// A join point this lowering will not inline: cyclic, several callers,
+    /// or a `jmp` with no matching `jp`. `prod-codegen` rejects exactly the
+    /// same set as `Error::UnsupportedJoinPoint`, and this variant exists so
+    /// the rejection survives the Task 7 cutover with its own name rather
+    /// than being folded into `UnsupportedKind` -- widening join-point
+    /// support is future work, not a permanent refusal.
+    UnsupportedJoinPoint(String),
     Name(crate::names::NameError),
 }

@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 use prod_ir::{NumKind, Type};
 use prod_lower::names::NamePolicy;
 use prod_lower::shape::Shape;
-use prod_lower::target::{BinOp, Body, FallibleOp, Lit, Stmt, TExpr};
+use prod_lower::target::{Arm, BinOp, Body, ErrorCode, FallibleOp, Lit, Stmt, TExpr};
 
 /// The Rust type a numeric kind renders as. Also the cast used to pin an
 /// arithmetic receiver's type — LCNF emits let-bound integer literals whose
@@ -129,13 +129,72 @@ impl Printer {
                         out.push_str(&format!("{}return {};\n", pad, e));
                     }
                 }
-                // Control flow is Task 4/5 and lists are Task 6; the lowering
-                // in this task emits none of them. A `compile_error!` rather
-                // than a plausible guess, so a premature use fails at the
-                // Rust compiler instead of shipping.
+                // Each branch is its own statement list, so it prints as its
+                // own BLOCK. That is what keeps a branch's `TryLet` -- and the
+                // `?` it carries -- from running when the branch does not.
+                //
+                // Both arms end in a terminator, so the `if` has type `!` and
+                // coerces wherever the body needs a value.
+                Stmt::If { cond, then, else_ } => {
+                    let cond = self.expr(cond);
+                    let then = self.block(then, depth + 1);
+                    let else_ = self.block(else_, depth + 1);
+                    out.push_str(&format!(
+                        "{}if {} {{\n{}{}}} else {{\n{}{}}}\n",
+                        pad, cond, then, pad, else_, pad
+                    ));
+                }
+                Stmt::Switch {
+                    scrut,
+                    arms,
+                    default,
+                } => out.push_str(&self.switch(scrut, arms, default.as_deref(), depth)),
+                Stmt::Fail(code) => out.push_str(&format!("{}{}\n", pad, fail(*code))),
+                // Lists are Task 6; the lowering in this task emits no
+                // `Push`. A `compile_error!` rather than a plausible guess,
+                // so a premature use fails at the Rust compiler instead of
+                // shipping.
                 other => out.push_str(&format!("{}{}\n", pad, todo_stmt(other))),
             }
         }
+        out
+    }
+
+    /// A `Switch` prints as a Rust `match`, one block per arm.
+    ///
+    /// The constructor spellings that need no type table are the ones this
+    /// slice can render: the `Nat` structural-recursion pair LCNF emits, and
+    /// `Bool`/`Option`/`List`, whose Rust patterns are fixed. A user-declared
+    /// constructor needs the module's type table to know its path and its
+    /// field names, which arrives in Task 5; until then it renders
+    /// positionally, exactly as `prod-codegen` does for a constructor it
+    /// cannot resolve.
+    fn switch(
+        &mut self,
+        scrut: &TExpr,
+        arms: &[Arm],
+        default: Option<&[Stmt]>,
+        depth: usize,
+    ) -> String {
+        let pad = "    ".repeat(depth);
+        let inner = "    ".repeat(depth + 1);
+        let scrut = self.expr(scrut);
+        let mut out = format!("{}match {} {{\n", pad, scrut);
+        for arm in arms {
+            let (pattern, prologue) = arm_pattern(&arm.ctor, &arm.binders, &scrut);
+            out.push_str(&format!("{}{} => {{\n", inner, pattern));
+            for line in &prologue {
+                out.push_str(&format!("{}    {}\n", inner, line));
+            }
+            out.push_str(&self.block(&arm.body, depth + 2));
+            out.push_str(&format!("{}}}\n", inner));
+        }
+        if let Some(d) = default {
+            out.push_str(&format!("{}_ => {{\n", inner));
+            out.push_str(&self.block(d, depth + 2));
+            out.push_str(&format!("{}}}\n", inner));
+        }
+        out.push_str(&format!("{}}}\n", pad));
         out
     }
 
@@ -347,16 +406,75 @@ fn unsupported(why: &str) -> String {
 
 fn todo_stmt(stmt: &Stmt) -> String {
     let what = match stmt {
-        Stmt::If { .. } => "If (Task 4)",
-        Stmt::Switch { .. } => "Switch (Task 5)",
-        Stmt::Fail(_) => "Fail (Task 5)",
         Stmt::Push { .. } => "Push (Task 6)",
-        Stmt::Let { .. } | Stmt::TryLet { .. } | Stmt::Return(_) => unreachable!(),
+        Stmt::Let { .. }
+        | Stmt::TryLet { .. }
+        | Stmt::Return(_)
+        | Stmt::If { .. }
+        | Stmt::Switch { .. }
+        | Stmt::Fail(_) => unreachable!(),
     };
     format!(
         "compile_error!(\"prod-emit-rust: {} is not lowered yet\");",
         what
     )
+}
+
+/// The Rust pattern for one arm, plus any bindings that have to happen inside
+/// the arm rather than in the pattern.
+///
+/// The `Nat` pair is LCNF's structural recursion: `Nat.zero` is the literal
+/// `0` and `Nat.succ k` is the `_` arm with `k` bound to the predecessor.
+/// Since the zero arm matches first the scrutinee is at least 1 there, so
+/// `saturating_sub(1)` is exact -- and stays inside the crate's bounded-`Nat`
+/// policy. Match ergonomics bind a slice's head by reference, so the cons arm
+/// rebinds it by value and arithmetic on it needs no dereference syntax.
+fn arm_pattern(ctor: &str, binders: &[String], scrut: &str) -> (String, Vec<String>) {
+    let bound = |i: usize| ident(&binders[i]);
+    match (ctor, binders.len()) {
+        ("Nat.zero", 0) => (String::from("0"), Vec::new()),
+        ("Nat.succ", 1) => (
+            String::from("_"),
+            alloc::vec![format!("let {} = ({}).saturating_sub(1);", bound(0), scrut)],
+        ),
+        ("Bool.true", 0) => (String::from("true"), Vec::new()),
+        ("Bool.false", 0) => (String::from("false"), Vec::new()),
+        ("Option.none", 0) => (String::from("None"), Vec::new()),
+        ("Option.some", 1) => (format!("Some({})", bound(0)), Vec::new()),
+        ("List.nil", 0) => (String::from("[]"), Vec::new()),
+        ("List.cons", 2) => (
+            format!("[{}, {} @ ..]", bound(0), bound(1)),
+            alloc::vec![format!("let {} = *{};", bound(0), bound(0))],
+        ),
+        (_, 0) => (String::from(ctor), Vec::new()),
+        _ => (
+            format!(
+                "{}({})",
+                ctor,
+                binders
+                    .iter()
+                    .map(|b| ident(b))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Vec::new(),
+        ),
+    }
+}
+
+/// A `Fail` is a terminator, so it prints as one.
+///
+/// `Unreachable` keeps `prod-codegen`'s `unreachable!()`: LCNF emits it only
+/// for a branch Lean itself proved dead, so it is not reachable on
+/// caller-controlled input, and there is no `ComputeError` variant for "the
+/// impossible happened" to report instead.
+fn fail(code: ErrorCode) -> String {
+    match code {
+        ErrorCode::Unreachable => String::from("unreachable!();"),
+        ErrorCode::OutputTooSmall => {
+            String::from("return Err(crate::ComputeError::OutputTooSmall);")
+        }
+    }
 }
 
 /// Rust spelling of a type in an ordinary (owned, by-value) position.

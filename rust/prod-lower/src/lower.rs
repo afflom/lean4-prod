@@ -181,7 +181,9 @@ fn lower_type_decl(
                         ));
                     }
                 }
-                Some(lower_invariant(predicate, &decl.name, &fields, policy)?)
+                Some(lower_invariant(
+                    predicate, &decl.name, &fields, all, policy,
+                )?)
             }
         };
 
@@ -329,8 +331,10 @@ fn check_representable(ty: &Type) -> Result<(), LowerError> {
 /// which is the right shape rather than an inconvenience. `lower_types`
 /// produces one [`TypeDef`] that *every* backend prints, so the predicate in
 /// it has to be a single total expression under every profile at once. That
-/// is what [`TargetProfile::op_is_fallible_under_any_profile`] answers, and
-/// it is the only fallibility question asked here.
+/// is what [`TargetProfile::op_is_fallible_under_any_profile`] answers.
+/// (One thing escapes that question: a `Call`, whose shape needs a
+/// [`Signatures`] map `lower_types` does not have. See its arm below -- the
+/// assumption is `prod-codegen`'s own, preserved rather than invented.)
 ///
 /// What is accepted is therefore the whole **total** fragment, not merely the
 /// boolean one: `Nat` subtraction saturates, sized arithmetic wraps, `Nat`
@@ -367,9 +371,10 @@ fn lower_invariant(
     e: &Expr,
     owner: &str,
     fields: &[(String, Type)],
+    decls: &[TypeDecl],
     policy: &NamePolicy,
 ) -> Result<TExpr, LowerError> {
-    let sub = |x: &Expr| lower_invariant(x, owner, fields, policy);
+    let sub = |x: &Expr| lower_invariant(x, owner, fields, decls, policy);
     match e {
         Expr::Nat(n) => Ok(TExpr::Lit(Lit::Nat(*n))),
         Expr::Int(n) => Ok(TExpr::Lit(Lit::Int(*n))),
@@ -430,11 +435,21 @@ fn lower_invariant(
             Ok(TExpr::Call(name.clone(), lowered))
         }
 
-        Expr::Proj(ty, field, value) => Ok(TExpr::Proj(
-            ty.clone(),
-            field.clone(),
-            Box::new(sub(value)?),
-        )),
+        // The same check the body path makes, through the same function.
+        // Passing a projection through unchecked would put `(q).nope` in the
+        // generated `new` -- output that does not compile -- where
+        // `prod-codegen`, whose invariant renderer is built with the module's
+        // type table, reports `UnknownField`.
+        Expr::Proj(ty, field, value) => {
+            let value = sub(value)?;
+            check_projected_field(decls, ty, field)?;
+            Ok(TExpr::Proj(ty.clone(), field.clone(), Box::new(value)))
+        }
+
+        // An invariant has no parameters -- it is a predicate over fields --
+        // so every parameter index is out of bounds. `prod-codegen` builds its
+        // invariant renderer with `params: &[]` and reports exactly this.
+        Expr::Param(index) => Err(LowerError::ParamOutOfBounds(*index)),
 
         other => Err(LowerError::NotYetLowered(format!(
             "{} in `{}`'s invariant",
@@ -524,6 +539,34 @@ fn type_kind(ty: &Type) -> Option<NumKind> {
         Type::Int => Some(NumKind::Int),
         Type::UInt(k) => Some(*k),
         _ => None,
+    }
+}
+
+/// A projection must name a field its declared type actually has.
+///
+/// One implementation, called from both the definition-body path and the
+/// invariant path. They diverged once -- the invariant path passed
+/// projections through unchecked and emitted `(q).nope` -- so the check lives
+/// in one place where a future caller inherits it rather than having to
+/// remember it.
+///
+/// A type this module does not declare is not checked, because there is
+/// nothing to check it against; that is `prod-codegen`'s behaviour too.
+fn check_projected_field(decls: &[TypeDecl], ty: &str, field: &str) -> Result<(), LowerError> {
+    let Some(decl) = decls.iter().find(|d| d.name == *ty) else {
+        return Ok(());
+    };
+    let declared = decl
+        .ctors
+        .iter()
+        .any(|c| c.fields.iter().any(|(name, _)| name == field));
+    if declared {
+        Ok(())
+    } else {
+        Err(LowerError::UnknownField(
+            String::from(ty),
+            String::from(field),
+        ))
     }
 }
 
@@ -777,15 +820,7 @@ impl<'a> Lowering<'a> {
 
             Expr::Proj(ty, field, value) => {
                 let value = self.expr(value, stmts)?;
-                if let Some(decl) = self.decls.iter().find(|d| d.name == *ty) {
-                    let declared = decl
-                        .ctors
-                        .iter()
-                        .any(|c| c.fields.iter().any(|(name, _)| name == field));
-                    if !declared {
-                        return Err(LowerError::UnknownField(ty.clone(), field.clone()));
-                    }
-                }
+                check_projected_field(self.decls, ty, field)?;
                 Ok(TExpr::Proj(ty.clone(), field.clone(), Box::new(value)))
             }
 
@@ -2295,6 +2330,74 @@ mod tests {
             Err(LowerError::UnsupportedFieldType(String::from(
                 "`Option.some` takes 2 field(s) but got 1 argument(s)"
             ))),
+        );
+    }
+
+    /// An invariant projecting a field its type does not declare.
+    ///
+    /// This regressed once. Widening the accepted fragment to admit `Proj`
+    /// dropped the check the body path was already making, and the result was
+    /// worse than the refusal it replaced: `pub fn new(q: crate::Inner) ...
+    /// if (1 <= (q).nope)` is generated output that does not compile, where
+    /// `prod-codegen` -- whose invariant renderer is built with the module's
+    /// type table -- reports `UnknownField`. Both paths now call one function.
+    #[test]
+    fn an_invariant_projecting_an_undeclared_field_is_rejected() {
+        let module = parse(
+            r#"
+(module M (type "M.Inner" (ctor "M.Inner.mk" (x Nat)))
+          (type "M.S" (ctor "M.S.mk" (q (named "M.Inner")))
+            (invariant (le 1 (proj "M.Inner" "nope" q)))))
+"#,
+        );
+        assert_eq!(
+            lower_types(&module, &crate::names::NamePolicy::RUST).err(),
+            Some(LowerError::UnknownField(
+                String::from("M.Inner"),
+                String::from("nope")
+            )),
+        );
+    }
+
+    /// The other half of the check above: a projection naming a field that
+    /// DOES exist still lowers. Without this, the rejection could be satisfied
+    /// by refusing every projection, which is the regression it replaced.
+    #[test]
+    fn an_invariant_projecting_a_declared_field_still_lowers() {
+        let module = parse(
+            r#"
+(module M (type "M.Inner" (ctor "M.Inner.mk" (x Nat)))
+          (type "M.S" (ctor "M.S.mk" (q (named "M.Inner")))
+            (invariant (le 1 (proj "M.Inner" "x" q)))))
+"#,
+        );
+        let types = lower_types(&module, &crate::names::NamePolicy::RUST)
+            .expect("a declared field projects fine");
+        let s = types.iter().find(|t| t.lean_name == "M.S").expect("M.S");
+        let invariant = s.invariant.as_ref().expect("an invariant");
+        assert!(
+            matches!(
+                invariant,
+                TExpr::BinOp(_, BinOp::Le, _, rhs) if matches!(&**rhs, TExpr::Proj(ty, field, _)
+                    if ty == "M.Inner" && field == "x")
+            ),
+            "got {:?}",
+            invariant
+        );
+    }
+
+    /// An invariant is a predicate over fields, so it has no parameters and
+    /// every `(param n)` in one is out of bounds. `prod-codegen` builds its
+    /// invariant renderer with `params: &[]` and reports exactly this, so the
+    /// rejection keeps its name rather than degrading to `NotYetLowered`.
+    #[test]
+    fn a_parameter_reference_inside_an_invariant_is_out_of_bounds() {
+        let module = parse(
+            r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat)) (invariant (le 1 (param 0)))))"#,
+        );
+        assert_eq!(
+            lower_types(&module, &crate::names::NamePolicy::RUST).err(),
+            Some(LowerError::ParamOutOfBounds(0)),
         );
     }
 }

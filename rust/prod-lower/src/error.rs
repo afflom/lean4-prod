@@ -39,8 +39,11 @@ pub enum LowerError {
     /// name because `prod-codegen` gave them one: a field type that would need
     /// owned storage; a type that carries an invariant and has more than one
     /// constructor, which cannot get the checked constructor an invariant
-    /// requires, since a `Prop` field belongs to exactly one constructor; and
-    /// an arity disagreement between a constructor's declaration and its use.
+    /// requires, since a `Prop` field belongs to exactly one constructor; an
+    /// arity disagreement between a constructor's declaration and its use; and
+    /// an invariant containing an operation that can fail, which would leave
+    /// the checked constructor reporting the operation's failure rather than
+    /// the invariant it was checking.
     UnsupportedFieldType(String),
     /// Two Lean types share a last name component, so they would collide.
     DuplicateTypeName(String),

@@ -181,7 +181,7 @@ fn lower_type_decl(
                         ));
                     }
                 }
-                Some(lower_invariant(predicate, &fields, policy)?)
+                Some(lower_invariant(predicate, &decl.name, &fields, policy)?)
             }
         };
 
@@ -326,11 +326,34 @@ fn check_representable(ty: &Type) -> Result<(), LowerError> {
 ///
 /// Deliberately **not** [`Lowering::expr`]. That one needs a
 /// [`TargetProfile`] to decide what can fail, and `lower_types` has none --
-/// which is the right shape, because a predicate that can fail has nowhere to
-/// put the failure. It guards the checked constructor, so it has to be a
-/// single total expression in every target, not a statement list. Anything
-/// outside the boolean fragment is [`LowerError::NotYetLowered`] rather than
-/// silently hoisted into a statement no printer would have a place for.
+/// which is the right shape rather than an inconvenience. `lower_types`
+/// produces one [`TypeDef`] that *every* backend prints, so the predicate in
+/// it has to be a single total expression under every profile at once. That
+/// is what [`TargetProfile::op_is_fallible_under_any_profile`] answers, and
+/// it is the only fallibility question asked here.
+///
+/// What is accepted is therefore the whole **total** fragment, not merely the
+/// boolean one: `Nat` subtraction saturates, sized arithmetic wraps, `Nat`
+/// shift-right truncates, and unsigned division is total -- all of which
+/// `prod-codegen` renders inside a checked constructor today, as a single
+/// expression with no `?` in it. Refusing them would narrow the published
+/// subset for a shape (`1 <= q - T`) that is entirely plausible in a
+/// Lean-proved structure.
+///
+/// What is refused, and this is a **deliberate divergence** from
+/// `prod-codegen` rather than a deferral:
+///
+/// * An operation that can fail. `prod-codegen` does render it -- `new`
+///   returns a `Result`, so `checked_mul(..)?` compiles -- but the result is a
+///   checked constructor that reports `MulOverflow` when the thing that
+///   actually failed was the invariant it was checking. Refusing to generate
+///   the type is the better answer, and it gets a named rejection saying so.
+/// * A node with no total-expression form in the Target IR at all: `If`,
+///   `Let` and `Match` are statements here, and `Convert` has no `TExpr` node
+///   yet. Those stay [`LowerError::NotYetLowered`], which is what they are.
+/// * `Expr::Ctor`, until `prod-emit-rust` can print a [`TExpr::Ctor`]. Passing
+///   it through would put a `compile_error!` in generated output, which is
+///   strictly worse than a rejection.
 ///
 /// Field references resolve to the *target* field identifiers, so the
 /// predicate reads the same names the fields and the constructor parameters
@@ -342,54 +365,135 @@ fn check_representable(ty: &Type) -> Result<(), LowerError> {
 /// still returns a `bool`, and rejects precisely the inputs it should accept.
 fn lower_invariant(
     e: &Expr,
+    owner: &str,
     fields: &[(String, Type)],
     policy: &NamePolicy,
 ) -> Result<TExpr, LowerError> {
-    let compare = |op: BinOp, a: &Expr, b: &Expr| -> Result<TExpr, LowerError> {
-        let a = lower_invariant(a, fields, policy)?;
-        let b = lower_invariant(b, fields, policy)?;
-        let kind = compare_kind(&a, &b, fields);
-        Ok(TExpr::BinOp(kind, op, Box::new(a), Box::new(b)))
-    };
+    let sub = |x: &Expr| lower_invariant(x, owner, fields, policy);
     match e {
         Expr::Nat(n) => Ok(TExpr::Lit(Lit::Nat(*n))),
         Expr::Int(n) => Ok(TExpr::Lit(Lit::Int(*n))),
         Expr::Bool(b) => Ok(TExpr::Lit(Lit::Bool(*b))),
         Expr::Var(name) => Ok(TExpr::Var(policy.apply(name))),
-        Expr::Eq(a, b) => compare(BinOp::Eq, a, b),
-        Expr::Lt(a, b) => compare(BinOp::Lt, a, b),
-        Expr::Le(a, b) => compare(BinOp::Le, a, b),
-        Expr::Gt(a, b) => compare(BinOp::Gt, a, b),
-        Expr::And(a, b) => Ok(TExpr::And(
-            Box::new(lower_invariant(a, fields, policy)?),
-            Box::new(lower_invariant(b, fields, policy)?),
+
+        Expr::Eq(a, b) => compare(BinOp::Eq, sub(a)?, sub(b)?, fields),
+        Expr::Lt(a, b) => compare(BinOp::Lt, sub(a)?, sub(b)?, fields),
+        Expr::Le(a, b) => compare(BinOp::Le, sub(a)?, sub(b)?, fields),
+        Expr::Gt(a, b) => compare(BinOp::Gt, sub(a)?, sub(b)?, fields),
+
+        Expr::And(a, b) => Ok(TExpr::And(Box::new(sub(a)?), Box::new(sub(b)?))),
+        Expr::Or(a, b) => Ok(TExpr::Or(Box::new(sub(a)?), Box::new(sub(b)?))),
+        Expr::Not(a) => Ok(TExpr::Not(Box::new(sub(a)?))),
+
+        Expr::Add(k, a, b) => invariant_arith(e, owner, *k, BinOp::Add, sub(a)?, sub(b)?),
+        Expr::Sub(k, a, b) => invariant_arith(e, owner, *k, BinOp::Sub, sub(a)?, sub(b)?),
+        Expr::Mul(k, a, b) => invariant_arith(e, owner, *k, BinOp::Mul, sub(a)?, sub(b)?),
+        // `Nat` and the sized kinds are unsigned, where truncating, flooring
+        // and Euclidean division coincide, so no host needs a correction and
+        // the operator is the same for every profile. `Int` division is
+        // fallible under every profile and is rejected below before the
+        // question of which operator arises.
+        Expr::Div(k, a, b) => invariant_arith(e, owner, *k, BinOp::Div, sub(a)?, sub(b)?),
+        Expr::Mod(k, a, b) => invariant_arith(e, owner, *k, BinOp::Mod, sub(a)?, sub(b)?),
+        Expr::Shl(k, a, b) => {
+            reject_int_shift(*k)?;
+            invariant_arith(e, owner, *k, BinOp::Shl, sub(a)?, sub(b)?)
+        }
+        Expr::Shr(k, a, b) => {
+            reject_int_shift(*k)?;
+            invariant_arith(e, owner, *k, BinOp::Shr, sub(a)?, sub(b)?)
+        }
+        Expr::Pow(k, a, b) => {
+            reject_sized_pow(*k)?;
+            invariant_arith(e, owner, *k, BinOp::Pow, sub(a)?, sub(b)?)
+        }
+        Expr::Neg(k, a) => {
+            reject_non_int_neg(*k)?;
+            let _ = sub(a)?;
+            // `Int` negation is fallible under every profile, so this is
+            // always the rejection; it is spelled through the same helper so
+            // there is one message for "an invariant may not fail".
+            Err(invariant_can_fail(owner, e))
+        }
+
+        // A call with no [`Signatures`] to consult, exactly as
+        // `generate_type_decl` renders one: it builds its `Renderer` with an
+        // empty signature map, so an invariant's callee is assumed total and
+        // gets no `?`. The assumption is preserved rather than fixed here --
+        // fixing it means giving `lower_types` the module's signatures, which
+        // is a signature change this task does not own.
+        Expr::Call(name, args) => {
+            let mut lowered = Vec::with_capacity(args.len());
+            for arg in args {
+                lowered.push(sub(arg)?);
+            }
+            Ok(TExpr::Call(name.clone(), lowered))
+        }
+
+        Expr::Proj(ty, field, value) => Ok(TExpr::Proj(
+            ty.clone(),
+            field.clone(),
+            Box::new(sub(value)?),
         )),
-        Expr::Or(a, b) => Ok(TExpr::Or(
-            Box::new(lower_invariant(a, fields, policy)?),
-            Box::new(lower_invariant(b, fields, policy)?),
-        )),
-        Expr::Not(a) => Ok(TExpr::Not(Box::new(lower_invariant(a, fields, policy)?))),
+
         other => Err(LowerError::NotYetLowered(format!(
-            "{} in an invariant",
-            node_name(other)
+            "{} in `{}`'s invariant",
+            node_name(other),
+            owner
         ))),
     }
 }
 
+/// One arithmetic node inside an invariant: total, or a named rejection.
+fn invariant_arith(
+    node: &Expr,
+    owner: &str,
+    kind: NumKind,
+    op: BinOp,
+    a: TExpr,
+    b: TExpr,
+) -> Result<TExpr, LowerError> {
+    if TargetProfile::op_is_fallible_under_any_profile(node) {
+        return Err(invariant_can_fail(owner, node));
+    }
+    Ok(TExpr::BinOp(kind, op, Box::new(a), Box::new(b)))
+}
+
+/// The rejection for an invariant that contains a failing operation.
+///
+/// `prod-codegen` renders this rather than refusing it, and the divergence is
+/// deliberate: the generated `new` would report the *arithmetic's* error --
+/// `MulOverflow` -- for a caller whose actual mistake was violating the
+/// invariant. A checked constructor that misattributes its own failure is
+/// worse than a type that is not generated at all.
+fn invariant_can_fail(owner: &str, node: &Expr) -> LowerError {
+    LowerError::UnsupportedFieldType(format!(
+        "`{}`: an invariant may not contain an operation that can fail, and `{}` can; \
+         the checked constructor would report that failure instead of the invariant \
+         it was checking",
+        owner,
+        node_name(node)
+    ))
+}
+
+/// A comparison over two lowered operands, at the kind its operands are read
+/// at.
+fn compare(op: BinOp, a: TExpr, b: TExpr, fields: &[(String, Type)]) -> Result<TExpr, LowerError> {
+    let kind = compare_kind(&a, &b, fields);
+    Ok(TExpr::BinOp(kind, op, Box::new(a), Box::new(b)))
+}
+
 /// The numeric kind a comparison's operands are read at.
 ///
-/// A field reference settles it, because a field has a declared type; a bare
-/// literal does not, so it is only consulted when neither side names a field.
-/// `le 1 used` over a `UInt8` field is a `UInt8` comparison, not a `Nat` one,
-/// even though the literal on the left says nothing.
+/// An operand with a kind of its own settles it: a field reference has a
+/// declared type, and an arithmetic node carries its kind. A bare literal does
+/// not, so it is consulted only when neither side is more specific. `le 1 used`
+/// over a `UInt8` field is a `UInt8` comparison, not a `Nat` one, even though
+/// the literal on the left says nothing.
 fn compare_kind(a: &TExpr, b: &TExpr, fields: &[(String, Type)]) -> NumKind {
     for operand in [a, b] {
-        if let TExpr::Var(name) = operand {
-            if let Some((_, ty)) = fields.iter().find(|(f, _)| f == name) {
-                if let Some(kind) = type_kind(ty) {
-                    return kind;
-                }
-            }
+        if let Some(kind) = operand_kind(operand, fields) {
+            return kind;
         }
     }
     for operand in [a, b] {
@@ -398,6 +502,20 @@ fn compare_kind(a: &TExpr, b: &TExpr, fields: &[(String, Type)]) -> NumKind {
         }
     }
     NumKind::Nat
+}
+
+fn operand_kind(e: &TExpr, fields: &[(String, Type)]) -> Option<NumKind> {
+    match e {
+        TExpr::Var(name) => fields
+            .iter()
+            .find(|(f, _)| f == name)
+            .and_then(|(_, ty)| type_kind(ty)),
+        TExpr::BinOp(kind, op, ..) => match op {
+            BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt => None,
+            _ => Some(*kind),
+        },
+        _ => None,
+    }
 }
 
 fn type_kind(ty: &Type) -> Option<NumKind> {
@@ -549,21 +667,11 @@ impl<'a> Lowering<'a> {
             // compute a different number, and `pow` has no absorbing
             // out-of-range case the way a shift does.
             Expr::Pow(k, a, b) => {
-                if !matches!(k, NumKind::Nat | NumKind::Int) {
-                    return Err(LowerError::UnsupportedKind(format!(
-                        "pow is not supported for sized kind {:?} (unsound u32 exponent narrowing)",
-                        k
-                    )));
-                }
+                reject_sized_pow(*k)?;
                 self.arith(e, *k, BinOp::Pow, a, b, stmts)
             }
             Expr::Neg(k, a) => {
-                if *k != NumKind::Int {
-                    return Err(LowerError::UnsupportedKind(format!(
-                        "unary negation is only supported for Int, not {:?}",
-                        k
-                    )));
-                }
+                reject_non_int_neg(*k)?;
                 let value = self.expr(a, stmts)?;
                 if self.profile.op_is_fallible(e) {
                     Ok(self.bind_fallible(Type::Int, FallibleOp::Neg(*k, value), stmts))
@@ -1061,6 +1169,29 @@ fn reject_int_shift(kind: NumKind) -> Result<(), LowerError> {
     if kind == NumKind::Int {
         return Err(LowerError::UnsupportedKind(String::from(
             "shifts are not supported for Int",
+        )));
+    }
+    Ok(())
+}
+
+/// Sized `pow` is rejected, not rendered: narrowing a `u64` exponent to the
+/// `u32` that `wrapping_pow` takes would silently compute a different number,
+/// and `pow` has no absorbing out-of-range case the way a shift does.
+fn reject_sized_pow(kind: NumKind) -> Result<(), LowerError> {
+    if !matches!(kind, NumKind::Nat | NumKind::Int) {
+        return Err(LowerError::UnsupportedKind(format!(
+            "pow is not supported for sized kind {:?} (unsound u32 exponent narrowing)",
+            kind
+        )));
+    }
+    Ok(())
+}
+
+fn reject_non_int_neg(kind: NumKind) -> Result<(), LowerError> {
+    if kind != NumKind::Int {
+        return Err(LowerError::UnsupportedKind(format!(
+            "unary negation is only supported for Int, not {:?}",
+            kind
         )));
     }
     Ok(())
@@ -2033,5 +2164,137 @@ mod tests {
                 ir
             );
         }
+    }
+
+    /// The total arithmetic an invariant may contain.
+    ///
+    /// `Nat` subtraction saturates, so `1 <= q - T` is a single total
+    /// expression and `prod-codegen` renders it today. Refusing it would
+    /// narrow the published subset for a shape that is entirely plausible in a
+    /// Lean-proved structure, so the accepted fragment is the whole total one,
+    /// not merely the boolean one.
+    #[test]
+    fn an_invariant_may_contain_arithmetic_that_cannot_fail() {
+        let module = parse(
+            r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat) (T Nat) (a U8) (b U8))
+                 (invariant (and (le 1 (sub Nat q T)) (le (add U8 a b) 200)))))"#,
+        );
+        let types = lower_types(&module, &crate::names::NamePolicy::RUST)
+            .expect("saturating subtraction and wrapping sized addition are total");
+        let invariant = types[0].invariant.as_ref().expect("an invariant");
+        // `Nat.sub` saturates and `UInt8.add` wraps; neither is a `TryLet`
+        // anywhere, so both stay inside the one expression.
+        assert!(
+            matches!(
+                invariant,
+                TExpr::And(a, b)
+                    if matches!(&**a, TExpr::BinOp(NumKind::Nat, BinOp::Le, ..))
+                    && matches!(&**b, TExpr::BinOp(NumKind::U8, BinOp::Le, ..))
+            ),
+            "got {:?}",
+            invariant
+        );
+    }
+
+    /// The half of `prod-codegen`'s invariant fragment this lowering
+    /// deliberately does NOT keep.
+    ///
+    /// `prod-codegen` renders `q * T <= 100` -- `new` returns a `Result`, so
+    /// the `?` on `checked_mul` compiles. The result is a checked constructor
+    /// that reports `MulOverflow` to a caller whose actual mistake was
+    /// violating the invariant. Refusing to generate the type is the better
+    /// answer, and it has to be a named rejection rather than
+    /// `NotYetLowered`, because nothing later is going to lower it.
+    #[test]
+    fn an_invariant_containing_a_failing_operation_is_rejected_by_name() {
+        for (ir, node) in [
+            (
+                r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat) (T Nat)) (invariant (le (mul Nat q T) 100))))"#,
+                "Mul",
+            ),
+            (
+                r#"(module M (type "M.S" (ctor "M.S.mk" (q Int) (T Int)) (invariant (le (sub Int q T) 100))))"#,
+                "Sub",
+            ),
+            (
+                r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat) (T Nat)) (invariant (le (shl Nat q T) 100))))"#,
+                "Shl",
+            ),
+        ] {
+            let module = parse(ir);
+            assert_eq!(
+                lower_types(&module, &crate::names::NamePolicy::RUST).err(),
+                Some(LowerError::UnsupportedFieldType(format!(
+                    "`M.S`: an invariant may not contain an operation that can fail, and `{}` can; \
+                     the checked constructor would report that failure instead of the invariant \
+                     it was checking",
+                    node
+                ))),
+                "for {}",
+                ir
+            );
+        }
+    }
+
+    /// A deliberate divergence, pinned here because it lands at the Task 7
+    /// cutover and a session report is not in the repo.
+    ///
+    /// `prod-codegen` matches an alternative's `(constructor, arity)` against
+    /// its builtin table *before* consulting the declaration, so a module that
+    /// declares its own constructor literally named `Nat.succ` gets LCNF's
+    /// predecessor rendering regardless of how many fields it declares. The
+    /// arity check here consults the declaration unconditionally and rejects.
+    /// The rejection is the more correct answer -- the alternative binds one
+    /// name for a two-field constructor -- but it is a behaviour change.
+    #[test]
+    fn a_declared_constructor_shadowing_a_builtin_name_is_still_arity_checked() {
+        let module = parse(r#"(module M (type "M.Odd" (ctor "Nat.succ" (a Nat) (b Nat))))"#);
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![(String::from("x"), Type::Named(String::from("M.Odd")))],
+            ret: Type::Nat,
+            body: Expr::Match {
+                scrut: Box::new(Expr::Var(String::from("x"))),
+                alts: vec![prod_ir::Alt {
+                    ctor: String::from("Nat.succ"),
+                    binders: vec![String::from("k")],
+                    body: Expr::Var(String::from("k")),
+                }],
+                default: Some(Box::new(Expr::Nat(0))),
+            },
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        assert_eq!(
+            lower_def_in(&defs[0], &shapes, &TargetProfile::RUST, &module.types),
+            Err(LowerError::UnsupportedFieldType(String::from(
+                "`Nat.succ` takes 2 field(s) but got 1 binder(s)"
+            ))),
+        );
+    }
+
+    /// The construction-side twin of the divergence above.
+    ///
+    /// `prod-codegen` renders `Option.some` with one argument as `Some(x)`
+    /// before it ever looks the constructor up, so a module declaring its own
+    /// two-field `Option.some` silently gets the builtin spelling. Here the
+    /// declaration is consulted first and the arity disagreement is named.
+    #[test]
+    fn a_declared_constructor_shadowing_a_builtin_name_is_arity_checked_on_construction() {
+        let module = parse(r#"(module M (type "M.Maybe" (ctor "Option.some" (a Nat) (b Nat))))"#);
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![],
+            ret: Type::Named(String::from("M.Maybe")),
+            body: Expr::Ctor(String::from("Option.some"), vec![Expr::Nat(1)]),
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        assert_eq!(
+            lower_def_in(&defs[0], &shapes, &TargetProfile::RUST, &module.types),
+            Err(LowerError::UnsupportedFieldType(String::from(
+                "`Option.some` takes 2 field(s) but got 1 argument(s)"
+            ))),
+        );
     }
 }

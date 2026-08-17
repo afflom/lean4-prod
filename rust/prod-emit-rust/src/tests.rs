@@ -639,3 +639,33 @@ fn a_projection_renders_as_field_access() {
     let out = emit_body(&body);
     assert!(out.contains("(p).a"), "got: {}", out);
 }
+
+/// An invariant is not restricted to comparisons: `Nat.sub` saturates, so
+/// `1 <= q - T` is a single total expression, and it must render exactly as
+/// `prod-codegen` renders it -- `saturating_sub`, no `?`, no temporary.
+///
+/// The strings are pinned rather than paraphrased because narrowing what an
+/// invariant may contain narrows the published subset, and a comparison of
+/// two field expressions is entirely plausible in a Lean-proved structure.
+#[test]
+fn an_invariant_may_contain_total_arithmetic_and_renders_it_inline() {
+    let ir = r#"
+(module M
+  (type "M.S" (ctor "M.S.mk" (q Nat) (T Nat) (a U8) (b U8))
+    (invariant (and (le 1 (sub Nat q T)) (le (add U8 a b) 200))))
+)
+"#;
+    let module = prod_ir::parser::parse_module(ir).expect("parses").1;
+    let out = emit_types(&lower_types(&module, &NamePolicy::RUST).expect("lowers"));
+    assert!(
+        out.contains(
+            "if ((1 <= ((q) as u64).saturating_sub(T)) && (((a) as u8).wrapping_add(b) <= 200))"
+        ),
+        "got: {}",
+        out
+    );
+    // A saturating subtraction and a wrapping addition cannot fail, so nothing
+    // was hoisted: no `?` and no `checked_` anywhere in the constructor.
+    assert!(!out.contains('?'), "got: {}", out);
+    assert!(!out.contains("checked_"), "got: {}", out);
+}

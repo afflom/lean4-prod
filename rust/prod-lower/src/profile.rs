@@ -88,6 +88,29 @@ impl TargetProfile {
             _ => false,
         }
     }
+
+    /// Does this operation report failure under **any** profile?
+    ///
+    /// Read where a construct has to be total for every backend at once rather
+    /// than for one chosen backend. A structure's invariant is the case:
+    /// [`crate::lower::lower_types`] takes no profile, so the single lowered
+    /// predicate it produces is printed by all of them, and an operation only
+    /// *some* profile can hoist into a statement has no place in it.
+    ///
+    /// [`TargetProfile::op_is_fallible`] reads exactly one field, `nat_repr`,
+    /// and `Bounded64` is the stricter of its two answers, so the union over
+    /// every profile is the answer a bounded-`Nat` profile gives. The other
+    /// fields are set to something, because a `TargetProfile` is a whole
+    /// value; nothing here reads them.
+    pub fn op_is_fallible_under_any_profile(expr: &Expr) -> bool {
+        const STRICTEST: TargetProfile = TargetProfile {
+            nat_repr: NatRepr::Bounded64,
+            list_strategy: ListStrategy::CallerBuffer,
+            sized_mask_required: false,
+            host_division: DivisionSemantics::Euclidean,
+        };
+        STRICTEST.op_is_fallible(expr)
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +162,55 @@ mod tests {
         );
         assert!(!TargetProfile::RUST.op_is_fallible(&e));
         assert!(!TargetProfile::PYTHON.op_is_fallible(&e));
+    }
+
+    /// The union that `op_is_fallible_under_any_profile` claims to be.
+    ///
+    /// It is consulted where a construct must be total for every backend at
+    /// once -- a structure's invariant -- so if it ever disagreed with the
+    /// actual union over the declared profiles it would either admit an
+    /// operation some backend cannot render, or refuse one every backend can.
+    #[test]
+    fn fallible_under_any_profile_is_the_union_over_the_declared_profiles() {
+        let a = || Box::new(Expr::Var(String::from("a")));
+        let b = || Box::new(Expr::Var(String::from("b")));
+        let nodes = [
+            // Fallible under Rust's bounded `Nat`, total under an exact one.
+            Expr::Add(NumKind::Nat, a(), b()),
+            Expr::Mul(NumKind::Nat, a(), b()),
+            Expr::Pow(NumKind::Nat, a(), b()),
+            // Fallible everywhere.
+            Expr::Add(NumKind::Int, a(), b()),
+            Expr::Sub(NumKind::Int, a(), b()),
+            Expr::Div(NumKind::Int, a(), b()),
+            Expr::Shl(NumKind::Nat, a(), b()),
+            Expr::Neg(NumKind::Int, a()),
+            // Total everywhere: the fragment an invariant may contain.
+            Expr::Sub(NumKind::Nat, a(), b()),
+            Expr::Div(NumKind::Nat, a(), b()),
+            Expr::Mod(NumKind::Nat, a(), b()),
+            Expr::Shr(NumKind::Nat, a(), b()),
+            Expr::Add(NumKind::U8, a(), b()),
+            Expr::Mul(NumKind::U8, a(), b()),
+            Expr::Shl(NumKind::U8, a(), b()),
+        ];
+        for node in &nodes {
+            let union = TargetProfile::RUST.op_is_fallible(node)
+                || TargetProfile::PYTHON.op_is_fallible(node);
+            assert_eq!(
+                TargetProfile::op_is_fallible_under_any_profile(node),
+                union,
+                "for {:?}",
+                node
+            );
+        }
+        // Not vacuous: the set is neither all-true nor all-false.
+        assert!(nodes
+            .iter()
+            .any(TargetProfile::op_is_fallible_under_any_profile));
+        assert!(!nodes
+            .iter()
+            .all(TargetProfile::op_is_fallible_under_any_profile));
     }
 
     #[test]

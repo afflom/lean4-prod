@@ -191,6 +191,7 @@ name = "prod-codegen"
 version = "0.1.0"
 dependencies = [
  "prod-ir",
+ "prod-lower",
 ]
 
 [[package]]
@@ -218,6 +219,13 @@ version = "0.1.0"
 dependencies = [
  "nom",
  "serde",
+]
+
+[[package]]
+name = "prod-lower"
+version = "0.1.0"
+dependencies = [
+ "prod-ir",
 ]
 
 [[package]]

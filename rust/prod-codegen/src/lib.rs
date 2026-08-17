@@ -111,6 +111,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, NumKind, Type, TypeDecl};
+use prod_lower::profile::TargetProfile;
+pub use prod_lower::shape::Shape;
+use prod_lower::shape::{signatures, Signatures};
 
 /// Errors that can occur during code generation
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,25 +282,6 @@ pub const REJECTIONS: &[(&str, &str)] = &[
         "a field of a structure whose invariant is enforced is named `new`, which the generated checked constructor already uses; the field's accessor would collide with it. Structures with no enforced invariant get neither, so the name is only reserved where the constructor exists",
     ),
 ];
-
-/// How a generated definition presents itself to its callers.
-///
-/// Computed for the whole module up front, because a call site cannot know
-/// whether to append `?` until the callee's shape is known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Shape {
-    /// Plain value: `fn f(..) -> T`.
-    Value,
-    /// Fallible: `fn f(..) -> Result<T, ComputeError>`; call sites append `?`.
-    Fallible,
-    /// List builder: `fn f(.., output: &mut [E]) -> Result<usize, ComputeError>`.
-    Buffer,
-    /// Zero-argument list golden: `fn f() -> &'static [E]`.
-    StaticList,
-}
-
-/// Definition name → [`Shape`], for one module.
-type Signatures<'m> = BTreeMap<&'m str, Shape>;
 
 /// Rust keywords that a Lean field or constructor name may legitimately be.
 /// Escaped with the raw-identifier prefix rather than renamed, so the Rust
@@ -550,7 +534,7 @@ fn check_field_type(ty: &Type, owner: &str, field: &str, table: &TypeTable) -> R
 /// Render a whole module: one `pub fn` per definition.
 pub fn generate_module(module: &Module) -> Result<String, Error> {
     let table = type_table(&module.types)?;
-    let shapes = signatures(&module.definitions);
+    let shapes = signatures(&module.definitions, &TargetProfile::RUST);
     let mut out = String::new();
     for decl in &module.types {
         out.push_str(&generate_type_decl(decl, &table)?);
@@ -572,67 +556,7 @@ pub fn generate_module(module: &Module) -> Result<String, Error> {
 pub fn generate_def(def: &Definition) -> Result<String, Error> {
     let one = core::slice::from_ref(def);
     let table: TypeTable = BTreeMap::new();
-    generate_def_in(def, &signatures(one), &table)
-}
-
-/// Compute every definition's [`Shape`] as a least fixpoint over the call
-/// graph: seed everything infallible, then promote until nothing changes.
-/// Monotone (shapes only ever move `Value` → `Fallible`), so it terminates.
-fn signatures<'m>(defs: &'m [Definition]) -> Signatures<'m> {
-    let mut shapes: Signatures<'m> = defs
-        .iter()
-        .map(|def| {
-            let shape = match &def.ret {
-                Type::List(_) if def.params.is_empty() => Shape::StaticList,
-                Type::List(_) => Shape::Buffer,
-                _ => Shape::Value,
-            };
-            (def.name.as_str(), shape)
-        })
-        .collect();
-
-    loop {
-        let mut changed = false;
-        for def in defs {
-            if shapes.get(def.name.as_str()) != Some(&Shape::Value) {
-                continue;
-            }
-            if is_fallible(&def.body, &shapes) {
-                shapes.insert(def.name.as_str(), Shape::Fallible);
-                changed = true;
-            }
-        }
-        if !changed {
-            return shapes;
-        }
-    }
-}
-
-/// Does this operation report failure? Kind-dependent: `Nat` and `Int` are
-/// checked, sized integers wrap and are total, and `Nat` subtraction
-/// saturates rather than failing.
-fn op_is_fallible(expr: &Expr) -> bool {
-    use prod_ir::NumKind::{Int, Nat};
-    match expr {
-        Expr::Add(k, ..) | Expr::Mul(k, ..) | Expr::Pow(k, ..) => matches!(k, Nat | Int),
-        Expr::Sub(k, ..) | Expr::Div(k, ..) | Expr::Mod(k, ..) => *k == Int,
-        Expr::Neg(k, _) => *k == Int,
-        Expr::Shl(k, ..) => *k == Nat,
-        _ => false,
-    }
-}
-
-/// Does this expression perform, or reach, an operation that can fail?
-fn is_fallible(expr: &Expr, shapes: &Signatures) -> bool {
-    let here = op_is_fallible(expr)
-        || matches!(
-            expr,
-            Expr::Call(name, _) if matches!(
-                shapes.get(name.as_str()),
-                Some(Shape::Fallible) | Some(Shape::Buffer)
-            )
-        );
-    here || expr.children().any(|child| is_fallible(child, shapes))
+    generate_def_in(def, &signatures(one, &TargetProfile::RUST), &table)
 }
 
 fn generate_def_in<'m>(
@@ -663,7 +587,7 @@ fn generate_def_in<'m>(
     match shape {
         Shape::StaticList => {
             let elem = list_element(&def.ret)?;
-            if is_fallible(&def.body, shapes) {
+            if prod_lower::shape::is_fallible(&def.body, shapes, &TargetProfile::RUST) {
                 return Err(Error::UnsupportedList(format!(
                     "`{}` computes its list elements, so it cannot be a promoted &'static slice",
                     def.name

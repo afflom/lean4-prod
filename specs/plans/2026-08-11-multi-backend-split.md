@@ -974,6 +974,10 @@ Port `generate_type_decl` from `prod-codegen`, splitting it along the seam: the 
 
 Keep every existing rejection with identical wording — `ReservedFieldName`, `PolymorphicType`, `RecursiveType`, `OpaqueType`, `UnsupportedFieldType`, `UnknownField`, `DuplicateTypeName`. `REJECTIONS` and the published contract pin them, and this is a refactor.
 
+**Restore the constructor-arity rejection, which Task 4 had to drop.** `prod-codegen`'s `generate_type_decl` region rejects a match alternative whose binder count differs from the constructor's declared field count, with `Error::UnsupportedFieldType`. Task 4's `arm_pattern` has no type table, so it falls through to the positional pattern and would emit `M.Shape.circle(r, extra)` for a mismatched arity — which does not compile. Task 4 could not keep the check because the type table arrives here, in Task 5.
+
+So: once `lower_types` exists, thread the arity check back in and test it with an alt whose binder count is wrong. A generator that emits non-compiling code for a malformed input is strictly worse than one that names the reason, and this is the task that can tell the difference.
+
 `Expr::Ctor` → `TExpr::Ctor` and `Expr::Proj` → `TExpr::Proj` in `lower_expr`; both are total.
 
 - [ ] **Step 4: Run tests**

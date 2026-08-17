@@ -1100,8 +1100,11 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 ### Task 7: Cutover — `prod-codegen` becomes a facade
 
 **Files:**
+- Modify: `rust/prod-codegen/Cargo.toml` — **add `prod-emit-rust = { path = "../prod-emit-rust" }`**. No earlier task adds this dependency, and `generate_module` below cannot call `prod_emit_rust::*` without it.
 - Modify: `rust/prod-codegen/src/lib.rs` (the large deletion), `rust/prod-codegen/src/tests.rs`
 - Modify: `AGENTS.md`, `specs/designs/2026-08-11-multi-backend-codegen.md`
+
+Note that `prod-wasm` depends on `prod-codegen`, so `prod-emit-rust` joins the wasm32 build transitively. It is `#![no_std]` with `alloc`, so this is fine — but the wasm32 gate is the thing that proves it, not this sentence.
 
 **Interfaces:**
 - Consumes: everything from Tasks 1-6.

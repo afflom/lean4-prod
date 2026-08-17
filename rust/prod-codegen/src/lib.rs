@@ -111,6 +111,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, NumKind, Type, TypeDecl};
+use prod_lower::names::{NameError, NamePolicy, NameTable, RUST_KEYWORDS};
 use prod_lower::profile::TargetProfile;
 pub use prod_lower::shape::Shape;
 use prod_lower::shape::{signatures, Signatures};
@@ -283,18 +284,9 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Rust keywords that a Lean field or constructor name may legitimately be.
-/// Escaped with the raw-identifier prefix rather than renamed, so the Rust
-/// name still matches the Lean name exactly.
-const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
-    "where", "while", "abstract", "become", "box", "do", "final", "macro", "override", "priv",
-    "typeof", "unsized", "virtual", "yield", "try", "gen",
-];
-
 /// A Lean identifier as a Rust identifier, raw-escaped if it is a keyword.
+/// `RUST_KEYWORDS` lives in `prod_lower::names` now, shared with every
+/// backend that wants Rust's own keyword list.
 fn rust_ident(name: &str) -> String {
     if RUST_KEYWORDS.contains(&name) {
         format!("r#{}", name)
@@ -312,18 +304,43 @@ fn last_component(name: &str) -> &str {
 type TypeTable<'m> = BTreeMap<&'m str, &'m TypeDecl>;
 
 fn type_table(types: &[TypeDecl]) -> Result<TypeTable<'_>, Error> {
+    check_type_name_collisions(types)?;
     let mut by_full: TypeTable = BTreeMap::new();
-    let mut short_seen: BTreeMap<&str, &str> = BTreeMap::new();
     for decl in types {
-        let short = last_component(&decl.name);
-        if let Some(previous) = short_seen.insert(short, &decl.name) {
-            if previous != decl.name {
-                return Err(Error::DuplicateTypeName(String::from(short)));
-            }
-        }
         by_full.insert(decl.name.as_str(), decl);
     }
     Ok(by_full)
+}
+
+/// Two Lean types whose last name component collide, once mangled the same
+/// way the generated `struct`/`enum` name is (see `rust_ident`): this is the
+/// one implementation of that check, sourced from `NameTable` rather than
+/// re-deriving it here.
+///
+/// Deliberately scoped to types only, with every type's constructors and
+/// fields stripped before building the table: `NameTable::build` also checks
+/// constructor and field injectivity, but that was never this function's
+/// contract, and folding it in here would reject modules this function used
+/// to accept under a `DuplicateTypeName` message that would be naming the
+/// wrong kind of collision.
+fn check_type_name_collisions(types: &[TypeDecl]) -> Result<(), Error> {
+    let types_only = Module {
+        name: String::new(),
+        types: types
+            .iter()
+            .map(|decl| TypeDecl {
+                name: decl.name.clone(),
+                ctors: Vec::new(),
+                unsupported: None,
+                invariant: None,
+            })
+            .collect(),
+        definitions: Vec::new(),
+    };
+    match NameTable::build(&types_only, &NamePolicy::RUST) {
+        Ok(_) => Ok(()),
+        Err(NameError::Collision { target, .. }) => Err(Error::DuplicateTypeName(target)),
+    }
 }
 
 /// Render one type declaration: a struct if it has exactly one constructor,

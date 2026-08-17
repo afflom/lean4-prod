@@ -7,5 +7,6 @@
 
 extern crate alloc;
 
+pub mod names;
 pub mod profile;
 pub mod shape;

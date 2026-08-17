@@ -10,7 +10,7 @@
 //!
 //! This is the strangler-stage printer. `prod-codegen`'s `Renderer` still
 //! produces every byte of real output; nothing outside this crate's own tests
-//! calls [`emit_body`] until the Task 7 cutover.
+//! calls [`emit_body`] or [`emit_types`] until the Task 7 cutover.
 
 #![no_std]
 
@@ -23,7 +23,9 @@ use alloc::vec::Vec;
 use prod_ir::{NumKind, Type};
 use prod_lower::names::NamePolicy;
 use prod_lower::shape::Shape;
-use prod_lower::target::{Arm, BinOp, Body, ErrorCode, FallibleOp, Lit, Stmt, TExpr};
+use prod_lower::target::{
+    Arm, BinOp, Body, CtorDef, ErrorCode, FallibleOp, Lit, Stmt, TExpr, TypeDef,
+};
 
 /// The Rust type a numeric kind renders as. Also the cast used to pin an
 /// arithmetic receiver's type — LCNF emits let-bound integer literals whose
@@ -41,6 +43,126 @@ pub const fn rust_type(kind: NumKind) -> &'static str {
         NumKind::U32 => "u32",
         NumKind::U64 => "u64",
     }
+}
+
+/// Render a module's lowered type declarations as Rust source.
+///
+/// Returns a `String`, not a `Result`: every question that could be answered
+/// "no" -- is the type representable, is the field name already taken, is
+/// there an invariant, are the fields private -- was answered by
+/// [`prod_lower::lower::lower_types`]. What is left is spelling.
+///
+/// Every generated type is `Copy`, which is what keeps it inside the
+/// allocation-free tier; the lowering only admits types whose every field is a
+/// scalar, a tuple of eligible types, or another eligible generated type.
+pub fn emit_types(types: &[TypeDef]) -> String {
+    let mut out = String::new();
+    for def in types {
+        out.push_str(&emit_type(def));
+        out.push('\n');
+    }
+    out
+}
+
+/// One type: a struct if it has exactly one constructor, otherwise an enum
+/// with named-field variants.
+fn emit_type(def: &TypeDef) -> String {
+    let mut out = String::from("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
+    if let [ctor] = &def.ctors[..] {
+        // How "reachable only from generated code" is spelled. The decision
+        // that it should be is `fields_private`, made in the lowering; Rust's
+        // word for it is `pub(crate)`, and that word belongs here.
+        let vis = if def.fields_private {
+            "pub(crate)"
+        } else {
+            "pub"
+        };
+        out.push_str(&format!("pub struct {} {{\n", def.name));
+        for (name, ty) in &ctor.fields {
+            out.push_str(&format!("    {} {}: {},\n", vis, name, value_type(ty)));
+        }
+        out.push_str("}\n");
+        if let Some(invariant) = &def.invariant {
+            out.push_str(&emit_checked_constructor(def, ctor, invariant));
+        }
+        return out;
+    }
+
+    out.push_str(&format!("pub enum {} {{\n", def.name));
+    for ctor in &def.ctors {
+        if ctor.fields.is_empty() {
+            out.push_str(&format!("    {},\n", ctor.name));
+            continue;
+        }
+        let fields = ctor
+            .fields
+            .iter()
+            .map(|(name, ty)| format!("{}: {}", name, value_type(ty)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("    {} {{ {} }},\n", ctor.name, fields));
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// The checked constructor and the accessors an invariant-carrying structure
+/// gets, in one inherent `impl`.
+///
+/// The invariant's field references are already the target identifiers the
+/// parameters are declared with, so the predicate reads them without any
+/// rebinding.
+fn emit_checked_constructor(def: &TypeDef, ctor: &CtorDef, invariant: &TExpr) -> String {
+    // An empty printer: the invariant is one total expression over the
+    // structure's own fields, with no statement list around it and therefore
+    // no temporary to fold and no `?` to place.
+    let printer = Printer {
+        fallible: false,
+        inline: BTreeMap::new(),
+        uses: BTreeMap::new(),
+    };
+    let predicate = printer.expr(invariant);
+
+    let params = ctor
+        .fields
+        .iter()
+        .map(|(name, ty)| format!("{}: {}", name, value_type(ty)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let inits = ctor
+        .fields
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut out = format!("impl {} {{\n", def.name);
+    out.push_str(&format!(
+        "    /// Re-checks the invariant Lean proved at construction.\n\
+         \x20   ///\n\
+         \x20   /// Generated code does not call this: inside the generated world the\n\
+         \x20   /// proof holds, and re-checking would turn proved-total functions\n\
+         \x20   /// fallible. It exists for callers at the crate boundary, where the\n\
+         \x20   /// proof is not available because it was erased on export.\n\
+         \x20   pub fn new({}) -> Result<Self, crate::ComputeError> {{\n\
+         \x20       if {} {{\n\
+         \x20           Ok({} {{ {} }})\n\
+         \x20       }} else {{\n\
+         \x20           Err(crate::ComputeError::InvariantViolated({:?}))\n\
+         \x20       }}\n\
+         \x20   }}\n",
+        params, predicate, def.name, inits, def.lean_name
+    ));
+    for (name, ty) in &ctor.fields {
+        out.push_str(&format!(
+            "    pub fn {}(&self) -> {} {{ self.{} }}\n",
+            name,
+            value_type(ty),
+            name
+        ));
+    }
+    out.push_str("}\n");
+    out
 }
 
 /// Render one lowered definition as Rust source.
@@ -166,9 +288,14 @@ impl Printer {
     /// slice can render: the `Nat` structural-recursion pair LCNF emits, and
     /// `Bool`/`Option`/`List`, whose Rust patterns are fixed. A user-declared
     /// constructor needs the module's type table to know its path and its
-    /// field names, which arrives in Task 5; until then it renders
-    /// positionally, exactly as `prod-codegen` does for a constructor it
-    /// cannot resolve.
+    /// field names, and that table reaches this printer at the Task 7
+    /// cutover; until then it renders positionally, exactly as `prod-codegen`
+    /// does for a constructor it cannot resolve.
+    ///
+    /// What it can no longer do is render an alternative whose binder count
+    /// disagrees with the declaration: `prod_lower::lower::lower_def_in`
+    /// rejects that before it gets here, so the positional fallthrough is
+    /// reached only by constructors nothing in the module declares.
     fn switch(
         &mut self,
         scrut: &TExpr,
@@ -212,9 +339,18 @@ impl Printer {
             TExpr::Not(a) => format!("(!{})", self.expr(a)),
             TExpr::And(a, b) => format!("({} && {})", self.expr(a), self.expr(b)),
             TExpr::Or(a, b) => format!("({} || {})", self.expr(a), self.expr(b)),
-            // Constructors and projections need the module's type table, which
-            // arrives in Task 5.
-            TExpr::Ctor(..) | TExpr::Proj(..) => unsupported("Ctor/Proj rendering is Task 5"),
+            // A projection needs nothing but the field name, which the
+            // lowering already checked against the declaration -- so there is
+            // nothing here to refuse, only to spell.
+            TExpr::Proj(_, field, value) => format!("({}).{}", self.expr(value), ident(field)),
+            // A constructor application does need the module's type table: a
+            // Rust struct literal names its fields, and the constructor's
+            // arguments arrive positionally. Threading the table into this
+            // printer is the Task 7 cutover's job, since that is where the
+            // lowered types and the lowered bodies first meet.
+            TExpr::Ctor(..) => {
+                unsupported("a struct literal needs the module's type table for its field names")
+            }
         }
     }
 

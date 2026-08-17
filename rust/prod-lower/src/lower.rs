@@ -8,21 +8,45 @@
 //! vote.
 
 use crate::error::LowerError;
+use crate::names::{NameError, NamePolicy, NameTable};
 use crate::profile::{DivisionSemantics, TargetProfile};
 use crate::shape::{Shape, Signatures};
-use crate::target::{Arm, BinOp, Body, ErrorCode, FallibleOp, Lit, Stmt, TExpr};
+use crate::target::{Arm, BinOp, Body, CtorDef, ErrorCode, FallibleOp, Lit, Stmt, TExpr, TypeDef};
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use prod_ir::{Definition, Expr, NumKind, Type};
+use prod_ir::{CtorDecl, Definition, Expr, Module, NumKind, Type, TypeDecl};
 
-/// Lower one definition to its [`Body`].
+/// Lower one definition to its [`Body`], with no module around it.
+///
+/// Named types are therefore unresolvable: a constructor application, a match
+/// alternative and a projection are all lowered without the declaration that
+/// would say how many fields they have. Use [`lower_def_in`] when that matters
+/// -- this entry point exists for the single-definition case, and mirrors
+/// `prod_codegen::generate_def`'s documented behaviour exactly.
 pub fn lower_def(
     def: &Definition,
     shapes: &Signatures,
     profile: &TargetProfile,
+) -> Result<Body, LowerError> {
+    lower_def_in(def, shapes, profile, &[])
+}
+
+/// Lower one definition to its [`Body`] against its module's type
+/// declarations.
+///
+/// `decls` is the module's own [`TypeDecl`] list -- the *source* declarations,
+/// not the lowered [`crate::target::TypeDef`]s. Every question it answers here
+/// is about the IR rather than about any target: how many fields a constructor
+/// has, and whether a projected field exists. Both are agreements the IR must
+/// keep with itself.
+pub fn lower_def_in(
+    def: &Definition,
+    shapes: &Signatures,
+    profile: &TargetProfile,
+    decls: &[TypeDecl],
 ) -> Result<Body, LowerError> {
     let shape = shapes
         .get(def.name.as_str())
@@ -45,6 +69,7 @@ pub fn lower_def(
         bound: def.params.iter().map(|(n, _)| n.clone()).collect(),
         scope: Vec::new(),
         types: Vec::new(),
+        decls,
         jps: JpContext::collect(&def.body),
     };
     // The body is lowered in TAIL position: control flow is a statement here,
@@ -58,6 +83,339 @@ pub fn lower_def(
         ret: def.ret.clone(),
         shape,
         stmts,
+    })
+}
+
+/// Lower every type declaration in `module`.
+///
+/// This is the *decision* half of what `prod-codegen`'s `generate_type_decl`
+/// used to do in one piece. Whether a type is representable at all, whether
+/// its fields are private, whether it has an invariant and what predicate that
+/// invariant is, whether a field name is already taken by the generated
+/// checked constructor -- all settled here. How any of it is spelled is the
+/// printer's, and `emit_types` returns a `String` rather than a `Result`
+/// precisely because nothing is left for it to refuse.
+pub fn lower_types(module: &Module, policy: &NamePolicy) -> Result<Vec<TypeDef>, LowerError> {
+    check_type_name_collisions(&module.types, policy)?;
+    let mut out = Vec::with_capacity(module.types.len());
+    for decl in &module.types {
+        out.push(lower_type_decl(decl, &module.types, policy)?);
+    }
+    Ok(out)
+}
+
+/// Two Lean types whose last name components collide once mangled: this is
+/// the one implementation of that check, sourced from [`NameTable`] rather
+/// than re-derived, so the names that are certified injective are the names
+/// that actually get emitted.
+///
+/// Deliberately scoped to types only, with every type's constructors and
+/// fields stripped before the table is built. `NameTable::build` also checks
+/// constructor and field injectivity, but folding that in here would reject
+/// modules under a `DuplicateTypeName` message naming the wrong kind of
+/// collision -- practically every Lean structure names its constructor `mk`.
+fn check_type_name_collisions(types: &[TypeDecl], policy: &NamePolicy) -> Result<(), LowerError> {
+    let types_only = Module {
+        name: String::new(),
+        types: types
+            .iter()
+            .map(|decl| TypeDecl {
+                name: decl.name.clone(),
+                ctors: Vec::new(),
+                unsupported: None,
+                invariant: None,
+            })
+            .collect(),
+        definitions: Vec::new(),
+    };
+    match NameTable::build(&types_only, policy) {
+        Ok(_) => Ok(()),
+        Err(NameError::Collision { target, .. }) => Err(LowerError::DuplicateTypeName(target)),
+    }
+}
+
+/// Lower one type declaration.
+///
+/// The order of the checks is `prod-codegen`'s order, deliberately: a
+/// declaration that trips several of them must still be rejected for the same
+/// reason it is rejected today, and the rejection wording is pinned by the
+/// published subset contract.
+fn lower_type_decl(
+    decl: &TypeDecl,
+    all: &[TypeDecl],
+    policy: &NamePolicy,
+) -> Result<TypeDef, LowerError> {
+    // The exporter reached this type but could not describe it. It is declared
+    // anyway so that the rejection names a reason instead of an unknown type.
+    if let Some(reason) = &decl.unsupported {
+        return Err(match reason.as_str() {
+            "type parameters" => LowerError::PolymorphicType(decl.name.clone()),
+            "recursive" => LowerError::RecursiveType(decl.name.clone()),
+            other => LowerError::OpaqueType(format!("{} ({})", decl.name, other)),
+        });
+    }
+    for ctor in &decl.ctors {
+        for (field, ty) in &ctor.fields {
+            check_field_type(ty, &decl.name, field, all)?;
+        }
+    }
+
+    if decl.ctors.len() == 1 {
+        let ctor = &decl.ctors[0];
+        let fields = lower_fields(ctor, policy)?;
+
+        let invariant = match &decl.invariant {
+            None => None,
+            Some(predicate) => {
+                // The accessors and the checked constructor are members of the
+                // same type, so a field named `new` would produce two members
+                // of that name. `new` is not a keyword in any policy's list,
+                // so the mangling leaves it alone and nothing downstream would
+                // catch it -- the output would simply not compile. Reject
+                // here, naming the type and the field.
+                for (name, _) in &ctor.fields {
+                    if policy.apply(name) == CHECKED_CONSTRUCTOR {
+                        return Err(LowerError::ReservedFieldName(
+                            decl.name.clone(),
+                            name.clone(),
+                        ));
+                    }
+                }
+                Some(lower_invariant(predicate, &fields, policy)?)
+            }
+        };
+
+        return Ok(TypeDef {
+            name: policy.apply(&decl.name),
+            lean_name: decl.name.clone(),
+            ctors: alloc::vec![CtorDef {
+                name: policy.apply(&ctor.name),
+                lean_name: ctor.name.clone(),
+                fields,
+            }],
+            fields_private: invariant.is_some(),
+            invariant,
+        });
+    }
+
+    // Only a single-constructor structure can carry an invariant: a `Prop`
+    // field belongs to one constructor. Reject rather than render half of it.
+    if decl.invariant.is_some() {
+        return Err(LowerError::UnsupportedFieldType(format!(
+            "`{}` carries an invariant but has {} constructors; only a \
+             single-constructor structure can have one",
+            decl.name,
+            decl.ctors.len()
+        )));
+    }
+
+    let mut ctors = Vec::with_capacity(decl.ctors.len());
+    for ctor in &decl.ctors {
+        ctors.push(CtorDef {
+            name: policy.apply(&ctor.name),
+            lean_name: ctor.name.clone(),
+            fields: lower_fields(ctor, policy)?,
+        });
+    }
+    Ok(TypeDef {
+        name: policy.apply(&decl.name),
+        lean_name: decl.name.clone(),
+        ctors,
+        invariant: None,
+        fields_private: false,
+    })
+}
+
+/// The name of the generated checked constructor, in the Target IR's own
+/// vocabulary. A printer that spells it differently owes the corresponding
+/// reservation in its own policy; the decision that *some* member name is
+/// taken belongs here, with the decision to generate the member at all.
+const CHECKED_CONSTRUCTOR: &str = "new";
+
+/// A constructor's fields under the caller's naming policy, rejecting any
+/// whose type has no representation at all.
+///
+/// Separate from [`check_field_type`] and run after it, because
+/// `prod-codegen` runs the two in that order: a field type can be
+/// unrepresentable (`Opaque`) *and* recursive, and the reason reported has to
+/// stay the one reported today.
+fn lower_fields(ctor: &CtorDecl, policy: &NamePolicy) -> Result<Vec<(String, Type)>, LowerError> {
+    let mut fields = Vec::with_capacity(ctor.fields.len());
+    for (name, ty) in &ctor.fields {
+        check_representable(ty)?;
+        fields.push((policy.apply(name), ty.clone()));
+    }
+    Ok(fields)
+}
+
+/// A field type must be renderable and must not make the type recursive.
+///
+/// `owner` and `field` are the Lean constant and field name responsible, and
+/// they appear in the rejection message: a failure has to name the declaration
+/// that caused it, and "a list field would need owned storage" on its own
+/// leaves the reader to grep for which one.
+fn check_field_type(
+    ty: &Type,
+    owner: &str,
+    field: &str,
+    all: &[TypeDecl],
+) -> Result<(), LowerError> {
+    match ty {
+        Type::Named(n) => {
+            if n == owner {
+                return Err(LowerError::RecursiveType(String::from(owner)));
+            }
+            match all.iter().find(|d| d.name == *n) {
+                // One level of indirection is enough to catch the mutual case
+                // too: B referring back to A makes A reachable from A.
+                Some(other) => {
+                    for ctor in &other.ctors {
+                        for (_, inner) in &ctor.fields {
+                            if let Type::Named(m) = inner {
+                                if m == owner {
+                                    return Err(LowerError::RecursiveType(String::from(owner)));
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                None => Err(LowerError::OpaqueType(n.clone())),
+            }
+        }
+        // A sequence field would need owned storage, which the allocation-free
+        // tier does not have. Lists are supported as borrowed parameters and
+        // caller-owned output buffers only, never as owned struct fields.
+        Type::List(_) => Err(LowerError::UnsupportedFieldType(format!(
+            "`{}.{}`: a list field would need owned storage",
+            owner, field
+        ))),
+        Type::Vec(_) => Err(LowerError::UnsupportedFieldType(format!(
+            "`{}.{}`: a vector field would need heap storage",
+            owner, field
+        ))),
+        Type::Tuple(items) => {
+            for item in items {
+                check_field_type(item, owner, field, all)?;
+            }
+            Ok(())
+        }
+        Type::Option(inner) => check_field_type(inner, owner, field, all),
+        _ => Ok(()),
+    }
+}
+
+/// A type the printers have no rendering for at all. `List` and `Vec` are
+/// already gone by the time this runs; what is left is `Opaque`, the type the
+/// exporter emits when it gave up.
+fn check_representable(ty: &Type) -> Result<(), LowerError> {
+    match ty {
+        Type::Opaque(s) => Err(LowerError::OpaqueType(s.clone())),
+        Type::Option(inner) => check_representable(inner),
+        Type::Tuple(items) => {
+            for item in items {
+                check_representable(item)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Lower a structure's invariant: a predicate over the structure's own fields.
+///
+/// Deliberately **not** [`Lowering::expr`]. That one needs a
+/// [`TargetProfile`] to decide what can fail, and `lower_types` has none --
+/// which is the right shape, because a predicate that can fail has nowhere to
+/// put the failure. It guards the checked constructor, so it has to be a
+/// single total expression in every target, not a statement list. Anything
+/// outside the boolean fragment is [`LowerError::NotYetLowered`] rather than
+/// silently hoisted into a statement no printer would have a place for.
+///
+/// Field references resolve to the *target* field identifiers, so the
+/// predicate reads the same names the fields and the constructor parameters
+/// are declared with. Without that, a field named `type` would be declared
+/// escaped and read raw.
+///
+/// The operand order is preserved exactly. `q >= 1` reaches here as
+/// `le 1 q` and must stay `1 <= q`: a reversed comparison still compiles,
+/// still returns a `bool`, and rejects precisely the inputs it should accept.
+fn lower_invariant(
+    e: &Expr,
+    fields: &[(String, Type)],
+    policy: &NamePolicy,
+) -> Result<TExpr, LowerError> {
+    let compare = |op: BinOp, a: &Expr, b: &Expr| -> Result<TExpr, LowerError> {
+        let a = lower_invariant(a, fields, policy)?;
+        let b = lower_invariant(b, fields, policy)?;
+        let kind = compare_kind(&a, &b, fields);
+        Ok(TExpr::BinOp(kind, op, Box::new(a), Box::new(b)))
+    };
+    match e {
+        Expr::Nat(n) => Ok(TExpr::Lit(Lit::Nat(*n))),
+        Expr::Int(n) => Ok(TExpr::Lit(Lit::Int(*n))),
+        Expr::Bool(b) => Ok(TExpr::Lit(Lit::Bool(*b))),
+        Expr::Var(name) => Ok(TExpr::Var(policy.apply(name))),
+        Expr::Eq(a, b) => compare(BinOp::Eq, a, b),
+        Expr::Lt(a, b) => compare(BinOp::Lt, a, b),
+        Expr::Le(a, b) => compare(BinOp::Le, a, b),
+        Expr::Gt(a, b) => compare(BinOp::Gt, a, b),
+        Expr::And(a, b) => Ok(TExpr::And(
+            Box::new(lower_invariant(a, fields, policy)?),
+            Box::new(lower_invariant(b, fields, policy)?),
+        )),
+        Expr::Or(a, b) => Ok(TExpr::Or(
+            Box::new(lower_invariant(a, fields, policy)?),
+            Box::new(lower_invariant(b, fields, policy)?),
+        )),
+        Expr::Not(a) => Ok(TExpr::Not(Box::new(lower_invariant(a, fields, policy)?))),
+        other => Err(LowerError::NotYetLowered(format!(
+            "{} in an invariant",
+            node_name(other)
+        ))),
+    }
+}
+
+/// The numeric kind a comparison's operands are read at.
+///
+/// A field reference settles it, because a field has a declared type; a bare
+/// literal does not, so it is only consulted when neither side names a field.
+/// `le 1 used` over a `UInt8` field is a `UInt8` comparison, not a `Nat` one,
+/// even though the literal on the left says nothing.
+fn compare_kind(a: &TExpr, b: &TExpr, fields: &[(String, Type)]) -> NumKind {
+    for operand in [a, b] {
+        if let TExpr::Var(name) = operand {
+            if let Some((_, ty)) = fields.iter().find(|(f, _)| f == name) {
+                if let Some(kind) = type_kind(ty) {
+                    return kind;
+                }
+            }
+        }
+    }
+    for operand in [a, b] {
+        if let TExpr::Lit(Lit::Int(_)) = operand {
+            return NumKind::Int;
+        }
+    }
+    NumKind::Nat
+}
+
+fn type_kind(ty: &Type) -> Option<NumKind> {
+    match ty {
+        Type::Nat => Some(NumKind::Nat),
+        Type::Int => Some(NumKind::Int),
+        Type::UInt(k) => Some(*k),
+        _ => None,
+    }
+}
+
+/// The declaration of a constructor, by its full Lean name.
+fn ctor_decl<'m>(decls: &'m [TypeDecl], name: &str) -> Option<(&'m TypeDecl, &'m CtorDecl)> {
+    decls.iter().find_map(|decl| {
+        decl.ctors
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| (decl, c))
     })
 }
 
@@ -108,6 +466,10 @@ struct Lowering<'a> {
     /// Target name -> type, for every binding made. Never popped: target names
     /// are unique, so an entry can never be shadowed.
     types: Vec<(String, Type)>,
+    /// The module's own type declarations, or empty when there is no module.
+    /// Consulted for constructor arity and field existence -- questions about
+    /// the IR, not about any target.
+    decls: &'a [TypeDecl],
     /// Join-point declarations and their call counts, collected once for the
     /// whole body.
     jps: JpContext<'a>,
@@ -269,6 +631,56 @@ impl<'a> Lowering<'a> {
                 }
             }
 
+            // Constructing and projecting are both TOTAL: neither can fail in
+            // any target, so both stay in expression position rather than
+            // becoming a `TryLet`.
+            //
+            // The owner's Lean type name is carried alongside the constructor
+            // so a printer can find the declaration without a second lookup;
+            // it is empty for a constructor this module does not declare
+            // (`Bool.true`, `Option.some`, `Prod.mk`, and anything the host
+            // supplies by hand), which is exactly the case a printer has to
+            // special-case anyway.
+            Expr::Ctor(name, args) => {
+                let mut lowered = Vec::with_capacity(args.len());
+                for arg in args {
+                    lowered.push(self.expr(arg, stmts)?);
+                }
+                let owner = match ctor_decl(self.decls, name) {
+                    Some((decl, cdecl)) => {
+                        // Arity is an agreement between the declaration and
+                        // this use, so a disagreement is the IR contradicting
+                        // itself. Rendering it would emit a call with the
+                        // wrong number of arguments, which does not compile.
+                        if lowered.len() != cdecl.fields.len() {
+                            return Err(LowerError::UnsupportedFieldType(format!(
+                                "`{}` takes {} field(s) but got {} argument(s)",
+                                name,
+                                cdecl.fields.len(),
+                                lowered.len()
+                            )));
+                        }
+                        decl.name.clone()
+                    }
+                    None => String::new(),
+                };
+                Ok(TExpr::Ctor(owner, name.clone(), lowered))
+            }
+
+            Expr::Proj(ty, field, value) => {
+                let value = self.expr(value, stmts)?;
+                if let Some(decl) = self.decls.iter().find(|d| d.name == *ty) {
+                    let declared = decl
+                        .ctors
+                        .iter()
+                        .any(|c| c.fields.iter().any(|(name, _)| name == field));
+                    if !declared {
+                        return Err(LowerError::UnknownField(ty.clone(), field.clone()));
+                    }
+                }
+                Ok(TExpr::Proj(ty.clone(), field.clone(), Box::new(value)))
+            }
+
             other => Err(LowerError::NotYetLowered(String::from(node_name(other)))),
         }
     }
@@ -315,6 +727,24 @@ impl<'a> Lowering<'a> {
                 let scrut = self.expr(scrut, stmts)?;
                 let mut arms = Vec::with_capacity(alts.len());
                 for alt in alts {
+                    // The same arity agreement as on the construction side,
+                    // and rejected in the same words. Without it the printer
+                    // falls through to its positional pattern and emits
+                    // `M.Shape.circle(r, extra)` -- a dotted Lean name used as
+                    // a Rust path, with one binder too many. Naming the reason
+                    // beats emitting code that does not compile, and this is
+                    // the layer that can tell the difference, because the
+                    // printers are total by construction.
+                    if let Some((_, cdecl)) = ctor_decl(self.decls, &alt.ctor) {
+                        if alt.binders.len() != cdecl.fields.len() {
+                            return Err(LowerError::UnsupportedFieldType(format!(
+                                "`{}` takes {} field(s) but got {} binder(s)",
+                                alt.ctor,
+                                cdecl.fields.len(),
+                                alt.binders.len()
+                            )));
+                        }
+                    }
                     // An alternative's binders are source binders like any
                     // other: they go through `bind_source`, so one that
                     // shadows a parameter is renamed, and through `scope`, so
@@ -1419,6 +1849,188 @@ mod tests {
             assert_eq!(
                 lower_def(&defs[0], &shapes, &TargetProfile::RUST),
                 Err(LowerError::UnsupportedJoinPoint(String::from("g"))),
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Type declarations, and the rejections that need the type table
+    // -----------------------------------------------------------------------
+
+    fn parse(ir: &str) -> prod_ir::Module {
+        prod_ir::parser::parse_module(ir).expect("parses").1
+    }
+
+    /// The rejection Task 4 had to drop for want of a type table.
+    ///
+    /// Without it the alternative falls through to the positional pattern and
+    /// the printer emits `M.Shape.circle(r, extra)` -- a dotted Lean name used
+    /// as a Rust path, with one field too many. That does not compile, and a
+    /// generator that emits code which does not compile is strictly worse than
+    /// one that names the reason.
+    #[test]
+    fn a_match_alternative_whose_binder_count_is_wrong_is_rejected() {
+        let module = parse(
+            r#"(module M (type "M.Shape" (ctor "M.Shape.circle" (r Nat)) (ctor "M.Shape.square" (s Nat))))"#,
+        );
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![(String::from("x"), Type::Named(String::from("M.Shape")))],
+            ret: Type::Nat,
+            body: Expr::Match {
+                scrut: Box::new(Expr::Var(String::from("x"))),
+                alts: vec![prod_ir::Alt {
+                    ctor: String::from("M.Shape.circle"),
+                    binders: vec![String::from("r"), String::from("extra")],
+                    body: Expr::Var(String::from("r")),
+                }],
+                default: Some(Box::new(Expr::Nat(0))),
+            },
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        assert_eq!(
+            lower_def_in(&defs[0], &shapes, &TargetProfile::RUST, &module.types),
+            Err(LowerError::UnsupportedFieldType(String::from(
+                "`M.Shape.circle` takes 1 field(s) but got 2 binder(s)"
+            ))),
+        );
+
+        // And the same alternative with the right number of binders lowers,
+        // so the rejection is about the arity rather than about the
+        // constructor being declared at all.
+        let Expr::Match {
+            scrut,
+            alts,
+            default,
+        } = defs[0].body.clone()
+        else {
+            unreachable!()
+        };
+        let mut alts = alts;
+        alts[0].binders.pop();
+        let ok = Definition {
+            body: Expr::Match {
+                scrut,
+                alts,
+                default,
+            },
+            ..defs[0].clone()
+        };
+        lower_def_in(&ok, &shapes, &TargetProfile::RUST, &module.types)
+            .expect("the declared arity lowers");
+    }
+
+    /// The same arity question on the construction side. Symmetric with the
+    /// alternative above, and rejected in the same words.
+    #[test]
+    fn a_constructor_applied_to_the_wrong_number_of_arguments_is_rejected() {
+        let module = parse(r#"(module M (type "M.Pair" (ctor "M.Pair.mk" (a Nat) (b Nat))))"#);
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![],
+            ret: Type::Named(String::from("M.Pair")),
+            body: Expr::Ctor(String::from("M.Pair.mk"), vec![Expr::Nat(1)]),
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        assert_eq!(
+            lower_def_in(&defs[0], &shapes, &TargetProfile::RUST, &module.types),
+            Err(LowerError::UnsupportedFieldType(String::from(
+                "`M.Pair.mk` takes 2 field(s) but got 1 argument(s)"
+            ))),
+        );
+    }
+
+    /// A projection naming a field the declaration does not have. Catches a
+    /// declaration and a projection disagreeing within one IR file.
+    #[test]
+    fn a_projection_of_an_undeclared_field_is_rejected() {
+        let module = parse(r#"(module M (type "M.Pair" (ctor "M.Pair.mk" (a Nat) (b Nat))))"#);
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![(String::from("p"), Type::Named(String::from("M.Pair")))],
+            ret: Type::Nat,
+            body: Expr::Proj(
+                String::from("M.Pair"),
+                String::from("c"),
+                Box::new(Expr::Var(String::from("p"))),
+            ),
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        assert_eq!(
+            lower_def_in(&defs[0], &shapes, &TargetProfile::RUST, &module.types),
+            Err(LowerError::UnknownField(
+                String::from("M.Pair"),
+                String::from("c")
+            )),
+        );
+    }
+
+    /// Every type-declaration rejection `prod-codegen` makes, with the payload
+    /// each one carries. The wording is pinned by `REJECTIONS` and by the
+    /// published subset contract, so this is a refactor, not a redesign.
+    #[test]
+    fn the_type_declaration_rejections_keep_their_exact_payloads() {
+        let cases: &[(&str, LowerError)] = &[
+            (
+                r#"(module M (type "M.Poly" (unsupported "type parameters")))"#,
+                LowerError::PolymorphicType(String::from("M.Poly")),
+            ),
+            (
+                r#"(module M (type "M.Tree" (unsupported "recursive")))"#,
+                LowerError::RecursiveType(String::from("M.Tree")),
+            ),
+            (
+                r#"(module M (type "M.Weird" (unsupported "something else")))"#,
+                LowerError::OpaqueType(String::from("M.Weird (something else)")),
+            ),
+            (
+                r#"(module M (type "M.Holder" (ctor "M.Holder.mk" (xs (List Nat)))))"#,
+                LowerError::UnsupportedFieldType(String::from(
+                    "`M.Holder.xs`: a list field would need owned storage",
+                )),
+            ),
+            (
+                r#"(module M (type "M.Holder" (ctor "M.Holder.mk" (xs (Vec Nat)))))"#,
+                LowerError::UnsupportedFieldType(String::from(
+                    "`M.Holder.xs`: a vector field would need heap storage",
+                )),
+            ),
+            (
+                r#"(module M (type "M.Loop" (ctor "M.Loop.mk" (me (named "M.Loop")))))"#,
+                LowerError::RecursiveType(String::from("M.Loop")),
+            ),
+            (
+                r#"(module M (type "M.Holder" (ctor "M.Holder.mk" (o (named "M.Missing")))))"#,
+                LowerError::OpaqueType(String::from("M.Missing")),
+            ),
+            (
+                r#"(module M (type "A.Instance" (ctor "A.Instance.mk")) (type "B.Instance" (ctor "B.Instance.mk")))"#,
+                LowerError::DuplicateTypeName(String::from("Instance")),
+            ),
+            (
+                r#"(module M (type "M.Reserved" (ctor "M.Reserved.mk" (new Nat)) (invariant (le 1 new))))"#,
+                LowerError::ReservedFieldName(String::from("M.Reserved"), String::from("new")),
+            ),
+            (
+                r#"(module M (type "M.Two" (ctor "M.Two.a" (x Nat)) (ctor "M.Two.b" (y Nat)) (invariant (le 1 x))))"#,
+                LowerError::UnsupportedFieldType(String::from(
+                    "`M.Two` carries an invariant but has 2 constructors; only a \
+                     single-constructor structure can have one",
+                )),
+            ),
+        ];
+        for (ir, expected) in cases {
+            let module = parse(ir);
+            assert_eq!(
+                lower_types(&module, &crate::names::NamePolicy::RUST)
+                    .err()
+                    .as_ref(),
+                Some(expected),
+                "for {}",
+                ir
             );
         }
     }

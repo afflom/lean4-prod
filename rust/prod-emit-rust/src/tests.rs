@@ -7,7 +7,8 @@ use alloc::boxed::Box;
 use alloc::vec;
 use prod_ir::{Alt, Definition, Expr, NumKind, Type};
 use prod_lower::error::LowerError;
-use prod_lower::lower::lower_def;
+use prod_lower::lower::{lower_def, lower_types};
+use prod_lower::names::NamePolicy;
 use prod_lower::profile::TargetProfile;
 use prod_lower::shape::signatures;
 
@@ -541,4 +542,100 @@ fn a_temporary_read_only_inside_a_branch_is_not_folded_into_it() {
         "the sum is computed unconditionally in the source, so it must stay above the branch:\n{}",
         out
     );
+}
+
+// ---------------------------------------------------------------------------
+// Type declarations, and the invariant machinery
+//
+// The behaviour under test is `prod-codegen`'s, moved across the seam: the
+// decisions on the lowering side, the syntax on this one. These assertions are
+// on the *rendered* text because that is what a caller at the crate boundary
+// actually gets.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_invariant_carrying_type_still_gets_private_fields_and_a_checked_new() {
+    let ir = r#"
+(module M
+  (type "UorAtlas.Instance"
+    (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat))
+    (invariant (and (le 1 q) (and (le 1 T) (le 1 O)))))
+)
+"#;
+    let module = prod_ir::parser::parse_module(ir).expect("parses").1;
+    let types = lower_types(&module, &NamePolicy::RUST).expect("lowers");
+    let out = emit_types(&types);
+    assert!(out.contains("pub(crate) q: u64"), "got: {}", out);
+    assert!(!out.contains("pub q: u64"));
+    assert!(
+        out.contains("pub fn new(q: u64, T: u64, O: u64) -> Result<Self, crate::ComputeError>"),
+        "got: {}",
+        out
+    );
+    assert!(
+        out.contains("if ((1 <= q) && ((1 <= T) && (1 <= O)))"),
+        "got: {}",
+        out
+    );
+    assert!(
+        out.contains("pub fn q(&self) -> u64 { self.q }"),
+        "got: {}",
+        out
+    );
+}
+
+#[test]
+fn a_type_with_no_lowerable_invariant_keeps_public_fields() {
+    let ir = r#"(module M (type "M.Pair" (ctor "M.Pair.mk" (a Nat) (b Nat))))"#;
+    let module = prod_ir::parser::parse_module(ir).expect("parses").1;
+    let out = emit_types(&lower_types(&module, &NamePolicy::RUST).expect("lowers"));
+    assert!(out.contains("pub a: u64"), "got: {}", out);
+    assert!(!out.contains("pub(crate)"));
+    assert!(!out.contains("fn new("));
+}
+
+#[test]
+fn the_invariant_is_not_lowered_inverted() {
+    // `q >= 1` must render `1 <= q`, never `q <= 1`. A reversed comparison
+    // compiles, returns a bool, and rejects exactly the inputs it should
+    // accept -- a defect of this exact shape has shipped here before. The two
+    // conjuncts point opposite ways on purpose, so a blanket swap is visible.
+    let ir = r#"
+(module M
+  (type "M.Bound" (ctor "M.Bound.mk" (lo Nat) (hi Nat))
+    (invariant (and (le 2 lo) (le hi 7))))
+)
+"#;
+    let module = prod_ir::parser::parse_module(ir).expect("parses").1;
+    let out = emit_types(&lower_types(&module, &NamePolicy::RUST).expect("lowers"));
+    assert!(out.contains("(2 <= lo)"), "got: {}", out);
+    assert!(out.contains("(hi <= 7)"), "got: {}", out);
+}
+
+/// A projection needs no type table to print: the lowering already checked the
+/// field against its declaration, so what is left is field-access syntax.
+#[test]
+fn a_projection_renders_as_field_access() {
+    let module = prod_ir::parser::parse_module(
+        r#"(module M (type "M.Pair" (ctor "M.Pair.mk" (a Nat) (b Nat))))"#,
+    )
+    .expect("parses")
+    .1;
+    let def = Definition {
+        name: String::from("f"),
+        params: vec![(String::from("p"), Type::Named(String::from("M.Pair")))],
+        ret: Type::Nat,
+        body: Expr::Proj(
+            String::from("M.Pair"),
+            String::from("a"),
+            Box::new(Expr::Var(String::from("p"))),
+        ),
+    };
+    let defs = vec![def];
+    let shapes = signatures(&defs, &TargetProfile::RUST);
+    let body =
+        prod_lower::lower::lower_def_in(&defs[0], &shapes, &TargetProfile::RUST, &module.types)
+            .expect("lowers");
+    let out = emit_body(&body);
+    assert!(out.contains("(p).a"), "got: {}", out);
 }

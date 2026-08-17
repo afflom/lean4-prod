@@ -141,6 +141,55 @@ pub enum Stmt {
     },
 }
 
+/// One lowered type declaration: everything a printer needs, with every
+/// question of *whether* already answered.
+///
+/// The split this type encodes: whether the fields are reachable only from
+/// generated code is a semantic question and is settled here
+/// ([`TypeDef::fields_private`]); how that is spelled -- `pub(crate)`,
+/// a leading underscore, nothing at all -- is the printer's business. Same for
+/// the invariant: whether there is one, and what predicate it is, is decided
+/// by [`crate::lower::lower_types`]; where the `if` goes is not.
+///
+/// Names are already mangled under the caller's [`crate::names::NamePolicy`],
+/// with one exception: [`TypeDef::lean_name`] and [`CtorDef::lean_name`] keep
+/// the full Lean name. The first is a diagnostic string (the checked
+/// constructor reports it when the invariant does not hold), and the second is
+/// the key a printer resolves a [`TExpr::Ctor`] against -- both of those carry
+/// Lean names, because resolution has to happen against something the IR
+/// actually wrote.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDef {
+    /// Target identifier for the type.
+    pub name: String,
+    /// Full Lean name, e.g. `UorAtlas.Instance`.
+    pub lean_name: String,
+    /// One constructor means a structure; several mean a tagged union.
+    pub ctors: Vec<CtorDef>,
+    /// The structure's invariant over its own fields, already lowered. The
+    /// field references in it are target identifiers, matching
+    /// [`CtorDef::fields`], so a printer never re-mangles them.
+    pub invariant: Option<TExpr>,
+    /// Are the fields reachable only from generated code?
+    ///
+    /// True exactly when the type carries an invariant. Generated code keeps
+    /// constructing such a type directly -- Lean already supplied the proof --
+    /// so the fields stay reachable in-crate; only callers outside, where the
+    /// proof was erased on export, are routed through the checked constructor.
+    pub fields_private: bool,
+}
+
+/// One constructor of a [`TypeDef`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CtorDef {
+    /// Target identifier for the constructor.
+    pub name: String,
+    /// Full Lean name, e.g. `UorAtlas.Instance.mk`.
+    pub lean_name: String,
+    /// Fields in declaration order: target identifier and type.
+    pub fields: Vec<(String, Type)>,
+}
+
 /// One lowered definition.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Body {

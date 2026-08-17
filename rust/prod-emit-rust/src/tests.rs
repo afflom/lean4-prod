@@ -362,3 +362,39 @@ fn int_shifts_are_rejected_by_the_lowering() {
         LowerError::UnsupportedKind(_)
     ));
 }
+
+/// End to end, the scoping the flat statement list has to preserve.
+///
+/// `f(x) = (let x := 1; x) + x` renders with the second operand still reading
+/// the parameter. The old renderer got this from the brace in
+/// `{ let x = 1; x } + x`; the Target IR is flat, so the lowering renames the
+/// inner binder and the printed Rust has to show it.
+#[test]
+fn a_let_shadowing_a_parameter_still_prints_the_parameter_at_the_outer_use() {
+    let def = Definition {
+        name: String::from("f"),
+        params: vec![(String::from("x"), Type::Nat)],
+        ret: Type::Nat,
+        body: Expr::Add(
+            NumKind::Nat,
+            Box::new(Expr::Let(
+                String::from("x"),
+                Box::new(Expr::Nat(1)),
+                Box::new(Expr::Var(String::from("x"))),
+            )),
+            Box::new(Expr::Var(String::from("x"))),
+        ),
+    };
+    let out = render(&def);
+    assert!(
+        !out.contains("let x ="),
+        "the inner binder must not shadow the parameter: {}",
+        out
+    );
+    // The add's right operand is the bare parameter.
+    assert!(
+        out.contains(".checked_add(x)"),
+        "the outer use must still be the parameter: {}",
+        out
+    );
+}

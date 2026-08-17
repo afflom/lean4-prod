@@ -389,6 +389,12 @@ fn param_type(ty: &Type) -> String {
 }
 
 /// Count every read of every bound name, at the binder's own level and below.
+///
+/// By NAME, with no scope of its own: it relies on `prod_lower::lower` having
+/// made every binder in the body unique. Two live bindings sharing a name
+/// would pool their reads here, and a temporary that is read once would look
+/// read twice (or worse, vice versa) -- so the fold-into-single-use decision
+/// depends on that invariant, not only the flat statement list does.
 fn uses(stmts: &[Stmt]) -> BTreeMap<String, Usage> {
     let mut out: BTreeMap<String, Usage> = BTreeMap::new();
     count_level(stmts, &mut out, true);

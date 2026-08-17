@@ -41,8 +41,10 @@ pub fn lower_def(
         shapes,
         profile,
         next_temp: 0,
-        taken: bound_names(def),
-        env: Vec::new(),
+        reserved: bound_names(def),
+        bound: def.params.iter().map(|(n, _)| n.clone()).collect(),
+        scope: Vec::new(),
+        types: Vec::new(),
     };
     let mut stmts: Vec<Stmt> = Vec::new();
     let result = lowering.expr(&def.body, &mut stmts)?;
@@ -64,19 +66,45 @@ enum DivMod {
     Mod,
 }
 
+/// Lowering makes every binder in a [`Body`] unique, because the Target IR has
+/// no nested scope to rely on.
+///
+/// `Expr::Let` is an *expression* -- it can sit in an operand -- and the
+/// statement list it lowers into is flat, so its `Stmt::Let` lands in the
+/// enclosing list and stays live for everything after it. Lean's scoping said
+/// otherwise. In `Add(Let("x", 1, Var("x")), Var("x"))` over a parameter `x`,
+/// the second operand means the *parameter*; flattened naively it would read
+/// the inner binding and the definition would compute `2` where Lean says
+/// `1 + x`.
+///
+/// So a source binder that collides with a name already bound in this body is
+/// renamed, and references within its own body are rewritten to the new name.
+/// Only on an actual collision: the common case keeps the name the source
+/// wrote, which is what a reader of the generated code wants to see.
+///
+/// Uniqueness is what makes flattening sound at all, and the printer depends
+/// on it a second time: `uses()` there counts reads by name with no scope of
+/// its own, so two live bindings sharing a name would corrupt the decision to
+/// fold a temporary into its single use.
 struct Lowering<'a> {
     params: &'a [(String, Type)],
     shapes: &'a Signatures<'a>,
     profile: &'a TargetProfile,
     next_temp: usize,
-    /// Every name the source definition itself binds. A generated temporary
-    /// must not collide with one: the printer may inline a temporary into its
-    /// single use, and a user binding of the same name in between would
-    /// shadow it and silently change which value is read.
-    taken: BTreeSet<String>,
-    /// Binder name -> type, innermost last. Only used to type later binders;
-    /// see [`Lowering::type_of`].
-    env: Vec<(String, Type)>,
+    /// Every name the source definition binds anywhere, collected up front. A
+    /// generated temporary must avoid all of them, including binders it has
+    /// not reached yet.
+    reserved: BTreeSet<String>,
+    /// Target names bound so far, parameters included. Membership here is
+    /// exactly the collision test.
+    bound: BTreeSet<String>,
+    /// Source name -> target name, for the binders whose body the lowering is
+    /// currently inside. Popped on the way out, so a sibling `let` of the same
+    /// name does not resolve through it.
+    scope: Vec<(String, String)>,
+    /// Target name -> type, for every binding made. Never popped: target names
+    /// are unique, so an entry can never be shadowed.
+    types: Vec<(String, Type)>,
 }
 
 impl<'a> Lowering<'a> {
@@ -84,10 +112,33 @@ impl<'a> Lowering<'a> {
         loop {
             let name = format!("t{}", self.next_temp);
             self.next_temp += 1;
-            if !self.taken.contains(&name) {
+            if !self.reserved.contains(&name) && !self.bound.contains(&name) {
+                self.bound.insert(name.clone());
                 return name;
             }
         }
+    }
+
+    /// The target name for a source binder: its own, or a fresh one if that is
+    /// already taken.
+    fn bind_source(&mut self, name: &str) -> String {
+        if self.bound.contains(name) {
+            return self.fresh();
+        }
+        self.bound.insert(String::from(name));
+        String::from(name)
+    }
+
+    /// The target name a source `Var` refers to: the innermost binder of that
+    /// name whose body we are inside, or the name itself (a parameter, or a
+    /// name this slice does not bind).
+    fn resolve(&self, name: &str) -> String {
+        self.scope
+            .iter()
+            .rev()
+            .find(|(source, _)| source == name)
+            .map(|(_, target)| target.clone())
+            .unwrap_or_else(|| String::from(name))
     }
 
     fn expr(&mut self, e: &Expr, stmts: &mut Vec<Stmt>) -> Result<TExpr, LowerError> {
@@ -95,7 +146,7 @@ impl<'a> Lowering<'a> {
             Expr::Nat(n) => Ok(TExpr::Lit(Lit::Nat(*n))),
             Expr::Int(n) => Ok(TExpr::Lit(Lit::Int(*n))),
             Expr::Bool(b) => Ok(TExpr::Lit(Lit::Bool(*b))),
-            Expr::Var(name) => Ok(TExpr::Var(name.clone())),
+            Expr::Var(name) => Ok(TExpr::Var(self.resolve(name))),
             Expr::Param(index) => self
                 .params
                 .get(*index)
@@ -157,17 +208,21 @@ impl<'a> Lowering<'a> {
                 }
             }
 
+            // The value is lowered BEFORE the binder is in scope, so a
+            // `let x := x + 1` still reads the outer `x` on the right.
             Expr::Let(name, value, body) => {
                 let value = self.expr(value, stmts)?;
                 let ty = self.type_of(&value);
+                let target = self.bind_source(name);
                 stmts.push(Stmt::Let {
-                    name: name.clone(),
+                    name: target.clone(),
                     ty: ty.clone(),
                     value,
                 });
-                self.env.push((name.clone(), ty));
+                self.types.push((target.clone(), ty));
+                self.scope.push((name.clone(), target));
                 let out = self.expr(body, stmts);
-                self.env.pop();
+                self.scope.pop();
                 out
             }
 
@@ -242,7 +297,7 @@ impl<'a> Lowering<'a> {
             ty: ty.clone(),
             op,
         });
-        self.env.push((name.clone(), ty));
+        self.types.push((name.clone(), ty));
         TExpr::Var(name)
     }
 
@@ -259,7 +314,7 @@ impl<'a> Lowering<'a> {
             },
             TExpr::Not(_) | TExpr::And(..) | TExpr::Or(..) => Type::Bool,
             TExpr::Var(name) => self
-                .env
+                .types
                 .iter()
                 .rev()
                 .chain(self.params.iter().rev())
@@ -579,5 +634,165 @@ mod tests {
             })
             .collect();
         assert_eq!(bound, vec![&String::from("t1")], "got {:?}", body.stmts);
+    }
+    /// The scoping the flattened statement list has to preserve by hand.
+    ///
+    /// `f(x) = (let x := 1; x) + x`. Lean's second operand is the PARAMETER --
+    /// the inner binding's scope ends at the first operand. Hoisting
+    /// `let x = 1;` into the enclosing list without renaming would put it in
+    /// scope for the second operand too, and the definition would compute
+    /// `1 + 1` where Lean says `1 + x`. The old renderer got this from the
+    /// brace in `{ let x = 1; x } + x`; a flat list has no brace, so the
+    /// lowering renames instead.
+    #[test]
+    fn a_let_shadowing_a_parameter_does_not_capture_later_uses() {
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![(String::from("x"), Type::Nat)],
+            ret: Type::Nat,
+            body: Expr::Add(
+                NumKind::Nat,
+                Box::new(Expr::Let(
+                    String::from("x"),
+                    Box::new(Expr::Nat(1)),
+                    Box::new(Expr::Var(String::from("x"))),
+                )),
+                Box::new(Expr::Var(String::from("x"))),
+            ),
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
+
+        let inner = match &body.stmts[0] {
+            Stmt::Let { name, .. } => name.clone(),
+            other => panic!("expected the hoisted Let first, got {:?}", other),
+        };
+        assert_ne!(inner, "x", "the inner binder must be renamed off the param");
+
+        match &body.stmts[1] {
+            Stmt::TryLet {
+                op: FallibleOp::Arith(_, BinOp::Add, a, b),
+                ..
+            } => {
+                assert_eq!(a, &TExpr::Var(inner), "first operand is the inner binding");
+                assert_eq!(
+                    b,
+                    &TExpr::Var(String::from("x")),
+                    "second operand must still be the PARAMETER, got {:?}",
+                    b
+                );
+            }
+            other => panic!("expected the add, got {:?}", other),
+        }
+    }
+
+    /// Two sibling `let`s of the same name are two different bindings. The
+    /// first one's value has already been read into an operand by the time the
+    /// second is emitted, so the second must not take its name.
+    #[test]
+    fn sibling_lets_of_the_same_name_get_different_binders() {
+        let shadow = |n: u64| {
+            Expr::Let(
+                String::from("y"),
+                Box::new(Expr::Nat(n)),
+                Box::new(Expr::Var(String::from("y"))),
+            )
+        };
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![],
+            ret: Type::Nat,
+            body: Expr::Add(NumKind::Nat, Box::new(shadow(1)), Box::new(shadow(2))),
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
+
+        let binders: Vec<String> = body
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Let { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(binders.len(), 2, "got {:?}", body.stmts);
+        assert_ne!(binders[0], binders[1], "got {:?}", body.stmts);
+
+        match &body.stmts[2] {
+            Stmt::TryLet {
+                op: FallibleOp::Arith(_, BinOp::Add, a, b),
+                ..
+            } => {
+                assert_eq!(a, &TExpr::Var(binders[0].clone()));
+                assert_eq!(b, &TExpr::Var(binders[1].clone()));
+            }
+            other => panic!("expected the add, got {:?}", other),
+        }
+    }
+
+    /// Renaming happens only on an actual collision -- otherwise the generated
+    /// code stops looking like the source it came from, and the Task 7 cutover
+    /// diff stops being reviewable.
+    #[test]
+    fn a_let_that_collides_with_nothing_keeps_its_source_name() {
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![(String::from("a"), Type::Nat)],
+            ret: Type::Nat,
+            body: Expr::Let(
+                String::from("scaled"),
+                Box::new(Expr::Var(String::from("a"))),
+                Box::new(Expr::Var(String::from("scaled"))),
+            ),
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
+        assert!(
+            matches!(&body.stmts[0], Stmt::Let { name, .. } if name == "scaled"),
+            "got {:?}",
+            body.stmts
+        );
+        assert_eq!(
+            &body.stmts[1],
+            &Stmt::Return(TExpr::Var(String::from("scaled")))
+        );
+    }
+
+    /// A binder's own value is outside its scope: `let x := x + 1` reads the
+    /// OUTER `x` on the right-hand side.
+    #[test]
+    fn a_binders_value_is_not_in_its_own_scope() {
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![(String::from("x"), Type::Nat)],
+            ret: Type::Nat,
+            body: Expr::Let(
+                String::from("x"),
+                Box::new(Expr::Sub(
+                    NumKind::Nat,
+                    Box::new(Expr::Var(String::from("x"))),
+                    Box::new(Expr::Nat(1)),
+                )),
+                Box::new(Expr::Var(String::from("x"))),
+            ),
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
+        match &body.stmts[0] {
+            Stmt::Let { name, value, .. } => {
+                assert_ne!(name, "x");
+                // `Nat.sub` saturates, so this stays a plain BinOp.
+                assert!(
+                    matches!(value, TExpr::BinOp(_, BinOp::Sub, a, _) if **a == TExpr::Var(String::from("x"))),
+                    "the value must read the PARAMETER x, got {:?}",
+                    value
+                );
+            }
+            other => panic!("expected the hoisted Let, got {:?}", other),
+        }
     }
 }

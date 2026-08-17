@@ -1076,13 +1076,21 @@ fn the_buffer_bounds_check_is_an_explicit_statement_not_the_printers_job() {
 Run: `cd rust && cargo test -p prod-lower bounds_check`
 Expected: FAIL.
 
-- [ ] **Step 4: Implement**
+- [ ] **Step 4: Also lower comparisons and boolean connectives in definition BODIES**
+
+Found during Task 5 and assigned to no task until now. `Lowering::expr` has no arm for `Expr::{Eq,Lt,Le,Gt,And,Or,Not}`, so a comparison in a *definition body* is still `NotYetLowered`. Task 5 added `lower_invariant` for the boolean fragment, but that is a separate, profile-free path for a structure's invariant predicate — it does not serve bodies.
+
+This blocks Task 7, which proves `NotYetLowered` unreachable across the whole corpus. Corpus bodies do contain comparisons, so without this the proof fails.
+
+Add the arms to `Lowering::expr`. All seven are **total** — none can fail under any profile — so each yields a `TExpr` directly and never a `TryLet`. Render them in `prod-emit-rust` as `==`, `<`, `<=`, `>`, `&&`, `||`, `!`, matching the current `Renderer` exactly. Test at least one comparison and one connective end to end, and check the operand order is preserved: `Lt(a, b)` must render `a < b`, not `b < a`.
+
+- [ ] **Step 5: Implement the list lowering**
 
 Under `ListStrategy::CallerBuffer`, each element lowers to an `If` comparing the running index against the buffer length, whose else-branch is `Stmt::Fail(ErrorCode::OutputTooSmall)`, followed by `Stmt::Push`. Under `NativeSequence`, just `Stmt::Push` — write that arm now even though no backend uses it yet: it is three lines, and an abstraction with one implementation is not one.
 
 `Shape::StaticList` keeps its current `&'static [E]` rendering; that is a printer concern.
 
-- [ ] **Step 5: Run tests, gates, commit**
+- [ ] **Step 6: Run tests, gates, commit**
 
 Commit message:
 
@@ -1141,7 +1149,11 @@ pub fn generate_module(module: &Module) -> Result<String, Error> {
 
     let mut out = prod_emit_rust::emit_types(&types);
     for def in &module.definitions {
-        let body = lower_def(def, &shapes, &profile)?;
+        // `lower_def_in`, NOT `lower_def`: the type-table-aware form is what
+        // makes the constructor-arity and `UnknownField` rejections fire. The
+        // table-free `lower_def` cannot check either, so using it here would
+        // silently drop two rejections that `REJECTIONS` still advertises.
+        let body = lower_def_in(def, &shapes, &profile, &module.types)?;
         out.push_str(&prod_emit_rust::emit_body(&body));
         out.push('\n');
     }

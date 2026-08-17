@@ -54,6 +54,18 @@ impl NamePolicy {
         escape: EscapeStrategy::RawIdentifier,
         flatten_namespaces: false,
     };
+
+    /// Mangle one Lean name under this policy: the same transform
+    /// `NameTable::build` applies to every name it certifies as injective.
+    /// Public so a backend's own renderer can call the *exact* mangling the
+    /// checked `NameTable` was built from, rather than keeping a second
+    /// implementation of "how a Lean name becomes a target identifier" that
+    /// could quietly drift from the one that is actually checked — the
+    /// injectivity guarantee is only real if the checked names are the
+    /// emitted names.
+    pub fn apply(&self, name: &str) -> String {
+        mangle(name, self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,15 +134,18 @@ impl NameTable {
                 insert_checked(scope, &ctor_target, &ctor.name)?;
                 forward.insert(ctor.name.clone(), ctor_target);
 
+                // Unlike types, constructors and definitions, a field is
+                // never a global symbol even under `flatten_namespaces`: C
+                // struct members are struct-scoped (`struct A_Foo { int x;
+                // }` and `struct B_Bar { int x; }` coexist fine), so folding
+                // field names into `global_scope` here would reject modules
+                // for a collision the C target itself does not have. If a
+                // future C backend emits *accessor functions* for fields,
+                // those are definitions and already flatten correctly below.
                 let mut field_scope: BTreeMap<String, String> = BTreeMap::new();
                 for (field_name, _field_ty) in &ctor.fields {
                     let field_target = mangle(field_name, policy);
-                    let scope = if policy.flatten_namespaces {
-                        &mut global_scope
-                    } else {
-                        &mut field_scope
-                    };
-                    insert_checked(scope, &field_target, field_name)?;
+                    insert_checked(&mut field_scope, &field_target, field_name)?;
                     forward.insert(field_name.clone(), field_target);
                 }
             }
@@ -204,7 +219,7 @@ mod tests {
     use alloc::format;
     use alloc::string::String;
     use alloc::vec;
-    use prod_ir::{CtorDecl, Module, TypeDecl};
+    use prod_ir::{CtorDecl, Definition, Expr, Module, Type, TypeDecl};
 
     fn module_with_types(names: &[&str]) -> Module {
         Module {
@@ -229,13 +244,52 @@ mod tests {
     fn distinct_lean_names_that_flatten_to_one_target_name_are_rejected() {
         // The failure this component exists to prevent. Both flatten to
         // `Instance`; `crate::Instance` can only mean one of them, and
-        // whichever loses is silently miscompiled.
+        // whichever loses is silently miscompiled. "Names both Lean sources"
+        // is the whole point of the rejection, so pin `first`/`second`, not
+        // just `target` -- a regression that swapped, dropped, or duplicated
+        // them would otherwise pass unnoticed.
         let m = module_with_types(&["A.Instance", "B.Instance"]);
         let err = NameTable::build(&m, &NamePolicy::RUST).unwrap_err();
-        assert!(
-            matches!(&err, NameError::Collision { target, .. } if target == "Instance"),
-            "expected a collision on `Instance`, got {:?}",
-            err
+        assert_eq!(
+            err,
+            NameError::Collision {
+                target: String::from("Instance"),
+                first: String::from("A.Instance"),
+                second: String::from("B.Instance"),
+            }
+        );
+    }
+
+    #[test]
+    fn distinct_definitions_that_flatten_to_one_target_name_are_rejected() {
+        // The constructor/field/type walk is not the whole module: two
+        // top-level definitions collide the same way.
+        let m = Module {
+            name: String::from("M"),
+            types: vec![],
+            definitions: vec![
+                Definition {
+                    name: String::from("A.compute"),
+                    params: vec![],
+                    ret: Type::Nat,
+                    body: Expr::Nat(0),
+                },
+                Definition {
+                    name: String::from("B.compute"),
+                    params: vec![],
+                    ret: Type::Nat,
+                    body: Expr::Nat(0),
+                },
+            ],
+        };
+        let err = NameTable::build(&m, &NamePolicy::RUST).unwrap_err();
+        assert_eq!(
+            err,
+            NameError::Collision {
+                target: String::from("compute"),
+                first: String::from("A.compute"),
+                second: String::from("B.compute"),
+            }
         );
     }
 
@@ -268,5 +322,98 @@ mod tests {
         let m = module_with_types(&["A.type", "A.type_"]);
         let err = NameTable::build(&m, &policy).unwrap_err();
         assert!(matches!(&err, NameError::Collision { target, .. } if target == "type_"));
+    }
+
+    #[test]
+    fn flatten_namespaces_lets_constructors_of_different_types_collide() {
+        // C has one global symbol space: once every scope collapses into
+        // one, a constructor is no longer isolated to its own type's
+        // variants. `A.Thing.mk` and `A_Thing.mk` are distinct Lean names --
+        // one type genuinely named with an underscore, the other namespaced
+        // -- that the naive dot-to-underscore flattening collapses onto the
+        // same symbol; that collapse is exactly what `flatten_namespaces`
+        // must be checked against.
+        let policy = NamePolicy {
+            keywords: &[],
+            escape: EscapeStrategy::SuffixUnderscore,
+            flatten_namespaces: true,
+        };
+        let m = Module {
+            name: String::from("M"),
+            types: vec![
+                TypeDecl {
+                    name: String::from("A.Thing"),
+                    ctors: vec![CtorDecl {
+                        name: String::from("A.Thing.mk"),
+                        fields: vec![],
+                    }],
+                    unsupported: None,
+                    invariant: None,
+                },
+                TypeDecl {
+                    name: String::from("Q"),
+                    ctors: vec![CtorDecl {
+                        name: String::from("A_Thing.mk"),
+                        fields: vec![],
+                    }],
+                    unsupported: None,
+                    invariant: None,
+                },
+            ],
+            definitions: vec![],
+        };
+        let err = NameTable::build(&m, &policy).unwrap_err();
+        assert_eq!(
+            err,
+            NameError::Collision {
+                target: String::from("A_Thing_mk"),
+                first: String::from("A.Thing.mk"),
+                second: String::from("A_Thing.mk"),
+            }
+        );
+    }
+
+    #[test]
+    fn flatten_namespaces_never_pools_fields_across_different_constructors() {
+        // C struct members are struct-scoped even though C itself has no
+        // namespaces: `struct A_Foo { int x; }` and `struct B_Bar { int x;
+        // }` coexist fine. A field must not become a global symbol even
+        // under `flatten_namespaces`, or this pair -- one field literally
+        // named the keyword `type`, escaped to `type_`, and an unrelated
+        // field on a different type already named `type_` -- would be
+        // rejected as a collision that the C target does not actually have.
+        let policy = NamePolicy {
+            keywords: &["type"],
+            escape: EscapeStrategy::SuffixUnderscore,
+            flatten_namespaces: true,
+        };
+        let m = Module {
+            name: String::from("M"),
+            types: vec![
+                TypeDecl {
+                    name: String::from("A.Foo"),
+                    ctors: vec![CtorDecl {
+                        name: String::from("A.Foo.mk"),
+                        fields: vec![(String::from("type"), Type::Nat)],
+                    }],
+                    unsupported: None,
+                    invariant: None,
+                },
+                TypeDecl {
+                    name: String::from("B.Bar"),
+                    ctors: vec![CtorDecl {
+                        name: String::from("B.Bar.mk"),
+                        fields: vec![(String::from("type_"), Type::Nat)],
+                    }],
+                    unsupported: None,
+                    invariant: None,
+                },
+            ],
+            definitions: vec![],
+        };
+        let table = NameTable::build(&m, &policy)
+            .expect("fields stay scoped to their own constructor even when flattened");
+        assert_eq!(table.target_name("type"), Some("type_"));
+        assert_eq!(table.target_name("type_"), Some("type_"));
     }
 }

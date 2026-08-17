@@ -111,7 +111,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, NumKind, Type, TypeDecl};
-use prod_lower::names::{NameError, NamePolicy, NameTable, RUST_KEYWORDS};
+use prod_lower::names::{NameError, NamePolicy, NameTable};
 use prod_lower::profile::TargetProfile;
 pub use prod_lower::shape::Shape;
 use prod_lower::shape::{signatures, Signatures};
@@ -284,20 +284,18 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     ),
 ];
 
-/// A Lean identifier as a Rust identifier, raw-escaped if it is a keyword.
-/// `RUST_KEYWORDS` lives in `prod_lower::names` now, shared with every
-/// backend that wants Rust's own keyword list.
+/// A full Lean name as a Rust identifier: its last dot-separated component
+/// (a bare, dot-free name passes through unchanged), raw-escaped if that
+/// component is a keyword.
+///
+/// Delegates to `prod_lower::names::NamePolicy::RUST` rather than
+/// re-deriving the last-component-plus-escape logic here: that is the exact
+/// mangling `check_type_name_collisions` uses to certify injectivity, and a
+/// second, hand-written copy of it could quietly drift from what actually
+/// gets emitted below, which would make the certification worthless without
+/// anyone noticing.
 fn rust_ident(name: &str) -> String {
-    if RUST_KEYWORDS.contains(&name) {
-        format!("r#{}", name)
-    } else {
-        String::from(name)
-    }
-}
-
-/// Last dot-separated component of a full Lean name.
-fn last_component(name: &str) -> &str {
-    name.rsplit('.').next().unwrap_or(name)
+    NamePolicy::RUST.apply(name)
 }
 
 /// Full Lean type name → its declaration, for the module being rendered.
@@ -371,7 +369,7 @@ fn generate_type_decl<'m>(decl: &'m TypeDecl, table: &TypeTable<'m>) -> Result<S
     }
 
     let mut out = String::from("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
-    let short = last_component(&decl.name);
+    let ident = rust_ident(&decl.name);
 
     if decl.ctors.len() == 1 {
         let ctor = &decl.ctors[0];
@@ -384,7 +382,7 @@ fn generate_type_decl<'m>(decl: &'m TypeDecl, table: &TypeTable<'m>) -> Result<S
         } else {
             "pub"
         };
-        out.push_str(&format!("pub struct {} {{\n", rust_ident(short)));
+        out.push_str(&format!("pub struct {} {{\n", ident));
         for (name, ty) in &ctor.fields {
             out.push_str(&format!(
                 "    {} {}: {},\n",
@@ -396,7 +394,7 @@ fn generate_type_decl<'m>(decl: &'m TypeDecl, table: &TypeTable<'m>) -> Result<S
         out.push_str("}\n");
 
         if let Some(invariant) = &decl.invariant {
-            let rust_name = rust_ident(short);
+            let rust_name = ident;
 
             // The accessors share an `impl` block with `new`, so a field named
             // `new` would emit two inherent methods of that name (E0592).
@@ -479,9 +477,9 @@ fn generate_type_decl<'m>(decl: &'m TypeDecl, table: &TypeTable<'m>) -> Result<S
         )));
     }
 
-    out.push_str(&format!("pub enum {} {{\n", rust_ident(short)));
+    out.push_str(&format!("pub enum {} {{\n", ident));
     for ctor in &decl.ctors {
-        let variant = rust_ident(last_component(&ctor.name));
+        let variant = rust_ident(&ctor.name);
         if ctor.fields.is_empty() {
             out.push_str(&format!("    {},\n", variant));
             continue;
@@ -662,7 +660,7 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
         Type::Int => String::from("i64"),
         Type::Bool => String::from("bool"),
         Type::UInt(k) => String::from(k.rust_type()),
-        Type::Named(n) => format!("crate::{}", rust_ident(last_component(n))),
+        Type::Named(n) => format!("crate::{}", rust_ident(n)),
         Type::Option(inner) => format!("Option<{}>", type_to_rust(inner)?),
         Type::Tuple(items) => {
             let mut rendered = Vec::with_capacity(items.len());
@@ -1161,12 +1159,12 @@ impl<'m> Renderer<'_, 'm> {
                         )));
                     }
                     let path = if decl.ctors.len() == 1 {
-                        format!("crate::{}", rust_ident(last_component(&decl.name)))
+                        format!("crate::{}", rust_ident(&decl.name))
                     } else {
                         format!(
                             "crate::{}::{}",
-                            rust_ident(last_component(&decl.name)),
-                            rust_ident(last_component(&cdecl.name))
+                            rust_ident(&decl.name),
+                            rust_ident(&cdecl.name)
                         )
                     };
                     if cdecl.fields.is_empty() {
@@ -1335,12 +1333,12 @@ impl<'m> Renderer<'_, 'm> {
                 _ => match self.ctor_decl(&alt.ctor) {
                     Some((decl, cdecl)) if alt.binders.len() == cdecl.fields.len() => {
                         let path = if decl.ctors.len() == 1 {
-                            format!("crate::{}", rust_ident(last_component(&decl.name)))
+                            format!("crate::{}", rust_ident(&decl.name))
                         } else {
                             format!(
                                 "crate::{}::{}",
-                                rust_ident(last_component(&decl.name)),
-                                rust_ident(last_component(&cdecl.name))
+                                rust_ident(&decl.name),
+                                rust_ident(&cdecl.name)
                             )
                         };
                         if cdecl.fields.is_empty() {

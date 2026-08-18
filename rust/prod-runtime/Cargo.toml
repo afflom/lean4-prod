@@ -1,0 +1,10 @@
+[package]
+name = "prod-runtime"
+version = "0.1.0"
+edition = "2021"
+authors = ["UOR Foundation"]
+license = "MIT"
+description = "Bounded deterministic host runtime for Lean-generated functions"
+
+[lints]
+workspace = true

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "prod-ir",
     "prod-codegen",
+    "prod-runtime",
     "prod-macros",
     "prod-core",
     "prod-cli",

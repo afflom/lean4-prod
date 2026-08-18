@@ -40,10 +40,13 @@ What that means in practice, and what you must not regress:
   test-only `prod-alloc-counter` (holds the one `unsafe impl GlobalAlloc`, so
   that `prod-core` can forbid unsafe in *all* its targets). `prod-core` also
   denies `clippy::{unwrap_used, expect_used, panic}`.
-- **Parallelism principles** (nothing parallel is implemented yet; generated
-  fns are pure and `Send`/`Sync` by construction): if data-parallel codegen is
-  added, use bounded workers and a deterministic merge order, no unbounded
-  queues, and canonical output bytes must never depend on thread scheduling.
+- **Parallelism principles.** Generated fns are pure and `Send`/`Sync` by
+  construction. The host-only `prod-runtime` crate now provides bounded
+  `parallel_map` execution over disjoint caller-owned slices, with deterministic
+  chunk-order joins and panic containment. Automatic proof-guided parallel
+  codegen is still future work: if it is added, use bounded workers and a
+  deterministic merge order, no unbounded queues, and canonical output bytes
+  must never depend on thread scheduling.
 
 ## Rules (hard)
 
@@ -217,7 +220,10 @@ PATTERNS: an alt naming an undeclared constructor still renders
 `Foo.Bar.left(v) => v`, which rustc rejects as "expected a pattern, found an
 expression". Same defect class, same fix shape; not done. Monomorphization is still absent, so a
 parameterised inductive is rejected (`PolymorphicType`) rather than lowered.
-No data-parallel codegen.
+Automatic data-parallel codegen is not implemented. The host-only
+`prod-runtime` crate can run independent generated functions in bounded,
+deterministic chunks; it does not make arbitrary closures safe or infer
+independence.
 
 ## M3 spec — the LCNF extractor (the defensible core)
 

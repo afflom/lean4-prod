@@ -78,7 +78,7 @@ pub fn lower_def_in(
         // It goes through `bind_source` like every other binder, so a
         // definition whose own source already writes `output` gets a fresh
         // name rather than two live bindings sharing one -- which
-        // `prod-emit-rust`'s `uses()`, counting reads by name with no scope of
+        // the Rust emitter's `uses()`, counting reads by name with no scope of
         // its own, would silently pool.
         Shape::Buffer | Shape::StaticList => {
             // `prod-codegen`'s own pre-check, kept DISTINCT from the
@@ -129,7 +129,7 @@ pub fn lower_def_in(
 /// `(named ...)` in one must be declared in this module.
 ///
 /// The printers are total by construction, so nothing downstream can refuse a
-/// signature: `prod-emit-rust`'s `value_type` renders an unrenderable type as
+/// signature: the Rust emitter's `value_type` renders an unrenderable type as
 /// a placeholder identifier rather than an error. `prod-codegen` refused these
 /// in `param_type_to_rust`/`type_to_rust`/`check_named_type`, before it
 /// rendered the body, and the checks are in that order here so a signature
@@ -295,11 +295,15 @@ fn check_constant_list(stmts: &[Stmt]) -> Result<(), LowerError> {
 /// checked constructor -- all settled here. How any of it is spelled is the
 /// printer's, and `emit_types` returns a `String` rather than a `Result`
 /// precisely because nothing is left for it to refuse.
-pub fn lower_types(module: &Module, policy: &NamePolicy) -> Result<Vec<TypeDef>, LowerError> {
+pub fn lower_types(
+    module: &Module,
+    policy: &NamePolicy,
+    profile: &TargetProfile,
+) -> Result<Vec<TypeDef>, LowerError> {
     check_type_name_collisions(&module.types, policy)?;
     let mut out = Vec::with_capacity(module.types.len());
     for decl in &module.types {
-        out.push(lower_type_decl(decl, &module.types, policy)?);
+        out.push(lower_type_decl(decl, &module.types, policy, profile)?);
     }
     Ok(out)
 }
@@ -344,6 +348,7 @@ fn lower_type_decl(
     decl: &TypeDecl,
     all: &[TypeDecl],
     policy: &NamePolicy,
+    profile: &TargetProfile,
 ) -> Result<TypeDef, LowerError> {
     // The exporter reached this type but could not describe it. It is declared
     // anyway so that the rejection names a reason instead of an unknown type.
@@ -382,7 +387,7 @@ fn lower_type_decl(
                     }
                 }
                 Some(lower_invariant(
-                    predicate, &decl.name, &fields, all, policy,
+                    predicate, &decl.name, &fields, all, policy, profile,
                 )?)
             }
         };
@@ -527,11 +532,13 @@ fn check_representable(ty: &Type) -> Result<(), LowerError> {
 /// Lower a structure's invariant: a predicate over the structure's own fields.
 ///
 /// Deliberately **not** [`Lowering::expr`]. That one needs a
-/// [`TargetProfile`] to decide what can fail, and `lower_types` has none --
-/// which is the right shape rather than an inconvenience. `lower_types`
-/// produces one [`TypeDef`] that *every* backend prints, so the predicate in
-/// it has to be a single total expression under every profile at once. That
-/// is what [`TargetProfile::op_is_fallible_under_any_profile`] answers.
+/// [`TargetProfile`] to decide what can fail, while this path must keep its
+/// fallibility decision profile-independent. `lower_types` produces one
+/// [`TypeDef`] that *every* backend prints, so the predicate in it has to be a
+/// single total expression under every profile at once. That is what
+/// [`TargetProfile::op_is_fallible_under_any_profile`] answers. The profile
+/// passed here is used only for target-specific spelling, currently sized
+/// arithmetic masks.
 /// (One thing escapes that question: a `Call`, whose shape needs a
 /// [`Signatures`] map `lower_types` does not have. See its arm below -- the
 /// assumption is `prod-codegen`'s own, preserved rather than invented.)
@@ -573,8 +580,9 @@ fn lower_invariant(
     fields: &[(String, Type)],
     decls: &[TypeDecl],
     policy: &NamePolicy,
+    profile: &TargetProfile,
 ) -> Result<TExpr, LowerError> {
-    let sub = |x: &Expr| lower_invariant(x, owner, fields, decls, policy);
+    let sub = |x: &Expr| lower_invariant(x, owner, fields, decls, policy, profile);
     match e {
         Expr::Nat(n) => Ok(TExpr::Lit(Lit::Nat(*n))),
         Expr::Int(n) => Ok(TExpr::Lit(Lit::Int(*n))),
@@ -603,27 +611,27 @@ fn lower_invariant(
         Expr::Or(a, b) => Ok(TExpr::Or(Box::new(sub(a)?), Box::new(sub(b)?))),
         Expr::Not(a) => Ok(TExpr::Not(Box::new(sub(a)?))),
 
-        Expr::Add(k, a, b) => invariant_arith(e, owner, *k, BinOp::Add, sub(a)?, sub(b)?),
-        Expr::Sub(k, a, b) => invariant_arith(e, owner, *k, BinOp::Sub, sub(a)?, sub(b)?),
-        Expr::Mul(k, a, b) => invariant_arith(e, owner, *k, BinOp::Mul, sub(a)?, sub(b)?),
+        Expr::Add(k, a, b) => invariant_arith(e, owner, profile, *k, BinOp::Add, sub(a)?, sub(b)?),
+        Expr::Sub(k, a, b) => invariant_arith(e, owner, profile, *k, BinOp::Sub, sub(a)?, sub(b)?),
+        Expr::Mul(k, a, b) => invariant_arith(e, owner, profile, *k, BinOp::Mul, sub(a)?, sub(b)?),
         // `Nat` and the sized kinds are unsigned, where truncating, flooring
         // and Euclidean division coincide, so no host needs a correction and
         // the operator is the same for every profile. `Int` division is
         // fallible under every profile and is rejected below before the
         // question of which operator arises.
-        Expr::Div(k, a, b) => invariant_arith(e, owner, *k, BinOp::Div, sub(a)?, sub(b)?),
-        Expr::Mod(k, a, b) => invariant_arith(e, owner, *k, BinOp::Mod, sub(a)?, sub(b)?),
+        Expr::Div(k, a, b) => invariant_arith(e, owner, profile, *k, BinOp::Div, sub(a)?, sub(b)?),
+        Expr::Mod(k, a, b) => invariant_arith(e, owner, profile, *k, BinOp::Mod, sub(a)?, sub(b)?),
         Expr::Shl(k, a, b) => {
             reject_int_shift(*k)?;
-            invariant_arith(e, owner, *k, BinOp::Shl, sub(a)?, sub(b)?)
+            invariant_arith(e, owner, profile, *k, BinOp::Shl, sub(a)?, sub(b)?)
         }
         Expr::Shr(k, a, b) => {
             reject_int_shift(*k)?;
-            invariant_arith(e, owner, *k, BinOp::Shr, sub(a)?, sub(b)?)
+            invariant_arith(e, owner, profile, *k, BinOp::Shr, sub(a)?, sub(b)?)
         }
         Expr::Pow(k, a, b) => {
             reject_sized_pow(*k)?;
-            invariant_arith(e, owner, *k, BinOp::Pow, sub(a)?, sub(b)?)
+            invariant_arith(e, owner, profile, *k, BinOp::Pow, sub(a)?, sub(b)?)
         }
         Expr::Neg(k, a) => {
             reject_non_int_neg(*k)?;
@@ -772,6 +780,7 @@ fn is_builtin_ctor(name: &str, arity: usize) -> bool {
 fn invariant_arith(
     node: &Expr,
     owner: &str,
+    profile: &TargetProfile,
     kind: NumKind,
     op: BinOp,
     a: TExpr,
@@ -780,7 +789,11 @@ fn invariant_arith(
     if TargetProfile::op_is_fallible_under_any_profile(node) {
         return Err(invariant_can_fail(owner, node));
     }
-    Ok(TExpr::BinOp(kind, op, Box::new(a), Box::new(b)))
+    Ok(Lowering::mask_sized(
+        profile,
+        kind,
+        TExpr::BinOp(kind, op, Box::new(a), Box::new(b)),
+    ))
 }
 
 /// The rejection for an invariant that contains a failing operation.
@@ -1141,7 +1154,7 @@ impl<'a> Lowering<'a> {
             Expr::Convert(from, to, a) => {
                 check_conversion(*from, *to)?;
                 let value = TExpr::Convert(*from, *to, Box::new(self.expr(a, stmts)?));
-                Ok(self.mask_sized(*to, value))
+                Ok(Self::mask_sized(self.profile, *to, value))
             }
 
             Expr::Neg(k, a) => {
@@ -1739,7 +1752,7 @@ impl<'a> Lowering<'a> {
         } else {
             TExpr::BinOp(kind, op, Box::new(a), Box::new(b))
         };
-        Ok(self.mask_sized(kind, value))
+        Ok(Self::mask_sized(self.profile, kind, value))
     }
 
     /// Reduce a sized-kind result to its own width, on a host that has no
@@ -1765,8 +1778,8 @@ impl<'a> Lowering<'a> {
     /// are redundant -- but "mask every sized result" is a rule the next
     /// operator inherits, and "mask the widening ones" is a list someone has
     /// to remember to extend.
-    fn mask_sized(&self, kind: NumKind, value: TExpr) -> TExpr {
-        if !self.profile.sized_mask_required {
+    fn mask_sized(profile: &TargetProfile, kind: NumKind, value: TExpr) -> TExpr {
+        if !profile.sized_mask_required {
             return value;
         }
         match sized_mask(kind) {
@@ -1950,7 +1963,7 @@ fn kind_type(kind: NumKind) -> Type {
 ///
 /// [`Signatures`] records each definition's [`Shape`], not its return type, so
 /// a call's result is untyped here, as are constructors and projections.
-/// Rust's `let` infers, so `prod-emit-rust` never reads the field; a C backend
+/// Rust's `let` infers, so the Rust emitter never reads the field; a C backend
 /// will, and widening the table consulted here is what that backend will need.
 /// Spelled `Opaque` deliberately rather than guessed: a printer that does read
 /// it then fails loudly instead of declaring the wrong type.
@@ -2951,7 +2964,12 @@ mod tests {
 "#,
         );
         assert_eq!(
-            lower_types(&module, &crate::names::NamePolicy::RUST).err(),
+            lower_types(
+                &module,
+                &crate::names::NamePolicy::RUST,
+                &TargetProfile::RUST
+            )
+            .err(),
             Some(LowerError::UnknownField(
                 String::from("M.Inner"),
                 String::from("nope")
@@ -3016,9 +3034,13 @@ mod tests {
         for (ir, expected) in cases {
             let module = parse(ir);
             assert_eq!(
-                lower_types(&module, &crate::names::NamePolicy::RUST)
-                    .err()
-                    .as_ref(),
+                lower_types(
+                    &module,
+                    &crate::names::NamePolicy::RUST,
+                    &TargetProfile::RUST
+                )
+                .err()
+                .as_ref(),
                 Some(expected),
                 "for {}",
                 ir
@@ -3039,8 +3061,12 @@ mod tests {
             r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat) (T Nat) (a U8) (b U8))
                  (invariant (and (le 1 (sub Nat q T)) (le (add U8 a b) 200)))))"#,
         );
-        let types = lower_types(&module, &crate::names::NamePolicy::RUST)
-            .expect("saturating subtraction and wrapping sized addition are total");
+        let types = lower_types(
+            &module,
+            &crate::names::NamePolicy::RUST,
+            &TargetProfile::RUST,
+        )
+        .expect("saturating subtraction and wrapping sized addition are total");
         let invariant = types[0].invariant.as_ref().expect("an invariant");
         // `Nat.sub` saturates and `UInt8.add` wraps; neither is a `TryLet`
         // anywhere, so both stay inside the one expression.
@@ -3054,6 +3080,51 @@ mod tests {
             "got {:?}",
             invariant
         );
+    }
+
+    /// Invariant predicates are shared by every backend, but their arithmetic
+    /// spelling still follows the selected target profile. A host without
+    /// fixed-width integers must mask sized results; Rust's native `u8` does
+    /// that implicitly. The profile must not change the invariant's
+    /// profile-independent admission decision -- only this expression tree.
+    #[test]
+    fn a_masking_profile_masks_sized_arithmetic_inside_an_invariant() {
+        let module = parse(
+            r#"(module M
+                 (type "M.S" (ctor "M.S.mk" (a U8) (b U8))
+                   (invariant (le (add U8 a b) 200))))"#,
+        );
+        let native = lower_types(
+            &module,
+            &crate::names::NamePolicy::RUST,
+            &TargetProfile::RUST,
+        )
+        .expect("the invariant is total under every profile");
+        let masked = lower_types(
+            &module,
+            &crate::names::NamePolicy::RUST,
+            &TargetProfile::PYTHON,
+        )
+        .expect("the invariant is total under every profile");
+
+        let native = native[0].invariant.as_ref().expect("an invariant");
+        let masked = masked[0].invariant.as_ref().expect("an invariant");
+        assert_ne!(native, masked, "the masking profile changed nothing");
+        assert!(matches!(
+            native,
+            TExpr::BinOp(NumKind::U8, BinOp::Le, lhs, _)
+                if matches!(&**lhs, TExpr::BinOp(NumKind::U8, BinOp::Add, ..))
+        ));
+        assert!(matches!(
+            masked,
+            TExpr::BinOp(NumKind::U8, BinOp::Le, lhs, _)
+                if matches!(
+                    &**lhs,
+                    TExpr::BinOp(NumKind::U8, BinOp::BitAnd, inner, mask)
+                        if matches!(&**inner, TExpr::BinOp(NumKind::U8, BinOp::Add, ..))
+                            && **mask == TExpr::Lit(Lit::Nat(255))
+                )
+        ));
     }
 
     /// The half of `prod-codegen`'s invariant fragment this lowering
@@ -3083,7 +3154,12 @@ mod tests {
         ] {
             let module = parse(ir);
             assert_eq!(
-                lower_types(&module, &crate::names::NamePolicy::RUST).err(),
+                lower_types(
+                    &module,
+                    &crate::names::NamePolicy::RUST,
+                    &TargetProfile::RUST
+                )
+                .err(),
                 Some(LowerError::UnsupportedFieldType(format!(
                     "`M.S`: an invariant may not contain an operation that can fail, and `{}` can; \
                      the checked constructor would report that failure instead of the invariant \
@@ -3176,7 +3252,12 @@ mod tests {
 "#,
         );
         assert_eq!(
-            lower_types(&module, &crate::names::NamePolicy::RUST).err(),
+            lower_types(
+                &module,
+                &crate::names::NamePolicy::RUST,
+                &TargetProfile::RUST
+            )
+            .err(),
             Some(LowerError::UnknownField(
                 String::from("M.Inner"),
                 String::from("nope")
@@ -3196,8 +3277,12 @@ mod tests {
             (invariant (le 1 (proj "M.Inner" "x" q)))))
 "#,
         );
-        let types = lower_types(&module, &crate::names::NamePolicy::RUST)
-            .expect("a declared field projects fine");
+        let types = lower_types(
+            &module,
+            &crate::names::NamePolicy::RUST,
+            &TargetProfile::RUST,
+        )
+        .expect("a declared field projects fine");
         let s = types.iter().find(|t| t.lean_name == "M.S").expect("M.S");
         let invariant = s.invariant.as_ref().expect("an invariant");
         assert!(
@@ -3221,7 +3306,12 @@ mod tests {
             r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat)) (invariant (le 1 (param 0)))))"#,
         );
         assert_eq!(
-            lower_types(&module, &crate::names::NamePolicy::RUST).err(),
+            lower_types(
+                &module,
+                &crate::names::NamePolicy::RUST,
+                &TargetProfile::RUST
+            )
+            .err(),
             Some(LowerError::ParamOutOfBounds(0)),
         );
     }
@@ -3695,8 +3785,12 @@ mod tests {
         let mut shapes_seen: Vec<Shape> = Vec::new();
         for (label, ir) in corpora {
             let module = parse(ir);
-            lower_types(&module, &crate::names::NamePolicy::RUST)
-                .unwrap_or_else(|e| panic!("{}: types must lower, got {:?}", label, e));
+            lower_types(
+                &module,
+                &crate::names::NamePolicy::RUST,
+                &TargetProfile::RUST,
+            )
+            .unwrap_or_else(|e| panic!("{}: types must lower, got {:?}", label, e));
             let shapes = signatures(&module.definitions, &TargetProfile::RUST);
             assert!(!module.definitions.is_empty(), "{} is empty", label);
             for def in &module.definitions {
@@ -3916,8 +4010,12 @@ mod tests {
             r#"(module M (type "M.S" (ctor "M.S.mk" (used U8))
                  (invariant (le (convert U8 Nat used) 200))))"#,
         );
-        let types = lower_types(&module, &crate::names::NamePolicy::RUST)
-            .expect("a lossless conversion is total, so an invariant may contain it");
+        let types = lower_types(
+            &module,
+            &crate::names::NamePolicy::RUST,
+            &TargetProfile::RUST,
+        )
+        .expect("a lossless conversion is total, so an invariant may contain it");
         assert!(
             matches!(
                 types[0].invariant.as_ref().expect("an invariant"),
@@ -3934,7 +4032,12 @@ mod tests {
         );
         assert!(
             matches!(
-                lower_types(&module, &crate::names::NamePolicy::RUST).err(),
+                lower_types(
+                    &module,
+                    &crate::names::NamePolicy::RUST,
+                    &TargetProfile::RUST
+                )
+                .err(),
                 Some(LowerError::UnsupportedKind(_))
             ),
             "the invariant path must refuse what the body path refuses"
@@ -3956,7 +4059,12 @@ mod tests {
             r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat)) {}))"#,
             invariant
         ));
-        lower_types(&module, &crate::names::NamePolicy::RUST).expect_err("must be rejected")
+        lower_types(
+            &module,
+            &crate::names::NamePolicy::RUST,
+            &TargetProfile::RUST,
+        )
+        .expect_err("must be rejected")
     }
 
     // ------------------------------- Task 7: the rejections that outlive
@@ -4044,7 +4152,7 @@ mod tests {
 
     /// A signature's types are checked HERE, before the body is lowered.
     ///
-    /// Nothing downstream can refuse one: `prod-emit-rust` is total by
+    /// Nothing downstream can refuse one: the Rust emitter is total by
     /// construction and renders an unrenderable type as a placeholder
     /// identifier rather than an error. `prod-codegen` refused these in
     /// `param_type_to_rust`/`type_to_rust`, and the rejections came across

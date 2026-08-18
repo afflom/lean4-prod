@@ -126,7 +126,7 @@ pub enum TExpr {
 /// # These are the one POSITION-DEPENDENT expressions in the IR
 ///
 /// Every other [`TExpr`] means the same thing wherever it is evaluated, which
-/// is what lets a printer relocate one -- `prod-emit-rust` folds a
+/// is what lets a printer relocate one -- the Rust emitter folds a
 /// single-use [`Stmt::TryLet`] down into its use site on exactly that
 /// assumption. A `Seq` denotes the cursor, or something taken from it, **at
 /// the point in the statement list where it is reached**: every [`Stmt::Push`]
@@ -136,7 +136,7 @@ pub enum TExpr {
 /// This is a *different property from totality*, and totality is not a
 /// substitute for it. All three variants are total -- none can fail, so none
 /// is a [`Stmt::TryLet`] -- and they still may not be relocated. A printer
-/// that reorders expressions owes them a pin; `prod-emit-rust` spells that as
+/// that reorders expressions owes them a pin; the Rust emitter spells that as
 /// declining to fold any `TryLet` whose operation mentions one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeqQuery {

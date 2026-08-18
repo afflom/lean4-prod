@@ -2,8 +2,8 @@
 //!
 //! **This crate is a facade.** It owns the published rejection contract --
 //! [`Error`] and [`REJECTIONS`] -- and nothing else: `prod-lower` decides what
-//! a definition *means* as an imperative Target IR, and `prod-emit-rust`
-//! decides how Rust *spells* it. A backend-specific decision inside this
+//! a definition *means* as an imperative Target IR, and the internal
+//! `emit_rust` module decides how Rust *spells* it. A backend-specific decision inside this
 //! crate, or inside `prod-lower`, is the design failure the split exists to
 //! prevent; it belongs in a `prod_lower::profile::TargetProfile`.
 //!
@@ -128,6 +128,8 @@ use prod_lower::names::{NameError, NamePolicy, NameTable};
 use prod_lower::profile::TargetProfile;
 use prod_lower::shape::signatures;
 pub use prod_lower::shape::Shape;
+
+mod emit_rust;
 
 /// Errors that can occur during code generation
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,17 +349,17 @@ impl From<NameError> for Error {
 pub fn generate_module(module: &Module) -> Result<String, Error> {
     let profile = TargetProfile::RUST;
     NameTable::build(module, &NamePolicy::RUST)?;
-    let types = lower_types(module, &NamePolicy::RUST)?;
+    let types = lower_types(module, &NamePolicy::RUST, &profile)?;
     let shapes = signatures(&module.definitions, &profile);
 
-    let mut out = prod_emit_rust::emit_types(&types);
+    let mut out = emit_rust::emit_types(&types);
     for def in &module.definitions {
         // `lower_def_in`, NOT `lower_def`: the type-table-aware form is what
         // makes the constructor-arity and `UnknownField` rejections fire. The
         // table-free `lower_def` cannot check either, so using it here would
         // silently drop two rejections that `REJECTIONS` still advertises.
         let body = lower_def_in(def, &shapes, &profile, &module.types)?;
-        out.push_str(&prod_emit_rust::emit_body(&body, &types));
+        out.push_str(&emit_rust::emit_body(&body, &types));
         out.push('\n');
     }
     Ok(out)
@@ -374,7 +376,7 @@ pub fn generate_def(def: &Definition) -> Result<String, Error> {
     let one = core::slice::from_ref(def);
     let shapes = signatures(one, &TargetProfile::RUST);
     let body = lower_def(def, &shapes, &TargetProfile::RUST)?;
-    Ok(prod_emit_rust::emit_body(&body, &[]))
+    Ok(emit_rust::emit_body(&body, &[]))
 }
 
 #[cfg(test)]

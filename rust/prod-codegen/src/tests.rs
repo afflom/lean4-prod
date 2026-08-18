@@ -76,6 +76,32 @@ fn test_generate_list_param_is_a_slice_and_return_is_a_buffer() {
 }
 
 #[test]
+fn generated_list_writes_do_not_use_indexing_syntax() {
+    // `clippy::indexing_slicing` does not inspect proc-macro expansions, and
+    // the scratch experiment for this task also showed it does not inspect
+    // `include!`d source. Keep the safety property executable at the source
+    // generator boundary instead: a caller-controlled output buffer may only
+    // be written through the checked `get_mut` path.
+    let ir = r#"
+(module M
+  (def digits ((n Nat)) (List Nat)
+    (ctor "List.cons" n (ctor "List.nil"))))
+"#;
+    let out = generate(ir);
+    assert!(out.contains("output.get_mut(__len)"), "got: {}", out);
+    assert!(
+        !out.contains("output["),
+        "generated output indexes the buffer: {}",
+        out
+    );
+    assert!(
+        !out.lines().any(|line| line.contains("] =")),
+        "generated output contains an indexed assignment: {}",
+        out
+    );
+}
+
+#[test]
 fn test_generate_list_builder_resolves_anf_let_bindings() {
     // The exact shape prod-export emits for `digits`: LCNF is in A-normal
     // form, so every cons cell arrives as a `let`. Those bindings have no

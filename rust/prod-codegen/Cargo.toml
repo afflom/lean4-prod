@@ -9,6 +9,5 @@ license = "MIT"
 workspace = true
 
 [dependencies]
-prod-emit-rust = { path = "../prod-emit-rust" }
 prod-ir = { path = "../prod-ir" }
 prod-lower = { path = "../prod-lower" }

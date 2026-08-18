@@ -90,6 +90,48 @@ pub enum TExpr {
     Not(Box<TExpr>),
     And(Box<TExpr>, Box<TExpr>),
     Or(Box<TExpr>, Box<TExpr>),
+    /// A conversion between two numeric kinds, `from` then `to`.
+    ///
+    /// Total, and therefore an expression: the admitted set is exactly the
+    /// **lossless** one -- `Nat <-> Int`, `UIntN -> Nat`, `Nat -> UIntN` --
+    /// and [`crate::lower`] refuses every other pair before one can reach a
+    /// printer. `Int -> Nat` clamps (Lean's `Int.toNat`) and `Nat -> UIntN`
+    /// truncates (Lean's `Nat.toUIntN`, which is `BitVec` truncation); both
+    /// are total functions in Lean, not failures.
+    Convert(NumKind, NumKind, Box<TExpr>),
+    /// A question about the output sequence a list-shaped definition appends
+    /// to. The `String` is [`Body::output`].
+    ///
+    /// A sequence has no `TExpr` of its own: what a backend can spell is a
+    /// property of it, and which properties exist is [`SeqQuery`]. All of
+    /// them are total.
+    Seq(SeqQuery, String),
+}
+
+/// What a lowering asks about an output sequence.
+///
+/// Each variant is a question every backend can answer, asked because the
+/// *lowering* needed it -- the bounds check is [`SeqQuery::Len`] against
+/// [`SeqQuery::Cap`], and it is in the statement list rather than inside a
+/// printer precisely so that three printers cannot forget it three times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqQuery {
+    /// How many elements have been appended so far: the running index.
+    ///
+    /// Also what a list-shaped definition returns. [`crate::shape::Shape`]
+    /// documents that signature -- `-> Result<usize, ComputeError>` -- for
+    /// every strategy, so "how many did you write" is the answer under
+    /// `NativeSequence` too, not a `CallerBuffer` detail leaking out.
+    Len,
+    /// How many elements the sequence can hold.
+    ///
+    /// Only a bounded sequence has an answer, so only a
+    /// [`crate::profile::ListStrategy::CallerBuffer`] lowering asks; a
+    /// `NativeSequence` one emits no bounds check and never mentions this.
+    Cap,
+    /// The part of the sequence not yet written, handed to a list-shaped
+    /// callee so that it appends where this definition left off.
+    Rest,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -138,6 +180,18 @@ pub enum Stmt {
     Push {
         seq: String,
         value: TExpr,
+    },
+    /// Advance `seq` past the `count` elements a list-shaped callee has
+    /// already appended to it.
+    ///
+    /// Split from the call itself on purpose: the call is a [`Stmt::TryLet`]
+    /// like every other fallible call -- the callee is the one that can run
+    /// out of room and say so -- and this statement, which cannot fail, only
+    /// moves the cursor. Folding the two together would make a second failure
+    /// point and cost the invariant this IR is built around.
+    Advance {
+        seq: String,
+        count: TExpr,
     },
 }
 
@@ -197,5 +251,13 @@ pub struct Body {
     pub params: Vec<(String, Type)>,
     pub ret: Type,
     pub shape: crate::shape::Shape,
+    /// The output sequence this definition appends to, named here because the
+    /// printer has to declare it: under `CallerBuffer` it is the trailing
+    /// `output: &mut [E]` parameter the signature grows. `Some` exactly when
+    /// the shape is `Buffer` or `StaticList`.
+    ///
+    /// The name comes from the same [`crate::lower`] binder machinery every
+    /// other binder does, so it cannot collide with one the source wrote.
+    pub output: Option<String>,
     pub stmts: Vec<Stmt>,
 }

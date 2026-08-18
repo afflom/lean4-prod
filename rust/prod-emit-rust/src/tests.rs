@@ -669,3 +669,147 @@ fn an_invariant_may_contain_total_arithmetic_and_renders_it_inline() {
     assert!(!out.contains('?'), "got: {}", out);
     assert!(!out.contains("checked_"), "got: {}", out);
 }
+
+// --------------------------------------------------------------- Task 6
+
+/// Every definition in an IR module, rendered.
+fn render_module(ir: &str) -> alloc::collections::BTreeMap<String, String> {
+    let module = prod_ir::parser::parse_module(ir).expect("parses").1;
+    let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+    module
+        .definitions
+        .iter()
+        .map(|def| {
+            let body =
+                prod_lower::lower::lower_def_in(def, &shapes, &TargetProfile::RUST, &module.types)
+                    .unwrap_or_else(|e| panic!("`{}` must lower: {:?}", def.name, e));
+            (def.name.clone(), emit_body(&body))
+        })
+        .collect()
+}
+
+fn render_one(ir: &str) -> String {
+    render_module(ir)
+        .into_values()
+        .next()
+        .expect("one definition")
+}
+
+/// The list-builder signature and, in the body, the bounds check the lowering
+/// put there.
+///
+/// The `output[__len]` index cannot be out of range: the `if` immediately
+/// above it is the check, and its else-branch returns. That check being in the
+/// statement list rather than re-derived here is the point of the task.
+#[test]
+fn a_caller_buffer_list_prints_its_guard_its_write_and_its_recursion() {
+    let out = render_module(include_str!("../../../lean/Conformance/golden.ir"))
+        .remove("c_list_build")
+        .expect("c_list_build is in the corpus");
+
+    assert!(
+        out.contains(
+            "pub fn c_list_build(fuel: u64, n: u64, output: &mut [u64]) \
+             -> Result<usize, crate::ComputeError>"
+        ),
+        "got: {}",
+        out
+    );
+    assert!(out.contains("let mut __len: usize = 0;"), "got: {}", out);
+    assert!(out.contains("if (__len < output.len()) {"), "got: {}", out);
+    assert!(
+        out.contains("return Err(crate::ComputeError::OutputTooSmall);"),
+        "got: {}",
+        out
+    );
+    assert!(out.contains("output[__len] = n;"), "got: {}", out);
+    assert!(out.contains("__len += 1;"), "got: {}", out);
+    // The recursion writes where this call left off and reports what it used.
+    assert!(
+        out.contains("c_list_build(n_27, _x_56, &mut output[__len..])?"),
+        "got: {}",
+        out
+    );
+    assert!(out.contains("return Ok(__len);"), "got: {}", out);
+    // Nothing is left unrendered.
+    assert!(!out.contains("compile_error!"), "got: {}", out);
+}
+
+/// A zero-argument list definition keeps its promoted `&'static [E]`
+/// rendering. That is a printer concern, and it stays one.
+#[test]
+fn a_static_list_prints_as_a_promoted_slice() {
+    let out = render_one(
+        r#"(module M (def m () (List Nat) (ctor "List.cons" 3 (ctor "List.cons" 5 (ctor "List.nil")))))"#,
+    );
+    assert_eq!(out, "pub fn m() -> &'static [u64] {\n    &[3, 5]\n}\n");
+}
+
+/// A list in parameter position borrows as a slice, unchanged.
+#[test]
+fn a_list_parameter_still_borrows_as_a_slice() {
+    let out = render_one(r#"(module M (def m ((xs (List Nat))) Nat 0))"#);
+    assert!(out.contains("pub fn m(xs: &[u64]) -> u64"), "got: {}", out);
+}
+
+/// Comparisons in a definition BODY, in source order. A reversed comparison
+/// still compiles, still returns a `bool`, and rejects precisely the inputs it
+/// should accept -- so the order is asserted, not just the operator.
+#[test]
+fn comparisons_print_in_source_order() {
+    for (node, rendered) in [
+        ("eq", "(a == b)"),
+        ("lt", "(a < b)"),
+        ("le", "(a <= b)"),
+        ("gt", "(a > b)"),
+    ] {
+        let out = render_one(&alloc::format!(
+            "(module M (def m ((a Nat) (b Nat)) Bool ({} a b)))",
+            node
+        ));
+        assert!(out.contains(rendered), "for {}: got {}", node, out);
+    }
+}
+
+/// The boolean connectives, matching what the `Renderer` prints today.
+#[test]
+fn boolean_connectives_print_as_rust_operators() {
+    let out = render_one("(module M (def m ((a Nat) (b Nat)) Bool (and (lt a b) (gt a b))))");
+    assert!(out.contains("((a < b) && (a > b))"), "got: {}", out);
+
+    let out = render_one("(module M (def m ((a Nat) (b Nat)) Bool (or (lt a b) (gt a b))))");
+    assert!(out.contains("((a < b) || (a > b))"), "got: {}", out);
+
+    let out = render_one("(module M (def m ((a Nat) (b Nat)) Bool (not (lt a b))))");
+    assert!(out.contains("(!(a < b))"), "got: {}", out);
+}
+
+/// The conversions, ported from `prod-codegen` unchanged. Each rendering is a
+/// Lean fact: `Int.toNat` clamps negatives to zero, `Nat.toUIntN` truncates.
+#[test]
+fn the_lossless_conversions_print_exactly_as_the_renderer_does() {
+    for (from, to, rendered) in [
+        ("Nat", "Int", "((a) as i64)"),
+        ("Int", "Nat", "((a).max(0) as u64)"),
+        ("Nat", "U8", "((a) as u8)"),
+        ("Nat", "U32", "((a) as u32)"),
+        ("U8", "Nat", "((a) as u64)"),
+        ("U64", "Nat", "((a) as u64)"),
+    ] {
+        let out = render_one(&alloc::format!(
+            "(module M (def m ((a {})) {} (convert {} {} a)))",
+            from,
+            to,
+            from,
+            to
+        ));
+        assert!(
+            out.contains(rendered),
+            "for {} -> {}: got {}",
+            from,
+            to,
+            out
+        );
+        assert!(!out.contains("compile_error!"), "got: {}", out);
+    }
+}

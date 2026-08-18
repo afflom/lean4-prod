@@ -24,7 +24,7 @@ use prod_ir::{NumKind, Type};
 use prod_lower::names::NamePolicy;
 use prod_lower::shape::Shape;
 use prod_lower::target::{
-    Arm, BinOp, Body, CtorDef, ErrorCode, FallibleOp, Lit, Stmt, TExpr, TypeDef,
+    Arm, BinOp, Body, CtorDef, ErrorCode, FallibleOp, Lit, SeqQuery, Stmt, TExpr, TypeDef,
 };
 
 /// The Rust type a numeric kind renders as. Also the cast used to pin an
@@ -167,6 +167,36 @@ fn emit_checked_constructor(def: &TypeDef, ctor: &CtorDef, invariant: &TExpr) ->
 
 /// Render one lowered definition as Rust source.
 pub fn emit_body(body: &Body) -> String {
+    let mut printer = Printer {
+        // A caller-buffer definition returns `Result<usize, _>`, so its
+        // `Return` needs the same `Ok(..)` a `Fallible` one does.
+        fallible: matches!(body.shape, Shape::Fallible | Shape::Buffer),
+        inline: BTreeMap::new(),
+        uses: uses(&body.stmts),
+    };
+
+    // A zero-argument list definition is promoted to a `&'static` slice, so
+    // its elements become an array literal instead of a statement list. The
+    // lowering has already established that there is nothing else in the body
+    // to print -- see `check_constant_list` -- which is why this can pick the
+    // `Push`es out and ignore the rest.
+    if body.shape == Shape::StaticList {
+        let items = body
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Push { value, .. } => Some(printer.expr(value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        return format!(
+            "pub fn {}() -> &'static [{}] {{\n    &[{}]\n}}\n",
+            body.name,
+            element_type(&body.ret),
+            items.join(", ")
+        );
+    }
+
     let mut params = String::new();
     for (i, (name, ty)) in body.params.iter().enumerate() {
         if i > 0 {
@@ -175,23 +205,78 @@ pub fn emit_body(body: &Body) -> String {
         params.push_str(&format!("{}: {}", name, param_type(ty)));
     }
 
-    let fallible = body.shape == Shape::Fallible;
+    let mut prologue = String::new();
     let ret = match body.shape {
         Shape::Fallible => format!("Result<{}, crate::ComputeError>", value_type(&body.ret)),
+        // The list-builder signature: the caller supplies the storage, and
+        // the definition reports how much of it it used.
+        Shape::Buffer => {
+            if !params.is_empty() {
+                params.push_str(", ");
+            }
+            params.push_str(&format!(
+                "{}: &mut [{}]",
+                output_name(body),
+                element_type(&body.ret)
+            ));
+            // Rust's spelling of the running index the lowering compares
+            // against the buffer's length. `mut` only when something actually
+            // advances it, so a definition that returns the empty list does
+            // not emit an `unused_mut`.
+            prologue = format!(
+                "    let {}{}: usize = 0;\n",
+                if advances(&body.stmts) { "mut " } else { "" },
+                CURSOR
+            );
+            String::from("Result<usize, crate::ComputeError>")
+        }
         _ => value_type(&body.ret),
     };
 
-    let mut printer = Printer {
-        fallible,
-        inline: BTreeMap::new(),
-        uses: uses(&body.stmts),
-    };
     let stmts = printer.block(&body.stmts, 1);
 
     format!(
-        "pub fn {}({}) -> {} {{\n{}}}\n",
-        body.name, params, ret, stmts
+        "pub fn {}({}) -> {} {{\n{}{}}}\n",
+        body.name, params, ret, prologue, stmts
     )
+}
+
+/// Rust's spelling of [`SeqQuery::Len`]: how many elements have been appended
+/// to the output sequence so far.
+///
+/// A generated name, in the same `__`-prefixed family `prod-codegen` already
+/// uses for its own buffer temporaries.
+const CURSOR: &str = "__len";
+
+/// The output buffer's parameter name, chosen by the lowering so that it
+/// cannot collide with a binder the source wrote.
+fn output_name(body: &Body) -> String {
+    match &body.output {
+        Some(seq) => ident(seq),
+        // Unreachable: the lowering names the sequence for every list shape.
+        None => String::from("output"),
+    }
+}
+
+/// Does anything in this body move the cursor?
+fn advances(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Push { .. } | Stmt::Advance { .. } => true,
+        Stmt::If { then, else_, .. } => advances(then) || advances(else_),
+        Stmt::Switch { arms, default, .. } => {
+            arms.iter().any(|a| advances(&a.body)) || default.as_deref().is_some_and(advances)
+        }
+        _ => false,
+    })
+}
+
+/// The element type of a list return type.
+fn element_type(ty: &Type) -> String {
+    match ty {
+        Type::List(inner) => value_type(inner),
+        // Unreachable: only a list-shaped definition asks.
+        other => value_type(other),
+    }
 }
 
 struct Printer {
@@ -272,11 +357,28 @@ impl Printer {
                     default,
                 } => out.push_str(&self.switch(scrut, arms, default.as_deref(), depth)),
                 Stmt::Fail(code) => out.push_str(&format!("{}{}\n", pad, fail(*code))),
-                // Lists are Task 6; the lowering in this task emits no
-                // `Push`. A `compile_error!` rather than a plausible guess,
-                // so a premature use fails at the Rust compiler instead of
-                // shipping.
-                other => out.push_str(&format!("{}{}\n", pad, todo_stmt(other))),
+                // The index cannot be out of range: the lowering emits an
+                // explicit `If` against the buffer's length immediately
+                // before every `Push`, and its else-branch returns
+                // `OutputTooSmall`. That check being in the statement list,
+                // rather than re-derived by each printer, is the point of
+                // this task -- so this does not repeat it.
+                Stmt::Push { seq, value } => {
+                    let value = self.expr(value);
+                    out.push_str(&format!(
+                        "{}{}[{}] = {};\n{}{} += 1;\n",
+                        pad,
+                        ident(seq),
+                        CURSOR,
+                        value,
+                        pad,
+                        CURSOR
+                    ));
+                }
+                Stmt::Advance { count, .. } => {
+                    let count = self.expr(count);
+                    out.push_str(&format!("{}{} += {};\n", pad, CURSOR, count));
+                }
             }
         }
         out
@@ -339,6 +441,17 @@ impl Printer {
             TExpr::Not(a) => format!("(!{})", self.expr(a)),
             TExpr::And(a, b) => format!("({} && {})", self.expr(a), self.expr(b)),
             TExpr::Or(a, b) => format!("({} || {})", self.expr(a), self.expr(b)),
+            TExpr::Convert(from, to, a) => self.convert(*from, *to, a),
+            // The three questions a backend answers about its own sequence
+            // representation. Under `CallerBuffer` that representation is a
+            // cursor into a caller-supplied slice, so all three are about the
+            // cursor and the slice.
+            TExpr::Seq(SeqQuery::Len, _) => String::from(CURSOR),
+            TExpr::Seq(SeqQuery::Cap, seq) => format!("{}.len()", ident(seq)),
+            // The unwritten remainder. `CURSOR` never passes the length --
+            // every `Push` is guarded and every `Advance` reports what the
+            // callee actually wrote -- so the slice cannot be out of range.
+            TExpr::Seq(SeqQuery::Rest, seq) => format!("&mut {}[{}..]", ident(seq), CURSOR),
             // A projection needs nothing but the field name, which the
             // lowering already checked against the declaration -- so there is
             // nothing here to refuse, only to spell.
@@ -411,6 +524,33 @@ impl Printer {
             // lowered under `TargetProfile::RUST` can reach here, and there is
             // no faithful rendering to offer if one does.
             _ => unsupported("no total Rust rendering for this operator and kind"),
+        }
+    }
+
+    /// The conversions, ported from `prod-codegen` unchanged. Each is a
+    /// Lean fact: `Int.toNat` clamps, `Nat.toUIntN` truncates.
+    ///
+    /// The pairs with no rendering never arrive -- `prod_lower::lower`
+    /// refuses them as `UnsupportedKind`, because a printer that quietly
+    /// emitted `as u32` for `UInt8 -> UInt32` would change the number.
+    fn convert(&self, from: NumKind, to: NumKind, a: &TExpr) -> String {
+        use NumKind::*;
+        let v = self.expr(a);
+        match (from, to) {
+            // `Nat -> Int` widens; a `u64` above `i64::MAX` cannot arise from
+            // Lean's `Nat` under the bounded-u64 policy without having
+            // overflowed already, so this is a plain cast.
+            (Nat, Int) => format!("(({}) as i64)", v),
+            // Lean's `Int.toNat` clamps negatives to 0. A bare cast would
+            // wrap them to enormous values.
+            (Int, Nat) => format!("(({}).max(0) as u64)", v),
+            // Lean's `Nat.toUIntN` truncates, matching `BitVec`.
+            (Nat, U8) | (Nat, U16) | (Nat, U32) | (Nat, U64) => {
+                format!("(({}) as {})", v, rust_type(to))
+            }
+            // `UIntN -> Nat` widens.
+            (U8, Nat) | (U16, Nat) | (U32, Nat) | (U64, Nat) => format!("(({}) as u64)", v),
+            _ => unsupported("no conversion between these kinds; the lowering refuses them"),
         }
     }
 
@@ -540,22 +680,6 @@ fn unsupported(why: &str) -> String {
     format!("compile_error!(\"prod-emit-rust: {}\")", why)
 }
 
-fn todo_stmt(stmt: &Stmt) -> String {
-    let what = match stmt {
-        Stmt::Push { .. } => "Push (Task 6)",
-        Stmt::Let { .. }
-        | Stmt::TryLet { .. }
-        | Stmt::Return(_)
-        | Stmt::If { .. }
-        | Stmt::Switch { .. }
-        | Stmt::Fail(_) => unreachable!(),
-    };
-    format!(
-        "compile_error!(\"prod-emit-rust: {} is not lowered yet\");",
-        what
-    )
-}
-
 /// The Rust pattern for one arm, plus any bindings that have to happen inside
 /// the arm rather than in the pattern.
 ///
@@ -626,8 +750,10 @@ fn value_type(ty: &Type) -> String {
             "({})",
             items.iter().map(value_type).collect::<Vec<_>>().join(", ")
         ),
-        // Lists are a caller buffer or a promoted static slice, neither of
-        // which this slice lowers; `Vec` and `Opaque` are rejected outright.
+        // A list is renderable only at the top of a parameter or return
+        // type, where the caller owns the storage -- `param_type` and
+        // `element_type` handle those. Nested, it has no rendering at all,
+        // and neither do `Vec` and `Opaque`, which the lowering rejects.
         Type::List(_) | Type::Vec(_) | Type::Opaque(_) => {
             "prod_emit_rust_unsupported_type".to_string()
         }
@@ -658,9 +784,10 @@ fn uses(stmts: &[Stmt]) -> BTreeMap<String, Usage> {
 fn count_level(stmts: &[Stmt], out: &mut BTreeMap<String, Usage>, same_level: bool) {
     for stmt in stmts {
         match stmt {
-            Stmt::Let { value, .. } | Stmt::Return(value) | Stmt::Push { value, .. } => {
-                count_expr(value, out, same_level)
-            }
+            Stmt::Let { value, .. }
+            | Stmt::Return(value)
+            | Stmt::Push { value, .. }
+            | Stmt::Advance { count: value, .. } => count_expr(value, out, same_level),
             Stmt::TryLet { op, .. } => match op {
                 FallibleOp::Arith(_, _, a, b) => {
                     count_expr(a, out, same_level);
@@ -710,7 +837,11 @@ fn count_expr(e: &TExpr, out: &mut BTreeMap<String, Usage>, same_level: bool) {
             count_expr(a, out, same_level);
             count_expr(b, out, same_level);
         }
-        TExpr::Not(a) | TExpr::Proj(_, _, a) => count_expr(a, out, same_level),
+        TExpr::Not(a) | TExpr::Proj(_, _, a) | TExpr::Convert(_, _, a) => {
+            count_expr(a, out, same_level)
+        }
+        // A question about the sequence reads no bound name.
+        TExpr::Seq(..) => {}
         TExpr::Ctor(_, _, args) | TExpr::Call(_, args) => {
             for a in args {
                 count_expr(a, out, same_level);

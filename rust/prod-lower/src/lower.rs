@@ -9,9 +9,11 @@
 
 use crate::error::LowerError;
 use crate::names::{NameError, NamePolicy, NameTable};
-use crate::profile::{DivisionSemantics, TargetProfile};
+use crate::profile::{DivisionSemantics, ListStrategy, TargetProfile};
 use crate::shape::{Shape, Signatures};
-use crate::target::{Arm, BinOp, Body, CtorDef, ErrorCode, FallibleOp, Lit, Stmt, TExpr, TypeDef};
+use crate::target::{
+    Arm, BinOp, Body, CtorDef, ErrorCode, FallibleOp, Lit, SeqQuery, Stmt, TExpr, TypeDef,
+};
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -52,14 +54,6 @@ pub fn lower_def_in(
         .get(def.name.as_str())
         .copied()
         .unwrap_or(Shape::Value);
-    if matches!(shape, Shape::Buffer | Shape::StaticList) {
-        // List-shaped definitions are Task 6: they need the buffer index
-        // arithmetic and the `Push` statement, which nothing here emits.
-        return Err(LowerError::NotYetLowered(format!(
-            "{:?}-shaped body",
-            shape
-        )));
-    }
     let mut lowering = Lowering {
         params: &def.params,
         shapes,
@@ -76,14 +70,74 @@ pub fn lower_def_in(
     // so each branch supplies its own terminator rather than yielding a value
     // for a `Return` this function appends.
     let mut stmts: Vec<Stmt> = Vec::new();
-    lowering.tail(&def.body, &mut stmts)?;
+    let mut env: Vec<(String, &Expr)> = Vec::new();
+    let output = match shape {
+        // A list-shaped definition appends to a sequence instead of yielding
+        // a value, so the first thing it needs is a name for that sequence.
+        // It goes through `bind_source` like every other binder, so a
+        // definition whose own source already writes `output` gets a fresh
+        // name rather than two live bindings sharing one -- which
+        // `prod-emit-rust`'s `uses()`, counting reads by name with no scope of
+        // its own, would silently pool.
+        Shape::Buffer | Shape::StaticList => {
+            let seq = lowering.bind_source(OUTPUT_SEQUENCE);
+            // Only a caller-supplied buffer can run out. A `NativeSequence`
+            // host grows on demand, and a promoted `&'static` list has no
+            // caller storage at all, so neither gets a bounds check.
+            let bounded =
+                shape == Shape::Buffer && profile.list_strategy == ListStrategy::CallerBuffer;
+            lowering.flow(
+                &def.body,
+                Position::List { seq: &seq, bounded },
+                &mut env,
+                &mut stmts,
+            )?;
+            if shape == Shape::StaticList {
+                check_constant_list(&stmts)?;
+            }
+            Some(seq)
+        }
+        Shape::Value | Shape::Fallible => {
+            lowering.flow(&def.body, Position::Value, &mut env, &mut stmts)?;
+            None
+        }
+    };
     Ok(Body {
         name: def.name.clone(),
         params: def.params.clone(),
         ret: def.ret.clone(),
         shape,
+        output,
         stmts,
     })
+}
+
+/// The source name a list-shaped definition's output sequence asks for.
+///
+/// A *request*, not a guarantee: it goes through `bind_source` like any other
+/// binder, so a definition that already binds `output` gets something else.
+const OUTPUT_SEQUENCE: &str = "output";
+
+/// A promoted `&'static [E]` has to be a constant run of elements and nothing
+/// else, because that is all an array literal can hold.
+///
+/// Expressed as a check on the *lowered* statements rather than on the source
+/// expression: a computed element leaves a [`Stmt::TryLet`] in front of its
+/// `Push`, and a branch leaves an `If` or a `Switch`, so one shape test
+/// catches every way a zero-argument list definition can fail to be constant.
+/// `prod-codegen` rejects the same set, and the message is its own.
+fn check_constant_list(stmts: &[Stmt]) -> Result<(), LowerError> {
+    let constant = match stmts.split_last() {
+        Some((Stmt::Return(_), pushes)) => pushes.iter().all(|s| matches!(s, Stmt::Push { .. })),
+        _ => false,
+    };
+    if constant {
+        Ok(())
+    } else {
+        Err(LowerError::UnsupportedKind(String::from(
+            "zero-argument list definitions must be constant cons chains",
+        )))
+    }
 }
 
 /// Lower every type declaration in `module`.
@@ -353,8 +407,8 @@ fn check_representable(ty: &Type) -> Result<(), LowerError> {
 ///   actually failed was the invariant it was checking. Refusing to generate
 ///   the type is the better answer, and it gets a named rejection saying so.
 /// * A node with no total-expression form in the Target IR at all: `If`,
-///   `Let` and `Match` are statements here, and `Convert` has no `TExpr` node
-///   yet. Those stay [`LowerError::NotYetLowered`], which is what they are.
+///   `Let` and `Match` are statements here. Those stay
+///   [`LowerError::NotYetLowered`], which is what they are.
 /// * `Expr::Ctor`, until `prod-emit-rust` can print a [`TExpr::Ctor`]. Passing
 ///   it through would put a `compile_error!` in generated output, which is
 ///   strictly worse than a rejection.
@@ -381,10 +435,23 @@ fn lower_invariant(
         Expr::Bool(b) => Ok(TExpr::Lit(Lit::Bool(*b))),
         Expr::Var(name) => Ok(TExpr::Var(policy.apply(name))),
 
-        Expr::Eq(a, b) => compare(BinOp::Eq, sub(a)?, sub(b)?, fields),
-        Expr::Lt(a, b) => compare(BinOp::Lt, sub(a)?, sub(b)?, fields),
-        Expr::Le(a, b) => compare(BinOp::Le, sub(a)?, sub(b)?, fields),
-        Expr::Gt(a, b) => compare(BinOp::Gt, sub(a)?, sub(b)?, fields),
+        // The field's declared type is what a bare `Var` is read at here; in
+        // a definition body the same question is answered by the binder
+        // table. That is the whole difference between the two paths, so it is
+        // the only thing passed in.
+        Expr::Eq(a, b) => Ok(compare(BinOp::Eq, sub(a)?, sub(b)?, &field_kind(fields))),
+        Expr::Lt(a, b) => Ok(compare(BinOp::Lt, sub(a)?, sub(b)?, &field_kind(fields))),
+        Expr::Le(a, b) => Ok(compare(BinOp::Le, sub(a)?, sub(b)?, &field_kind(fields))),
+        Expr::Gt(a, b) => Ok(compare(BinOp::Gt, sub(a)?, sub(b)?, &field_kind(fields))),
+
+        // Total under every profile -- `Int.toNat` clamps and `Nat.toUIntN`
+        // truncates, and neither is a failure -- so a conversion is admitted
+        // in an invariant on exactly the terms the body path admits it, and
+        // through the same whitelist.
+        Expr::Convert(from, to, a) => {
+            check_conversion(*from, *to)?;
+            Ok(TExpr::Convert(*from, *to, Box::new(sub(a)?)))
+        }
 
         Expr::And(a, b) => Ok(TExpr::And(Box::new(sub(a)?), Box::new(sub(b)?))),
         Expr::Or(a, b) => Ok(TExpr::Or(Box::new(sub(a)?), Box::new(sub(b)?))),
@@ -493,9 +560,54 @@ fn invariant_can_fail(owner: &str, node: &Expr) -> LowerError {
 
 /// A comparison over two lowered operands, at the kind its operands are read
 /// at.
-fn compare(op: BinOp, a: TExpr, b: TExpr, fields: &[(String, Type)]) -> Result<TExpr, LowerError> {
-    let kind = compare_kind(&a, &b, fields);
-    Ok(TExpr::BinOp(kind, op, Box::new(a), Box::new(b)))
+///
+/// One implementation, called from the definition-body path and the invariant
+/// path. They answer "what kind is this variable" from different tables -- a
+/// field list there, the binder table here -- so that question, and only that
+/// question, is the parameter. Task 5 found three divergences between those
+/// two paths; this is the shape that stops a fourth.
+///
+/// The operand order is preserved exactly: `Lt(a, b)` is `a < b`. A reversed
+/// comparison still compiles, still returns a `bool`, and rejects precisely
+/// the inputs it should accept.
+fn compare(op: BinOp, a: TExpr, b: TExpr, var_kind: &dyn Fn(&str) -> Option<NumKind>) -> TExpr {
+    let kind = compare_kind(&a, &b, var_kind);
+    TExpr::BinOp(kind, op, Box::new(a), Box::new(b))
+}
+
+/// The invariant path's answer to "what kind is this variable": a structure's
+/// own field, at its declared type.
+fn field_kind(fields: &[(String, Type)]) -> impl Fn(&str) -> Option<NumKind> + '_ {
+    move |name: &str| {
+        fields
+            .iter()
+            .find(|(f, _)| f == name)
+            .and_then(|(_, ty)| type_kind(ty))
+    }
+}
+
+/// The conversions that have a rendering: the LOSSLESS set, and nothing else.
+///
+/// One implementation, called from the definition-body path and the invariant
+/// path, and `prod-codegen`'s own set unchanged. Every sized-to-sized pair
+/// (`UInt8 -> UInt32` included) and every `Int`-to-sized pair is a deliberate
+/// non-goal: a printer that quietly emitted `as u32` for one of them would
+/// change the number, so the refusal lives here, where the semantics are,
+/// rather than in three printers that each have to remember it.
+fn check_conversion(from: NumKind, to: NumKind) -> Result<(), LowerError> {
+    use NumKind::*;
+    match (from, to) {
+        // `Nat -> Int` widens; `Int -> Nat` is Lean's `Int.toNat`, which
+        // clamps negatives to zero rather than failing.
+        (Nat, Int) | (Int, Nat) => Ok(()),
+        // `Nat.toUIntN` truncates, matching `BitVec`; `UIntN.toNat` widens.
+        (Nat, U8) | (Nat, U16) | (Nat, U32) | (Nat, U64) => Ok(()),
+        (U8, Nat) | (U16, Nat) | (U32, Nat) | (U64, Nat) => Ok(()),
+        _ => Err(LowerError::UnsupportedKind(format!(
+            "no conversion from {:?} to {:?}; cross-width sized conversions are a deliberate non-goal",
+            from, to
+        ))),
+    }
 }
 
 /// The numeric kind a comparison's operands are read at.
@@ -505,9 +617,9 @@ fn compare(op: BinOp, a: TExpr, b: TExpr, fields: &[(String, Type)]) -> Result<T
 /// not, so it is consulted only when neither side is more specific. `le 1 used`
 /// over a `UInt8` field is a `UInt8` comparison, not a `Nat` one, even though
 /// the literal on the left says nothing.
-fn compare_kind(a: &TExpr, b: &TExpr, fields: &[(String, Type)]) -> NumKind {
+fn compare_kind(a: &TExpr, b: &TExpr, var_kind: &dyn Fn(&str) -> Option<NumKind>) -> NumKind {
     for operand in [a, b] {
-        if let Some(kind) = operand_kind(operand, fields) {
+        if let Some(kind) = operand_kind(operand, var_kind) {
             return kind;
         }
     }
@@ -519,16 +631,18 @@ fn compare_kind(a: &TExpr, b: &TExpr, fields: &[(String, Type)]) -> NumKind {
     NumKind::Nat
 }
 
-fn operand_kind(e: &TExpr, fields: &[(String, Type)]) -> Option<NumKind> {
+fn operand_kind(e: &TExpr, var_kind: &dyn Fn(&str) -> Option<NumKind>) -> Option<NumKind> {
     match e {
-        TExpr::Var(name) => fields
-            .iter()
-            .find(|(f, _)| f == name)
-            .and_then(|(_, ty)| type_kind(ty)),
+        TExpr::Var(name) => var_kind(name),
         TExpr::BinOp(kind, op, ..) => match op {
             BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt => None,
             _ => Some(*kind),
         },
+        // A conversion says what kind it produces, which is the whole reason
+        // it is written: `(convert Nat U8 x) < cap` is a `UInt8` comparison.
+        TExpr::Convert(_, to, _) => Some(*to),
+        // Every question about a sequence answers with a count.
+        TExpr::Seq(..) => Some(NumKind::Nat),
         _ => None,
     }
 }
@@ -586,6 +700,27 @@ fn ctor_decl<'m>(decls: &'m [TypeDecl], name: &str) -> Option<(&'m TypeDecl, &'m
 enum DivMod {
     Div,
     Mod,
+}
+
+/// What the lowering does with what an expression in tail position produces.
+///
+/// The two positions share every control-flow lowering and differ only at the
+/// leaves, which is why they are a parameter rather than two functions.
+#[derive(Clone, Copy)]
+enum Position<'p> {
+    /// Return it.
+    Value,
+    /// Append it to the named output sequence.
+    List {
+        seq: &'p str,
+        /// Is the sequence a caller-supplied buffer that can run out?
+        ///
+        /// True only for [`crate::profile::ListStrategy::CallerBuffer`] on a
+        /// `Shape::Buffer` definition. A `NativeSequence` host grows on
+        /// demand, and a promoted `&'static` list has no caller storage, so
+        /// neither has a bound to check against.
+        bounded: bool,
+    },
 }
 
 /// Lowering makes every binder in a [`Body`] unique, because the Target IR has
@@ -713,6 +848,31 @@ impl<'a> Lowering<'a> {
                 reject_sized_pow(*k)?;
                 self.arith(e, *k, BinOp::Pow, a, b, stmts)
             }
+            // Comparisons, connectives and conversions are TOTAL: none of
+            // them can fail under any profile, so each yields a `TExpr`
+            // directly and none is ever a `TryLet`.
+            Expr::Eq(a, b) => self.compare_op(BinOp::Eq, a, b, stmts),
+            Expr::Lt(a, b) => self.compare_op(BinOp::Lt, a, b, stmts),
+            Expr::Le(a, b) => self.compare_op(BinOp::Le, a, b, stmts),
+            Expr::Gt(a, b) => self.compare_op(BinOp::Gt, a, b, stmts),
+
+            Expr::And(a, b) => {
+                let (a, b) = self.connective(e, a, b, stmts)?;
+                Ok(TExpr::And(Box::new(a), Box::new(b)))
+            }
+            Expr::Or(a, b) => {
+                let (a, b) = self.connective(e, a, b, stmts)?;
+                Ok(TExpr::Or(Box::new(a), Box::new(b)))
+            }
+            // `Not` is strict in its only operand, so whatever that operand
+            // needs is evaluated anyway and may be hoisted freely.
+            Expr::Not(a) => Ok(TExpr::Not(Box::new(self.expr(a, stmts)?))),
+
+            Expr::Convert(from, to, a) => {
+                check_conversion(*from, *to)?;
+                Ok(TExpr::Convert(*from, *to, Box::new(self.expr(a, stmts)?)))
+            }
+
             Expr::Neg(k, a) => {
                 reject_non_int_neg(*k)?;
                 let value = self.expr(a, stmts)?;
@@ -775,11 +935,32 @@ impl<'a> Lowering<'a> {
                         FallibleOp::Call(name.clone(), lowered),
                         stmts,
                     )),
-                    Some(Shape::Buffer) | Some(Shape::StaticList) => Err(
-                        LowerError::NotYetLowered(format!("Call to list-shaped `{}`", name)),
-                    ),
+                    // Not scaffolding: a list has no by-value form in the
+                    // allocation-free tier, so its result cannot be an
+                    // intermediate. `prod-codegen` refuses this in the same
+                    // words, and the refusal outlives Task 7.
+                    Some(Shape::Buffer) | Some(Shape::StaticList) => {
+                        Err(LowerError::UnsupportedKind(format!(
+                            "`{}` returns a list; its result cannot be used as an intermediate value",
+                            name
+                        )))
+                    }
                     Some(Shape::Value) | None => Ok(TExpr::Call(name.clone(), lowered)),
                 }
+            }
+
+            // The list constructors have no value form either: they build
+            // into the output sequence, which is `Position::List`, not here.
+            // Falling through to the general constructor arm below would put
+            // a `TExpr::Ctor` nobody can print into the body.
+            Expr::Ctor(name, args)
+                if (name == "List.nil" && args.is_empty())
+                    || (name == "List.cons" && args.len() == 2) =>
+            {
+                Err(LowerError::UnsupportedKind(format!(
+                    "`{}` outside a list return position",
+                    name
+                )))
             }
 
             // Constructing and projecting are both TOTAL: neither can fail in
@@ -832,6 +1013,14 @@ impl<'a> Lowering<'a> {
     /// terminator ([`Stmt::Return`], [`Stmt::If`], [`Stmt::Switch`] or
     /// [`Stmt::Fail`]).
     ///
+    /// [`Position`] says what the tail *is*: a value to return, or elements
+    /// to append to the definition's output sequence. Control flow is
+    /// identical either way -- an `if` in a list-shaped definition is still an
+    /// `if`, and its branches are still separate statement lists -- so there
+    /// is one implementation of it rather than one per position. The two
+    /// diverged in `prod-codegen`, where `Mode::Value` and `Mode::Builder`
+    /// each re-derive the same match lowering.
+    ///
     /// # Why branches get their own accumulator
     ///
     /// **A `TryLet` must never cross a control-flow boundary.** Every branch
@@ -846,14 +1035,20 @@ impl<'a> Lowering<'a> {
     /// The scrutinee and the condition are lowered into the ENCLOSING list on
     /// purpose: they are evaluated unconditionally, whichever way the branch
     /// goes.
-    fn tail(&mut self, e: &Expr, stmts: &mut Vec<Stmt>) -> Result<(), LowerError> {
+    fn flow(
+        &mut self,
+        e: &'a Expr,
+        pos: Position<'_>,
+        env: &mut Vec<(String, &'a Expr)>,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<(), LowerError> {
         match e {
             Expr::If(cond, then_, else_) => {
                 let cond = self.expr(cond, stmts)?;
                 let mut then_stmts: Vec<Stmt> = Vec::new();
-                self.tail(then_, &mut then_stmts)?;
+                self.flow(then_, pos, env, &mut then_stmts)?;
                 let mut else_stmts: Vec<Stmt> = Vec::new();
-                self.tail(else_, &mut else_stmts)?;
+                self.flow(else_, pos, env, &mut else_stmts)?;
                 stmts.push(Stmt::If {
                     cond,
                     then: then_stmts,
@@ -902,7 +1097,7 @@ impl<'a> Lowering<'a> {
                         binders.push(target);
                     }
                     let mut body: Vec<Stmt> = Vec::new();
-                    let out = self.tail(&alt.body, &mut body);
+                    let out = self.flow(&alt.body, pos, env, &mut body);
                     self.scope.truncate(self.scope.len() - alt.binders.len());
                     out?;
                     arms.push(Arm {
@@ -914,7 +1109,7 @@ impl<'a> Lowering<'a> {
                 let default = match default {
                     Some(d) => {
                         let mut body: Vec<Stmt> = Vec::new();
-                        self.tail(d, &mut body)?;
+                        self.flow(d, pos, env, &mut body)?;
                         Some(body)
                     }
                     None => None,
@@ -935,30 +1130,221 @@ impl<'a> Lowering<'a> {
             }
 
             Expr::Let(name, value, body) => {
+                // A `let` whose value is a LIST has no runtime representation
+                // to bind: the elements go into the output sequence at the
+                // point the list is consumed, not where it is named. LCNF
+                // writes cons chains in A-normal form, so this is the usual
+                // spelling rather than an exotic one, and recording the
+                // binding here is what lets the tail of a cons be a `Var`.
+                if let Position::List { .. } = pos {
+                    if self.is_list_valued(value, env) {
+                        env.push((name.clone(), value));
+                        let out = self.flow(body, pos, env, stmts);
+                        env.pop();
+                        return out;
+                    }
+                }
                 let bound = self.bind_let(name, value, stmts)?;
-                let out = self.tail(body, stmts);
+                let out = self.flow(body, pos, env, stmts);
                 if bound {
                     self.scope.pop();
                 }
                 out
             }
 
-            Expr::Jp { name, body, .. } if self.jps.jmp_count(name) == 0 => self.tail(body, stmts),
+            Expr::Jp { name, body, .. } if self.jps.jmp_count(name) == 0 => {
+                self.flow(body, pos, env, stmts)
+            }
 
             Expr::Jmp(name, args) => {
                 let (body, pushed) = self.inline_jmp(name, args, stmts)?;
-                let out = self.tail(body, stmts);
+                let out = self.flow(body, pos, env, stmts);
                 self.scope.truncate(self.scope.len() - pushed);
                 out
             }
 
-            // Everything else is a value: lower it and return it.
-            other => {
-                let value = self.expr(other, stmts)?;
-                stmts.push(Stmt::Return(value));
+            other => match pos {
+                // Everything else is a value: lower it and return it.
+                Position::Value => {
+                    let value = self.expr(other, stmts)?;
+                    stmts.push(Stmt::Return(value));
+                    Ok(())
+                }
+                Position::List { seq, bounded } => self.append(other, seq, bounded, env, stmts),
+            },
+        }
+    }
+
+    /// Lower `e` as the remaining elements of the output sequence `seq`.
+    ///
+    /// Reached only from [`Lowering::flow`], so control flow is already
+    /// handled; what is left is the three ways a list ends up being built.
+    ///
+    /// `bounded` is the caller-supplied-buffer case, and it is the whole
+    /// reason this is a lowering rather than a printer: running out of that
+    /// buffer is a FAILURE, and by this IR's central invariant a failure
+    /// belongs in statement position. It used to live inside the Rust
+    /// renderer, where three printers would be three chances to forget it.
+    fn append(
+        &mut self,
+        e: &'a Expr,
+        seq: &str,
+        bounded: bool,
+        env: &mut Vec<(String, &'a Expr)>,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<(), LowerError> {
+        match e {
+            // The empty list appends nothing, so the definition is done and
+            // reports how much of the sequence it used.
+            Expr::Ctor(name, args) if name == "List.nil" && args.is_empty() => {
+                stmts.push(Stmt::Return(TExpr::Seq(SeqQuery::Len, String::from(seq))));
                 Ok(())
             }
+
+            Expr::Ctor(name, args) if name == "List.cons" && args.len() == 2 => {
+                // The guard is emitted BEFORE the head is lowered, so a head
+                // whose arithmetic can fail reports `OutputTooSmall` first --
+                // the order `prod-codegen` renders, where the head is written
+                // inside the arm that found room for it.
+                if bounded {
+                    stmts.push(Stmt::If {
+                        cond: TExpr::BinOp(
+                            NumKind::Nat,
+                            BinOp::Lt,
+                            Box::new(TExpr::Seq(SeqQuery::Len, String::from(seq))),
+                            Box::new(TExpr::Seq(SeqQuery::Cap, String::from(seq))),
+                        ),
+                        then: Vec::new(),
+                        else_: alloc::vec![Stmt::Fail(ErrorCode::OutputTooSmall)],
+                    });
+                }
+                let value = self.expr(&args[0], stmts)?;
+                stmts.push(Stmt::Push {
+                    seq: String::from(seq),
+                    value,
+                });
+                // The tail goes back through `flow`, not straight to
+                // `append`: it may be a `let`, an `if` or a match, and those
+                // have one lowering, not one per position.
+                self.flow(&args[1], Position::List { seq, bounded }, env, stmts)
+            }
+
+            // A list named by a `let` this definition made: continue with what
+            // it was bound to, in the environment that was in scope where the
+            // binding was written -- so `let x := x` cannot resolve to itself.
+            Expr::Var(name) => match env.iter().rposition(|(n, _)| n == name) {
+                Some(index) => {
+                    let bound = env[index].1;
+                    let inner = env.split_off(index);
+                    let out = self.flow(bound, Position::List { seq, bounded }, env, stmts);
+                    env.extend(inner);
+                    out
+                }
+                None => Err(LowerError::UnsupportedKind(format!(
+                    "`{}` is not a list built in this definition",
+                    name
+                ))),
+            },
+
+            // A callee that builds a list appends to the SAME sequence,
+            // starting where this definition left off, and reports how many
+            // elements it added.
+            //
+            // The call stays an ordinary fallible call -- the callee is the
+            // one that can run out of room and say so -- and the cursor moves
+            // in a separate, infallible `Advance`. That is what keeps
+            // `TryLet` the only failure point in the language.
+            Expr::Call(name, args) if self.shapes.get(name.as_str()) == Some(&Shape::Buffer) => {
+                let mut lowered = Vec::with_capacity(args.len() + 1);
+                for arg in args {
+                    lowered.push(self.expr(arg, stmts)?);
+                }
+                lowered.push(TExpr::Seq(SeqQuery::Rest, String::from(seq)));
+                let count = self.bind_fallible(
+                    unknown_type(),
+                    FallibleOp::Call(name.clone(), lowered),
+                    stmts,
+                );
+                stmts.push(Stmt::Advance {
+                    seq: String::from(seq),
+                    count,
+                });
+                stmts.push(Stmt::Return(TExpr::Seq(SeqQuery::Len, String::from(seq))));
+                Ok(())
+            }
+
+            Expr::Call(name, _) => Err(LowerError::UnsupportedKind(format!(
+                "`{}` does not build its list into the caller's sequence",
+                name
+            ))),
+
+            other => Err(LowerError::UnsupportedKind(format!(
+                "`{}` does not build a list",
+                node_name(other)
+            ))),
         }
+    }
+
+    /// Is this the value of a list-typed binding -- one with no runtime
+    /// representation of its own, to be resolved where the list is consumed?
+    fn is_list_valued(&self, e: &Expr, env: &[(String, &'a Expr)]) -> bool {
+        match e {
+            Expr::Ctor(name, _) => name == "List.nil" || name == "List.cons",
+            Expr::Call(name, _) => matches!(
+                self.shapes.get(name.as_str()),
+                Some(Shape::Buffer) | Some(Shape::StaticList)
+            ),
+            Expr::Var(name) => env.iter().any(|(n, _)| n == name),
+            _ => false,
+        }
+    }
+
+    /// A comparison in a definition body, through the same [`compare`] the
+    /// invariant path uses.
+    fn compare_op(
+        &mut self,
+        op: BinOp,
+        a: &Expr,
+        b: &Expr,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<TExpr, LowerError> {
+        let a = self.expr(a, stmts)?;
+        let b = self.expr(b, stmts)?;
+        Ok(compare(op, a, b, &|name: &str| {
+            type_kind(&self.var_type(name))
+        }))
+    }
+
+    /// Both operands of `And`/`Or`, refusing the one shape this IR cannot say.
+    ///
+    /// **They are LAZY in the right operand**, and `TExpr` has no statement
+    /// list to hang a lazy operand's work on. Lowering the right operand into
+    /// the enclosing statement list would evaluate it unconditionally, so a
+    /// `Nat` addition inside it would report an overflow on inputs where Lean
+    /// -- whose `Nat` is unbounded and whose `&&` is short-circuiting -- has
+    /// no failure at all. That is a different function, not a different
+    /// formatting, so it is refused rather than emitted.
+    ///
+    /// No definition in any corpus reaches this: the boolean connectives
+    /// appear in structure invariants, where an operation that can fail is
+    /// already refused outright, and never in a definition body.
+    fn connective(
+        &mut self,
+        node: &Expr,
+        a: &Expr,
+        b: &Expr,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<(TExpr, TExpr), LowerError> {
+        let a = self.expr(a, stmts)?;
+        let mut lazy: Vec<Stmt> = Vec::new();
+        let b = self.expr(b, &mut lazy)?;
+        if !lazy.is_empty() {
+            return Err(LowerError::NotYetLowered(format!(
+                "{} whose right operand needs statements, which would evaluate it eagerly",
+                node_name(node)
+            )));
+        }
+        Ok((a, b))
     }
 
     /// Emit the binding for a source `let` and put it in scope. Returns
@@ -1102,16 +1488,30 @@ impl<'a> Lowering<'a> {
                 _ => kind_type(*kind),
             },
             TExpr::Not(_) | TExpr::And(..) | TExpr::Or(..) => Type::Bool,
-            TExpr::Var(name) => self
-                .types
-                .iter()
-                .rev()
-                .chain(self.params.iter().rev())
-                .find(|(bound, _)| bound == name)
-                .map(|(_, ty)| ty.clone())
-                .unwrap_or_else(unknown_type),
+            // A conversion's type is the kind it converts TO -- that is what
+            // it is for.
+            TExpr::Convert(_, to, _) => kind_type(*to),
+            // Every question about a sequence answers with a count.
+            TExpr::Seq(..) => Type::Nat,
+            TExpr::Var(name) => self.var_type(name),
             TExpr::Call(..) | TExpr::Ctor(..) | TExpr::Proj(..) => unknown_type(),
         }
+    }
+
+    /// The type a bound name was given: the definition-body path's answer to
+    /// the question [`field_kind`] answers for an invariant.
+    ///
+    /// Parameters are searched after generated binders, and both in reverse,
+    /// so the most recent binding of a name wins -- though the lowering makes
+    /// every binder unique, so in practice there is only ever one.
+    fn var_type(&self, name: &str) -> Type {
+        self.types
+            .iter()
+            .rev()
+            .chain(self.params.iter().rev())
+            .find(|(bound, _)| bound == name)
+            .map(|(_, ty)| ty.clone())
+            .unwrap_or_else(unknown_type)
     }
 }
 
@@ -2398,6 +2798,414 @@ mod tests {
         assert_eq!(
             lower_types(&module, &crate::names::NamePolicy::RUST).err(),
             Some(LowerError::ParamOutOfBounds(0)),
+        );
+    }
+
+    // ---------------------------------------------------------------- lists
+
+    /// The corpus definition the list tests are built on: `(List Nat)` in
+    /// return position, so `Shape::Buffer`.
+    fn corpus_def(name: &str) -> (Module, usize) {
+        let module = parse(include_str!("../../../lean/Conformance/golden.ir"));
+        let index = module
+            .definitions
+            .iter()
+            .position(|d| d.name.ends_with(name))
+            .expect("the definition is in the corpus");
+        (module, index)
+    }
+
+    fn find_stmt(stmts: &[Stmt], want: &dyn Fn(&Stmt) -> bool) -> bool {
+        stmts.iter().any(|s| {
+            want(s)
+                || match s {
+                    Stmt::If { then, else_, .. } => find_stmt(then, want) || find_stmt(else_, want),
+                    Stmt::Switch { arms, default, .. } => {
+                        arms.iter().any(|a| find_stmt(&a.body, want))
+                            || default.as_deref().is_some_and(|d| find_stmt(d, want))
+                    }
+                    _ => false,
+                }
+        })
+    }
+
+    /// Running out of caller-supplied buffer is a failure, so by this IR's
+    /// central invariant it must appear as a statement. It used to live inside
+    /// the Rust renderer -- with three printers that is three chances to
+    /// forget it.
+    ///
+    /// The brief's sketch of this test looked for the `Push` at the top level
+    /// of `body.stmts`. `c_list_build` opens with a `cases`, so every `Push`
+    /// it has is inside a `Switch` arm; the search is recursive here for the
+    /// same reason the `OutputTooSmall` search already was.
+    #[test]
+    fn the_buffer_bounds_check_is_an_explicit_statement_not_the_printers_job() {
+        let (module, index) = corpus_def("c_list_build");
+        let def = &module.definitions[index];
+        let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+        let body = lower_def(def, &shapes, &TargetProfile::RUST).expect("lowers");
+
+        assert_eq!(
+            body.shape,
+            crate::shape::Shape::Buffer,
+            "a (List Nat) return must be Buffer under the Rust profile"
+        );
+        assert!(
+            find_stmt(&body.stmts, &|s| matches!(
+                s,
+                Stmt::Fail(ErrorCode::OutputTooSmall)
+            )),
+            "no explicit OutputTooSmall guard in {:?}",
+            body.stmts
+        );
+        assert!(
+            find_stmt(&body.stmts, &|s| matches!(s, Stmt::Push { .. })),
+            "no Push in {:?}",
+            body.stmts
+        );
+        // The guard is a comparison of the running index against the buffer's
+        // length, and it is what the failure hangs off.
+        assert!(
+            find_stmt(&body.stmts, &|s| matches!(
+                s,
+                Stmt::If { cond: TExpr::BinOp(_, BinOp::Lt, a, b), else_, .. }
+                    if matches!(&**a, TExpr::Seq(SeqQuery::Len, _))
+                        && matches!(&**b, TExpr::Seq(SeqQuery::Cap, _))
+                        && else_.as_slice() == [Stmt::Fail(ErrorCode::OutputTooSmall)]
+            )),
+            "the guard is not `len < cap` with the failure in its else-branch: {:?}",
+            body.stmts
+        );
+        // The output sequence is named for the printer, and named through the
+        // same binder machinery every other binder uses.
+        assert_eq!(body.output.as_deref(), Some("output"));
+    }
+
+    /// The same definition under a profile whose lists grow.
+    ///
+    /// Not a formatting difference: there is no bound to run out of, so the
+    /// statement list has a different SHAPE -- the `Push`es are there and the
+    /// guard is not. This is the `ListStrategy` seam doing work, and if it
+    /// ever passed vacuously the abstraction would have bought nothing.
+    #[test]
+    fn a_native_sequence_profile_pushes_without_any_bounds_check() {
+        let (module, index) = corpus_def("c_list_build");
+        let def = &module.definitions[index];
+        let shapes = signatures(&module.definitions, &TargetProfile::PYTHON);
+        let body = lower_def(def, &shapes, &TargetProfile::PYTHON).expect("lowers");
+
+        assert!(find_stmt(&body.stmts, &|s| matches!(s, Stmt::Push { .. })));
+        assert!(
+            !find_stmt(&body.stmts, &|s| matches!(
+                s,
+                Stmt::Fail(ErrorCode::OutputTooSmall)
+            )),
+            "a growable sequence cannot run out, so nothing may report that it did: {:?}",
+            body.stmts
+        );
+    }
+
+    /// A list-shaped callee appends to the SAME sequence and reports how many
+    /// elements it added.
+    ///
+    /// The call stays an ordinary `TryLet` -- the callee is the one that can
+    /// run out of room -- and the cursor moves in a separate, infallible
+    /// `Advance`. Folding the two together would make a second failure point.
+    #[test]
+    fn a_recursive_list_call_is_a_trylet_and_an_advance_not_a_second_failure_point() {
+        let (module, index) = corpus_def("c_list_build");
+        let def = &module.definitions[index];
+        let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+        let body = lower_def(def, &shapes, &TargetProfile::RUST).expect("lowers");
+
+        assert!(
+            find_stmt(&body.stmts, &|s| matches!(
+                s,
+                Stmt::TryLet { op: FallibleOp::Call(name, args), .. }
+                    if name == "c_list_build"
+                        && matches!(args.last(), Some(TExpr::Seq(SeqQuery::Rest, _)))
+            )),
+            "the callee is not handed the unwritten remainder: {:?}",
+            body.stmts
+        );
+        assert!(find_stmt(&body.stmts, &|s| matches!(
+            s,
+            Stmt::Advance { .. }
+        )));
+    }
+
+    /// A zero-argument list definition is a promoted `&'static` slice, so it
+    /// gets the elements and no bounds check -- there is no caller storage to
+    /// run out of.
+    #[test]
+    fn a_static_list_lowers_to_its_elements_and_nothing_else() {
+        let module = parse(
+            r#"(module M (def m () (List Nat) (ctor "List.cons" 3 (ctor "List.cons" 5 (ctor "List.nil")))))"#,
+        );
+        let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+        let body =
+            lower_def(&module.definitions[0], &shapes, &TargetProfile::RUST).expect("lowers");
+        assert_eq!(body.shape, crate::shape::Shape::StaticList);
+        assert!(
+            matches!(
+                body.stmts.as_slice(),
+                [
+                    Stmt::Push {
+                        value: TExpr::Lit(Lit::Nat(3)),
+                        ..
+                    },
+                    Stmt::Push {
+                        value: TExpr::Lit(Lit::Nat(5)),
+                        ..
+                    },
+                    Stmt::Return(TExpr::Seq(SeqQuery::Len, _)),
+                ]
+            ),
+            "got {:?}",
+            body.stmts
+        );
+    }
+
+    /// An array literal can hold constants and nothing else, so a
+    /// zero-argument list definition that branches is refused -- in
+    /// `prod-codegen`'s own words, and with a rejection that outlives Task 7.
+    #[test]
+    fn a_static_list_that_is_not_a_constant_chain_is_refused() {
+        let module = parse(
+            r#"(module M (def m () (List Nat)
+                 (if (lt 1 2) (ctor "List.nil") (ctor "List.cons" 1 (ctor "List.nil")))))"#,
+        );
+        let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+        assert_eq!(
+            lower_def(&module.definitions[0], &shapes, &TargetProfile::RUST).err(),
+            Some(LowerError::UnsupportedKind(String::from(
+                "zero-argument list definitions must be constant cons chains"
+            )))
+        );
+    }
+
+    /// A list has no by-value form in the allocation-free tier, so a cons cell
+    /// outside list position is refused rather than lowered to a `TExpr::Ctor`
+    /// no printer can render.
+    #[test]
+    fn a_list_constructor_outside_list_position_is_refused() {
+        let module =
+            parse(r#"(module M (def m ((a Nat)) Nat (ctor "List.cons" a (ctor "List.nil"))))"#);
+        let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+        assert_eq!(
+            lower_def(&module.definitions[0], &shapes, &TargetProfile::RUST).err(),
+            Some(LowerError::UnsupportedKind(String::from(
+                "`List.cons` outside a list return position"
+            )))
+        );
+    }
+
+    // ------------------------------------- comparisons, connectives, casts
+
+    fn body_of(ir: &str) -> Vec<Stmt> {
+        let module = parse(ir);
+        let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+        lower_def_in(
+            &module.definitions[0],
+            &shapes,
+            &TargetProfile::RUST,
+            &module.types,
+        )
+        .expect("lowers")
+        .stmts
+    }
+
+    /// A comparison in a definition BODY. `lower_invariant` served the
+    /// invariant path from Task 5; `Lowering::expr` had no arm at all, so any
+    /// corpus body containing one was `NotYetLowered`.
+    ///
+    /// All four are TOTAL -- none can fail under any profile -- so each is a
+    /// `TExpr` and never a `TryLet`, and the operand order is preserved:
+    /// `Lt(a, b)` is `a < b`, not `b < a`. A reversed comparison still
+    /// compiles and rejects precisely the inputs it should accept.
+    #[test]
+    fn comparisons_lower_in_a_body_as_total_expressions_in_source_order() {
+        for (node, op) in [
+            ("eq", BinOp::Eq),
+            ("lt", BinOp::Lt),
+            ("le", BinOp::Le),
+            ("gt", BinOp::Gt),
+        ] {
+            let stmts = body_of(&format!(
+                "(module M (def m ((a Nat) (b Nat)) Bool ({} a b)))",
+                node
+            ));
+            assert!(
+                matches!(
+                    stmts.as_slice(),
+                    [Stmt::Return(TExpr::BinOp(NumKind::Nat, got, x, y))]
+                        if *got == op
+                            && **x == TExpr::Var(String::from("a"))
+                            && **y == TExpr::Var(String::from("b"))
+                ),
+                "for {}: got {:?}",
+                node,
+                stmts
+            );
+        }
+    }
+
+    /// A comparison reads its operands at the kind they have, not at `Nat` by
+    /// default: `a < 10` over `UInt8` parameters is a `UInt8` comparison.
+    #[test]
+    fn a_comparison_takes_its_kind_from_the_operand_that_has_one() {
+        let stmts = body_of("(module M (def m ((a U8)) Bool (lt a 10)))");
+        assert!(
+            matches!(
+                stmts.as_slice(),
+                [Stmt::Return(TExpr::BinOp(NumKind::U8, BinOp::Lt, ..))]
+            ),
+            "got {:?}",
+            stmts
+        );
+    }
+
+    /// The boolean connectives are total too, so they stay in expression
+    /// position.
+    #[test]
+    fn boolean_connectives_lower_in_a_body() {
+        let stmts =
+            body_of("(module M (def m ((a Nat) (b Nat)) Bool (and (lt a b) (not (eq a b)))))");
+        assert!(
+            matches!(
+                stmts.as_slice(),
+                [Stmt::Return(TExpr::And(x, y))]
+                    if matches!(&**x, TExpr::BinOp(_, BinOp::Lt, ..))
+                        && matches!(&**y, TExpr::Not(inner)
+                            if matches!(&**inner, TExpr::BinOp(_, BinOp::Eq, ..)))
+            ),
+            "got {:?}",
+            stmts
+        );
+
+        let stmts = body_of("(module M (def m ((a Nat) (b Nat)) Bool (or (lt a b) (gt a b))))");
+        assert!(
+            matches!(stmts.as_slice(), [Stmt::Return(TExpr::Or(..))]),
+            "got {:?}",
+            stmts
+        );
+    }
+
+    /// `&&` and `||` are LAZY in their right operand, and `TExpr` has no
+    /// statement list to hang a lazy operand's work on. Hoisting it would
+    /// report an overflow on inputs where Lean -- whose `Nat` is unbounded --
+    /// has no failure at all, so it is refused rather than emitted.
+    ///
+    /// No corpus definition reaches this: the connectives appear in structure
+    /// invariants, where a failing operation is already refused outright, and
+    /// never in a definition body.
+    #[test]
+    fn a_connective_whose_right_operand_can_fail_is_refused_not_evaluated_eagerly() {
+        let module =
+            parse("(module M (def m ((a Nat) (b Nat)) Bool (and (lt a b) (lt (add Nat a b) b))))");
+        let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+        assert!(
+            matches!(
+                lower_def(&module.definitions[0], &shapes, &TargetProfile::RUST).err(),
+                Some(LowerError::NotYetLowered(_))
+            ),
+            "a hoisted right operand would be a different function"
+        );
+        // Under a profile whose `Nat` is exact there is nothing to hoist, so
+        // the same source lowers.
+        let shapes = signatures(&module.definitions, &TargetProfile::PYTHON);
+        assert!(lower_def(&module.definitions[0], &shapes, &TargetProfile::PYTHON).is_ok());
+    }
+
+    /// The conversion whitelist is the LOSSLESS set and nothing else.
+    #[test]
+    fn the_lossless_conversions_lower_and_the_rest_are_refused() {
+        for (from, to, kind) in [
+            ("Nat", "Int", NumKind::Int),
+            ("Int", "Nat", NumKind::Nat),
+            ("U8", "Nat", NumKind::Nat),
+            ("Nat", "U8", NumKind::U8),
+            ("U64", "Nat", NumKind::Nat),
+            ("Nat", "U32", NumKind::U32),
+        ] {
+            let stmts = body_of(&format!(
+                "(module M (def m ((a {})) {} (convert {} {} a)))",
+                from, to, from, to
+            ));
+            assert!(
+                matches!(
+                    stmts.as_slice(),
+                    [Stmt::Return(TExpr::Convert(_, got, _))] if *got == kind
+                ),
+                "for {} -> {}: got {:?}",
+                from,
+                to,
+                stmts
+            );
+        }
+    }
+
+    /// Every sized-to-sized pair and every `Int`-to-sized pair is a deliberate
+    /// non-goal. They must stay `UnsupportedKind` rather than silently render
+    /// a cast that changes the number, and the refusal lives here rather than
+    /// in three printers that would each have to remember it.
+    #[test]
+    fn cross_width_and_int_to_sized_conversions_stay_refused() {
+        for (from, to) in [
+            ("U8", "U32"),
+            ("U32", "U8"),
+            ("Int", "U8"),
+            ("U8", "Int"),
+            ("Nat", "Nat"),
+        ] {
+            let module = parse(&format!(
+                "(module M (def m ((a {})) {} (convert {} {} a)))",
+                from, to, from, to
+            ));
+            let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+            assert!(
+                matches!(
+                    lower_def(&module.definitions[0], &shapes, &TargetProfile::RUST).err(),
+                    Some(LowerError::UnsupportedKind(_))
+                ),
+                "{} -> {} must be refused",
+                from,
+                to
+            );
+        }
+    }
+
+    /// The invariant path and the body path admit the same conversions,
+    /// through the same whitelist. Task 5 found three divergences between
+    /// those two paths; this is the check that stops a fourth.
+    #[test]
+    fn an_invariant_admits_exactly_the_conversions_a_body_does() {
+        let module = parse(
+            r#"(module M (type "M.S" (ctor "M.S.mk" (used U8))
+                 (invariant (le (convert U8 Nat used) 200))))"#,
+        );
+        let types = lower_types(&module, &crate::names::NamePolicy::RUST)
+            .expect("a lossless conversion is total, so an invariant may contain it");
+        assert!(
+            matches!(
+                types[0].invariant.as_ref().expect("an invariant"),
+                TExpr::BinOp(NumKind::Nat, BinOp::Le, a, _)
+                    if matches!(&**a, TExpr::Convert(NumKind::U8, NumKind::Nat, _))
+            ),
+            "got {:?}",
+            types[0].invariant
+        );
+
+        let module = parse(
+            r#"(module M (type "M.S" (ctor "M.S.mk" (used U8))
+                 (invariant (le (convert U8 U32 used) 200))))"#,
+        );
+        assert!(
+            matches!(
+                lower_types(&module, &crate::names::NamePolicy::RUST).err(),
+                Some(LowerError::UnsupportedKind(_))
+            ),
+            "the invariant path must refuse what the body path refuses"
         );
     }
 }

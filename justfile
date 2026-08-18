@@ -42,6 +42,11 @@ sdk-typescript ir="rust/prod-core/goldens.ir" stem="lean4-prod" library_name="le
 sdk-kotlin ir="rust/prod-core/goldens.ir" stem="lean4-prod" library_name="lean4_prod":
     just sdk kotlin {{ir}} {{stem}} {{library_name}}
 
+# Compile/syntax-check one representative generated fixture for every SDK
+# language. Optional language compilers are skipped by the fixture harness.
+sdk-fixtures:
+    RUSTC_WRAPPER= cargo test --manifest-path rust/Cargo.toml -p prod-codegen --test sdk_fixtures -- --nocapture
+
 # Export prod from lean
 prod-export:
     cd lean && lake exe prod-export

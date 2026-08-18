@@ -114,6 +114,22 @@ pub enum TExpr {
 /// *lowering* needed it -- the bounds check is [`SeqQuery::Len`] against
 /// [`SeqQuery::Cap`], and it is in the statement list rather than inside a
 /// printer precisely so that three printers cannot forget it three times.
+///
+/// # These are the one POSITION-DEPENDENT expressions in the IR
+///
+/// Every other [`TExpr`] means the same thing wherever it is evaluated, which
+/// is what lets a printer relocate one -- `prod-emit-rust` folds a
+/// single-use [`Stmt::TryLet`] down into its use site on exactly that
+/// assumption. A `Seq` denotes the cursor, or something taken from it, **at
+/// the point in the statement list where it is reached**: every [`Stmt::Push`]
+/// and every [`Stmt::Advance`] in between has moved it. Moving a `Seq`-bearing
+/// expression past one silently reads a different cursor.
+///
+/// This is a *different property from totality*, and totality is not a
+/// substitute for it. All three variants are total -- none can fail, so none
+/// is a [`Stmt::TryLet`] -- and they still may not be relocated. A printer
+/// that reorders expressions owes them a pin; `prod-emit-rust` spells that as
+/// declining to fold any `TryLet` whose operation mentions one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeqQuery {
     /// How many elements have been appended so far: the running index.

@@ -316,8 +316,17 @@ impl Printer {
                     // in evaluation order and the uses appear in that same
                     // order, so folding cannot reorder which failure is
                     // reported first.
+                    //
+                    // Unless the expression mentions the sequence. Folding
+                    // MOVES an expression down the statement list, and a
+                    // `TExpr::Seq` does not mean the same thing in two places:
+                    // it reads the cursor, which every `Push` and every
+                    // `Advance` in between has moved. Every other `TExpr` is
+                    // position-independent and may be relocated freely; these
+                    // are the exception, so they are pinned to where the
+                    // lowering put them.
                     let usage = self.uses.get(name).copied().unwrap_or_default();
-                    if usage.total == 1 && usage.same_level == 1 {
+                    if usage.total == 1 && usage.same_level == 1 && !mentions_sequence(op) {
                         self.inline.insert(name.clone(), text);
                     } else {
                         out.push_str(&format!("{}let {} = {};\n", pad, ident(name), text));
@@ -765,6 +774,39 @@ fn param_type(ty: &Type) -> String {
     match ty {
         Type::List(inner) => format!("&[{}]", value_type(inner)),
         _ => value_type(ty),
+    }
+}
+
+/// Does this operation read the output sequence?
+///
+/// The one question the fold-into-single-use decision has to ask beyond
+/// "how often is it read". A [`TExpr::Seq`] is **position-dependent**: it
+/// denotes the cursor, or a slice taken from it, at the point the statement
+/// list reaches it. Moving such an expression past a `Push` or an `Advance`
+/// silently reads a different cursor, and nothing about totality rules that
+/// out -- `Seq` is total, and still may not be relocated.
+///
+/// Today no lowering puts a `Seq`-bearing `TryLet` anywhere but immediately
+/// before the `Advance` that consumes it, so the fold would happen to be
+/// sound. That is an accident of ordering, not a guarantee, and this is the
+/// guarantee.
+fn mentions_sequence(op: &FallibleOp) -> bool {
+    match op {
+        FallibleOp::Arith(_, _, a, b) => expr_mentions_sequence(a) || expr_mentions_sequence(b),
+        FallibleOp::Neg(_, a) => expr_mentions_sequence(a),
+        FallibleOp::Call(_, args) => args.iter().any(expr_mentions_sequence),
+    }
+}
+
+fn expr_mentions_sequence(e: &TExpr) -> bool {
+    match e {
+        TExpr::Seq(..) => true,
+        TExpr::Lit(_) | TExpr::Var(_) => false,
+        TExpr::BinOp(_, _, a, b) | TExpr::And(a, b) | TExpr::Or(a, b) => {
+            expr_mentions_sequence(a) || expr_mentions_sequence(b)
+        }
+        TExpr::Not(a) | TExpr::Proj(_, _, a) | TExpr::Convert(_, _, a) => expr_mentions_sequence(a),
+        TExpr::Ctor(_, _, args) | TExpr::Call(_, args) => args.iter().any(expr_mentions_sequence),
     }
 }
 

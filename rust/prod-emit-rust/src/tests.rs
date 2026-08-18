@@ -813,3 +813,121 @@ fn the_lossless_conversions_print_exactly_as_the_renderer_does() {
         assert!(!out.contains("compile_error!"), "got: {}", out);
     }
 }
+
+/// A `TryLet` whose operation reads the sequence is PINNED where the lowering
+/// put it, even when the fold-into-single-use rule would otherwise move it.
+///
+/// Folding moves an expression down the statement list. `TExpr::Seq` denotes
+/// the cursor at the point it is reached, so moving it past a `Push` or an
+/// `Advance` reads a different cursor and silently computes something else.
+/// Totality does not rule this out -- `Seq` is total and still may not be
+/// relocated -- so the inliner has to ask a second question.
+///
+/// The body is built by hand because no lowering emits this ordering today:
+/// the only `Seq`-bearing `TryLet` the list lowering produces is immediately
+/// followed by the `Advance` that consumes it, so the fold would happen to be
+/// sound. That is an accident of ordering, and this is the test that stops a
+/// later task from disturbing it unnoticed.
+#[test]
+fn a_trylet_that_reads_the_cursor_is_never_folded_past_a_push() {
+    use prod_lower::target::{Body, SeqQuery};
+
+    let seq = || String::from("output");
+    let body = Body {
+        name: String::from("m"),
+        params: vec![],
+        ret: Type::List(Box::new(Type::Nat)),
+        shape: Shape::Buffer,
+        output: Some(seq()),
+        stmts: vec![
+            // Reads the cursor HERE, while it is still 0.
+            Stmt::TryLet {
+                name: String::from("t0"),
+                ty: Type::Nat,
+                op: FallibleOp::Call(String::from("f"), vec![TExpr::Seq(SeqQuery::Rest, seq())]),
+            },
+            // ... and these move it.
+            Stmt::If {
+                cond: TExpr::BinOp(
+                    NumKind::Nat,
+                    BinOp::Lt,
+                    Box::new(TExpr::Seq(SeqQuery::Len, seq())),
+                    Box::new(TExpr::Seq(SeqQuery::Cap, seq())),
+                ),
+                then: vec![],
+                else_: vec![Stmt::Fail(ErrorCode::OutputTooSmall)],
+            },
+            Stmt::Push {
+                seq: seq(),
+                value: TExpr::Lit(Lit::Nat(7)),
+            },
+            // The single, same-level read of `t0`.
+            Stmt::Advance {
+                seq: seq(),
+                count: TExpr::Var(String::from("t0")),
+            },
+            Stmt::Return(TExpr::Seq(SeqQuery::Len, seq())),
+        ],
+    };
+
+    // The read is counted exactly once at this level, so without the pin the
+    // fold would fire. If this ever stops holding the test is vacuous.
+    let usage = uses(&body.stmts).get("t0").copied().expect("`t0` is read");
+    assert_eq!((usage.total, usage.same_level), (1, 1));
+
+    let out = emit_body(&body);
+    assert!(
+        out.contains("let t0 = f(&mut output[__len..])?;"),
+        "the call must stay where the cursor was still 0: {}",
+        out
+    );
+    assert!(
+        out.contains("__len += t0;"),
+        "the advance must read the binding, not a moved copy of the call: {}",
+        out
+    );
+    assert!(
+        !out.contains("__len += f("),
+        "the call was folded past a Push and now reads the wrong cursor: {}",
+        out
+    );
+}
+
+/// The second in-repo corpus. `golden.ir` is downstream of Lean;
+/// `representative.ir` is the hand-written one, and it carries the
+/// multi-constructor enum, the keyword field names and the inlined join point
+/// that the Lean corpus cannot produce.
+///
+/// Every definition lowers and renders. The only `compile_error!` left is the
+/// struct literal, which needs the module's type table -- that is the Task 7
+/// cutover's job, and this asserts it is the *only* thing outstanding.
+#[test]
+fn the_hand_written_corpus_lowers_and_renders() {
+    let rendered = render_module(include_str!(
+        "../../prod-codegen-compile-tests/fixtures/representative.ir"
+    ));
+    assert_eq!(rendered.len(), 6, "got {:?}", rendered.keys());
+
+    for (name, out) in &rendered {
+        for line in out.lines().filter(|l| l.contains("compile_error!")) {
+            assert!(
+                line.contains("a struct literal needs the module's type table"),
+                "`{}` has an unexpected compile_error!: {}",
+                name,
+                line
+            );
+        }
+    }
+    // The join point is inlined at its jump site, not rejected.
+    assert!(
+        rendered["r_jp_inlined"].contains("checked_add"),
+        "got {}",
+        rendered["r_jp_inlined"]
+    );
+    // A keyword field name is escaped identically at declaration and use.
+    assert!(
+        rendered["r_keyword_fields"].contains("r#type"),
+        "got {}",
+        rendered["r_keyword_fields"]
+    );
+}

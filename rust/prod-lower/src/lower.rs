@@ -80,6 +80,18 @@ pub fn lower_def_in(
         // `prod-emit-rust`'s `uses()`, counting reads by name with no scope of
         // its own, would silently pool.
         Shape::Buffer | Shape::StaticList => {
+            // `prod-codegen`'s own pre-check, kept DISTINCT from the
+            // constant-cons-chain one below because it names a different
+            // reason: this definition is shaped like a constant list but
+            // computes its elements, and a promoted `&'static` slice holds
+            // values, not work. Collapsing the two would report the wrong
+            // cause for a definition that has this one.
+            if shape == Shape::StaticList && crate::shape::is_fallible(&def.body, shapes, profile) {
+                return Err(LowerError::UnsupportedKind(format!(
+                    "`{}` computes its list elements, so it cannot be a promoted &'static slice",
+                    def.name
+                )));
+            }
             let seq = lowering.bind_source(OUTPUT_SEQUENCE);
             // Only a caller-supplied buffer can run out. A `NativeSequence`
             // host grows on demand, and a promoted `&'static` list has no
@@ -1232,6 +1244,11 @@ impl<'a> Lowering<'a> {
             // A list named by a `let` this definition made: continue with what
             // it was bound to, in the environment that was in scope where the
             // binding was written -- so `let x := x` cannot resolve to itself.
+            //
+            // Only `env` is rewound, not `self.scope`. A list binding never
+            // pushes a `scope` entry (it has no runtime value to bind), and
+            // LCNF names every binder uniquely, so a `Var` inside the bound
+            // expression resolves to the same target name from either point.
             Expr::Var(name) => match env.iter().rposition(|(n, _)| n == name) {
                 Some(index) => {
                     let bound = env[index].1;
@@ -1273,14 +1290,16 @@ impl<'a> Lowering<'a> {
                 Ok(())
             }
 
+            // Both messages are `prod-codegen`'s, verbatim: the rejection
+            // wording is pinned by the published subset contract, so it moves
+            // across the split without being improved.
             Expr::Call(name, _) => Err(LowerError::UnsupportedKind(format!(
-                "`{}` does not build its list into the caller's sequence",
+                "`{}` does not build its list into a caller buffer",
                 name
             ))),
 
-            other => Err(LowerError::UnsupportedKind(format!(
-                "`{}` does not build a list",
-                node_name(other)
+            _ => Err(LowerError::UnsupportedKind(String::from(
+                "expression does not build a list",
             ))),
         }
     }
@@ -1519,8 +1538,13 @@ impl<'a> Lowering<'a> {
 ///
 /// Ported unchanged from `prod-codegen`'s renderer, deliberately: the policy
 /// it encodes -- inline the single-caller, non-cyclic form, reject the rest --
-/// is the behaviour the Task 7 cutover has to reproduce byte for byte, so it
-/// moves without being widened.
+/// is the behaviour the Task 7 cutover has to reproduce, so it moves without
+/// being widened.
+///
+/// *Behaviour*, not text. The two generators no longer agree byte for byte
+/// anywhere: a list body renders here as a flat `__len` cursor where
+/// `prod-codegen` nests `split_first_mut`, which computes the same function
+/// and does not spell it the same way.
 struct JpContext<'a> {
     /// name -> (params, body) of each `jp` declaration in the body
     decls: BTreeMap<&'a str, (&'a [String], &'a Expr)>,
@@ -2981,6 +3005,101 @@ mod tests {
             Some(LowerError::UnsupportedKind(String::from(
                 "zero-argument list definitions must be constant cons chains"
             )))
+        );
+    }
+
+    /// The rejections `append` can reach, each in `prod-codegen`'s exact
+    /// words.
+    ///
+    /// The wording is pinned by the published subset contract, so it moves
+    /// across the split without being improved. Three of these drifted once
+    /// and were restored.
+    #[test]
+    fn the_list_rejections_keep_prod_codegens_exact_wording() {
+        let cases: &[(&str, &str)] = &[
+            // A callee that does not write into the caller's buffer.
+            (
+                r#"(module M (def g ((a Nat)) Nat a) (def m ((a Nat)) (List Nat) (call g a)))"#,
+                "`g` does not build its list into a caller buffer",
+            ),
+            // Something that is not a list at all where a list was declared.
+            (
+                r#"(module M (def m ((a Nat)) (List Nat) (add Nat a 1)))"#,
+                "expression does not build a list",
+            ),
+            // A name this definition did not bind to a list.
+            (
+                r#"(module M (def m ((a Nat)) (List Nat) a))"#,
+                "`a` is not a list built in this definition",
+            ),
+            // Shaped like a constant list, but it computes its elements. A
+            // DISTINCT reason from the one below, and it must keep its own
+            // message rather than collapsing into the generic one.
+            (
+                r#"(module M (def m () (List Nat) (ctor "List.cons" (add Nat 1 2) (ctor "List.nil"))))"#,
+                "`m` computes its list elements, so it cannot be a promoted &'static slice",
+            ),
+            // Constant elements, but not a chain: an array literal holds
+            // neither branches nor anything else.
+            (
+                r#"(module M (def m () (List Nat)
+                     (if (lt 1 2) (ctor "List.nil") (ctor "List.cons" 1 (ctor "List.nil")))))"#,
+                "zero-argument list definitions must be constant cons chains",
+            ),
+        ];
+        for (ir, expected) in cases {
+            let module = parse(ir);
+            let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+            let def = module.definitions.last().expect("a definition");
+            assert_eq!(
+                lower_def_in(def, &shapes, &TargetProfile::RUST, &module.types).err(),
+                Some(LowerError::UnsupportedKind(String::from(*expected))),
+                "for {}",
+                ir
+            );
+        }
+    }
+
+    /// Every definition and every type declaration in both IN-REPO corpora
+    /// lowers, with no `NotYetLowered` anywhere.
+    ///
+    /// This is the property Task 7 turns into a proof, pinned here on the two
+    /// corpora a fresh checkout actually has. `prod-core/kernel.ir` and
+    /// `prod-core/goldens.ir` are generated and gitignored, so they cannot be
+    /// pinned by a test; they were swept by hand and lower too.
+    #[test]
+    fn both_in_repo_corpora_lower_completely() {
+        let corpora = [
+            (
+                "golden.ir",
+                include_str!("../../../lean/Conformance/golden.ir"),
+            ),
+            (
+                "representative.ir",
+                include_str!("../../prod-codegen-compile-tests/fixtures/representative.ir"),
+            ),
+        ];
+        let mut shapes_seen: Vec<Shape> = Vec::new();
+        for (label, ir) in corpora {
+            let module = parse(ir);
+            lower_types(&module, &crate::names::NamePolicy::RUST)
+                .unwrap_or_else(|e| panic!("{}: types must lower, got {:?}", label, e));
+            let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+            assert!(!module.definitions.is_empty(), "{} is empty", label);
+            for def in &module.definitions {
+                let body = lower_def_in(def, &shapes, &TargetProfile::RUST, &module.types)
+                    .unwrap_or_else(|e| {
+                        panic!("{}: `{}` must lower, got {:?}", label, def.name, e)
+                    });
+                shapes_seen.push(body.shape);
+            }
+        }
+        // Not vacuous: the sweep reaches the list shape this task added, not
+        // only the shapes that already worked.
+        assert!(
+            shapes_seen.contains(&Shape::Buffer),
+            "the corpora no longer exercise a list-shaped body: {:?}",
+            shapes_seen
         );
     }
 

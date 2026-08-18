@@ -186,6 +186,15 @@ generic form is `just sdk python path/to/kernel.ir kernel lean4_prod` (the
 language, IR path, stem, and native library name are positional).
 Use `just sdks` when you want the complete bundle.
 
+Run the generated-language fixture checks with:
+
+```sh
+just sdk-fixtures
+```
+
+The fixture compiles the C header and Rust SDK, parses the Python SDK, and
+type-checks TypeScript and Kotlin when those toolchains are installed.
+
 Include the generated wrapper after the proc-macro expansion in the crate
 that owns the generated definitions:
 

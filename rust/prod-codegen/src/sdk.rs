@@ -29,7 +29,9 @@ fn result_name(spec: &FunctionSpec) -> String {
 
 fn rust_return(spec: &FunctionSpec) -> String {
     if spec.shape == Shape::Fallible {
-        result_name(spec)
+        // The native declarations live in a nested module while the result
+        // structs are public items at the SDK root.
+        format!("super::{}", result_name(spec))
     } else {
         String::from(rust_abi_type(spec.ret))
     }

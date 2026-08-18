@@ -9,3 +9,4 @@ coverage.md
 goldens.txt
 .direnv/
 rust/prod-core/goldens.ir
+/subset.json

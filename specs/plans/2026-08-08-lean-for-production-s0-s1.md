@@ -966,7 +966,7 @@ pub fn generate_module(module: &Module) -> Result<String, Error> {
 - [ ] **Step 7: Run the tests**
 
 Run: `cd rust && cargo test -p prod-codegen`
-Expected: PASS. If `test_unknown_named_type_is_rejected` fails, that is expected until Task 7 routes parameter types through the table — mark it `#[ignore]` with a comment naming Task 7, and remove the attribute there.
+Expected: PASS, all of them. The parameter-position rejection test lives in Task 7, not here — parameter types only route through the type table once `Type::Instance` is gone.
 
 - [ ] **Step 8: Full gates and commit**
 
@@ -1531,8 +1531,27 @@ In `render_value_leaf`'s `Expr::Ctor` arm, check the table *before* the existing
 In `render_match`, before the final fallback arms, add a table-driven case. The alt's binders are positional, so zip them against the declared field names:
 
 ```rust
+                // A declared constructor whose binder count disagrees with its
+                // declared field count is an error, symmetric with the
+                // construction side. Amended mid-execution: this originally
+                // fell through to the positional fallback, which emits
+                // `M.Shape.circle(r, extra)` — a dotted name used as a Rust
+                // path, which does not compile. A milestone whose thesis is
+                // "reject precisely rather than emit code that cannot compile"
+                // cannot keep a path that does exactly that. An UNDECLARED
+                // constructor still falls through untouched: that is how
+                // `Nat.succ`, the List slice patterns, and the Bool/Option
+                // arms continue to work.
                 _ => match self.ctor_decl(&alt.ctor) {
-                    Some((decl, cdecl)) if alt.binders.len() == cdecl.fields.len() => {
+                    Some((_, cdecl)) if alt.binders.len() != cdecl.fields.len() => {
+                        return Err(Error::UnsupportedFieldType(format!(
+                            "`{}` declares {} field(s) but the match arm binds {}",
+                            alt.ctor,
+                            cdecl.fields.len(),
+                            alt.binders.len()
+                        )))
+                    }
+                    Some((decl, cdecl)) => {
                         let path = if decl.ctors.len() == 1 {
                             format!("crate::{}", rust_ident(last_component(&decl.name)))
                         } else {
@@ -1836,7 +1855,81 @@ In `type_to_rust`, replace the `Type::Opaque(s) => s.clone()` arm:
 Run: `cd rust && cargo test --workspace`
 Expected: PASS. If any existing fixture used an opaque type as a stand-in, convert it to a declared `(type ...)` or delete it.
 
-- [ ] **Step 5: Gates and commit**
+- [ ] **Step 5: Reject a projection naming a field the type does not declare**
+
+Added mid-execution, because Task 6 shipped an IR in which `(type "UorAtlas.Instance" ... (T Nat) (O Nat))` coexisted with `(proj "UorAtlas.Instance" "t" ...)` — the declaration and the projection disagreeing inside one file, which is the exact failure the field-name lowering exists to prevent. Every gate passed, because a transitional guard suppressed the generated struct so the projections resolved against a hand-written type. Nothing in the pipeline checks that the IR is internally consistent; this step adds that check.
+
+Write the failing test first, in `rust/prod-codegen/src/tests.rs`:
+
+```rust
+#[test]
+fn test_projection_of_an_undeclared_field_is_rejected() {
+    // A projection must name a field its type actually declares. Without this,
+    // a declaration and a projection can disagree inside one IR file and still
+    // compile, as long as something else supplies a type with the other
+    // spelling.
+    let ir = r#"
+(module M
+  (type "M.Rec" (ctor "M.Rec.mk" (alpha Nat)))
+  (def f ((r (named "M.Rec"))) Nat (proj "M.Rec" "beta" r)))
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::UnknownField("M.Rec".to_string(), "beta".to_string())
+    );
+}
+
+#[test]
+fn test_projection_of_a_declared_field_still_renders() {
+    let ir = r#"
+(module M
+  (type "M.Rec" (ctor "M.Rec.mk" (alpha Nat)))
+  (def f ((r (named "M.Rec"))) Nat (proj "M.Rec" "alpha" r)))
+"#;
+    assert!(generate(ir).contains("(r).alpha"));
+}
+```
+
+Run `cd rust && cargo test -p prod-codegen` and confirm the first fails before implementing.
+
+Add the error variant and its `Display` arm:
+
+```rust
+    /// A projection names a field the declared type does not have. Catches a
+    /// declaration and a projection disagreeing within one IR file.
+    UnknownField(String, String),
+```
+
+```rust
+            Error::UnknownField(ty, field) => write!(
+                f,
+                "type `{}` declares no field `{}`",
+                ty, field
+            ),
+```
+
+Enforce it in the `Proj` arm of `render_value_leaf`. A projection on a type this module does not declare stays permissive — the type may be supplied by the host crate, which is how `Instance` worked before it was generated:
+
+```rust
+            Expr::Proj(ty, field, e) => {
+                if let Some(decl) = self.types.get(ty.as_str()) {
+                    let declared = decl
+                        .ctors
+                        .iter()
+                        .any(|c| c.fields.iter().any(|(name, _)| name == field));
+                    if !declared {
+                        return Err(Error::UnknownField(ty.clone(), field.clone()));
+                    }
+                }
+                Ok(format!("({}).{}", self.value(e)?, rust_ident(field)))
+            }
+```
+
+This needs `self.types`, which Task 8 also threads into `Renderer`. If Task 8 has not landed, thread it here and note it in the report so Task 8 does not duplicate the work.
+
+Run `cd rust && cargo test -p prod-codegen` again: both new tests pass, nothing else regresses.
+
+- [ ] **Step 6: Gates and commit**
 
 Run: `cd rust && cargo clippy --all-targets -- -D warnings && cargo fmt --all -- --check`
 

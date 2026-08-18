@@ -1,7 +1,50 @@
 # Design: Lean-for-production coverage — honest boundary + generated types
 
 **Date:** 2026-08-08
-**Status:** Approved design. Implementation plan to follow.
+**Status: S0 and S1 IMPLEMENTED 2026-08-08.** All steps in the migration order
+below are done and gated (`lake build`, `lake exe prod-export`, `just prod` —
+which now includes `subset-check` — `just lint`, `just fmt-check`, `just
+wasm-check`). The sections above have been left as originally written, with
+deviations from the plan recorded here:
+
+1. **More `Error` variants landed than the "Error variants" table below
+   anticipated.** That table lists six; the shipped `prod_codegen::Error` has
+   eleven. `OpaqueExpr`, `ParamOutOfBounds`, `UnsupportedList`, and
+   `HeapType` predate this milestone (best-practices alignment) and were
+   never listed here to begin with. `UnknownField` is new *in* this milestone
+   and was not anticipated by the design: a projection naming a field the
+   type declaration does not have (declaration/projection disagreement
+   within one IR file) turned out to be a distinct failure mode from
+   `UnsupportedFieldType`, worth its own variant and conformance case rather
+   than folding into an existing one. `specs/lean-for-production.md`'s
+   "Rejections" table is generated from the actual eleven-variant enum
+   (`prod_codegen::REJECTIONS`), so it is the up-to-date list; treat the
+   table below as historical intent, not current fact.
+2. **Multi-constructor enum construction/matching has no Lean-side
+   conformance case.** The design's "Construction and matching stop being
+   positional" section describes `cases` on a multi-constructor type
+   rendering real enum patterns, and `prod-codegen` implements and unit-tests
+   this against hand-written IR fixtures
+   (`test_generate_enum_from_multi_ctor_type`,
+   `test_generate_enum_construction_and_patterns` in
+   `rust/prod-codegen/src/tests.rs`). But no `inductive` with more than one
+   constructor exists anywhere in `Example`/`Conformance`, so the path is
+   never exercised through the actual Lean → LCNF → IR pipeline, only through
+   IR fixtures assembled by hand. `MidProp`/`NoProp`/`Instance` are all
+   `structure`s (single constructor). The published subset contract
+   describes only what the full pipeline exercises, so it lists "parameterless,
+   non-recursive, single-constructor structures" and does not claim enum
+   support — see `specs/lean-for-production.md`. Closing this gap (a real
+   multi-constructor Lean `inductive` conformance case) is a candidate for a
+   follow-up task, not done here.
+3. **`natOpNames`/`deciderNames` refactor, not literal `subsetJson`.** The
+   design's "Generated subset contract" paragraph does not spell out the
+   single-source-of-truth mechanism; the implementation extracts the
+   operator/decider whitelists in `Lower.lean` into association lists
+   (`natOpNames`, `deciderNames`) consumed by both the lowerer
+   (`opWhitelist`/`deciderOp`) and the exporter (`subsetJson` in `Emit.lean`),
+   so the two cannot list different operators.
+
 **Scope:** Milestone S0 + S1 of the coverage roadmap below.
 
 ## Why this exists

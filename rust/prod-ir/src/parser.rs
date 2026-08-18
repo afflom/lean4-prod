@@ -2,30 +2,37 @@
 //!
 //! Grammar (simplified sexp):
 //! ```text
-//! module   ::= "(" "module" ident def* ")"
+//! module   ::= "(" "module" ident type_decl* def* ")"
+//! type_decl ::= "(" "type" '"' ident '"' unsupported? ctor_decl* ")"
+//! unsupported ::= "(" "unsupported" '"' text '"' ")"
+//! ctor_decl ::= "(" "ctor" '"' ident '"' field* ")"
+//! field    ::= "(" ident type ")"
 //! def      ::= "(" "def" ident "(" param* ")" type expr ")"
 //! param    ::= "(" ident type ")"
-//! type     ::= "Nat" | "Int" | "Bool" | "Instance" | "(" "Option" type ")" | "(" "Vec" type ")"
-//!            | "(" "List" type ")" | "(" "Tuple" type* ")" | "(" "opaque" '"' ident '"' ")"
-//! expr     ::= nat | ident | "(" "param" nat ")" | "(" "field" expr ident ")"
+//! type     ::= "Nat" | "Int" | "Bool" | "(" "Option" type ")" | "(" "Vec" type ")"
+//!            | "(" "List" type ")" | "(" "Tuple" type* ")" | "(" "named" '"' ident '"' ")"
+//!            | "(" "opaque" '"' ident '"' ")"
+//! expr     ::= nat | ident | "(" "param" nat ")"
 //!            | "(" "add" expr expr ")" | "(" "sub" expr expr ")" | "(" "mul" expr expr ")"
 //!            | "(" "div" expr expr ")" | "(" "mod" expr expr ")" | "(" "shl" expr expr ")"
+//!            | "(" "shr" expr expr ")"
 //!            | "(" "pow" expr expr ")" | "(" "opaque" '"' ident '"' ")"
 //!            | "(" "eq" expr expr ")" | "(" "lt" expr expr ")" | "(" "le" expr expr ")"
 //!            | "(" "gt" expr expr ")" | "(" "if" expr expr expr ")" | "(" "let" ident expr expr ")"
 //!            | "(" "call" ident expr* ")"
 //!            | "(" "cases" expr alt* default? ")"          ; LCNF cases_on
 //!            | "(" "ctor" '"' ident '"' expr* ")"          ; constructor application
-//!            | "(" "proj" '"' ident '"' nat expr ")"       ; structure projection
+//!            | "(" "proj" '"' ident '"' '"' ident '"' expr ")"  ; structure projection
 //!            | "(" "jp" ident "(" ident* ")" expr ")"      ; LCNF join point
 //!            | "(" "jmp" ident expr* ")"                   ; LCNF jump
 //!            | "(" "unreachable" ")"
+//!            | "(" "extern" '"' ident '"' expr* ")"        ; unresolved callee
 //! alt      ::= "(" "alt" '"' ident '"' "(" ident* ")" expr ")"
 //! default  ::= "(" "default" expr ")"
 //! comment  ::= ";;" ... end-of-line                       ; skipped as whitespace
 //! ```
 
-use super::{Alt, Definition, Expr, Module, Type};
+use super::{Alt, CtorDecl, Definition, Expr, Module, Type, TypeDecl};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -94,7 +101,6 @@ fn parse_type(input: &str) -> IResult<&str, Type> {
         value(Type::Nat, tag("Nat")),
         value(Type::Int, tag("Int")),
         value(Type::Bool, tag("Bool")),
-        value(Type::Instance, tag("Instance")),
         map(
             delimited(char('('), tuple((tag("Option"), parse_type)), char(')')),
             |(_, t)| Type::Option(Box::new(t)),
@@ -114,6 +120,14 @@ fn parse_type(input: &str) -> IResult<&str, Type> {
                 char(')'),
             ),
             |(_, ts)| Type::Tuple(ts),
+        ),
+        map(
+            delimited(
+                char('('),
+                tuple((tag("named"), ws(quoted_ident))),
+                char(')'),
+            ),
+            |(_, n)| Type::Named(n),
         ),
         map(
             delimited(
@@ -190,10 +204,6 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                     Expr::Param(idx as usize)
                 }),
                 map(
-                    tuple((tag("field"), ws(parse_expr), ws(quoted_ident))),
-                    |(_, e, f)| Expr::Field(Box::new(e), f),
-                ),
-                map(
                     tuple((tag("add"), ws(parse_expr), ws(parse_expr))),
                     |(_, a, b)| Expr::Add(Box::new(a), Box::new(b)),
                 ),
@@ -216,6 +226,10 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                 map(
                     tuple((tag("shl"), ws(parse_expr), ws(parse_expr))),
                     |(_, a, b)| Expr::Shl(Box::new(a), Box::new(b)),
+                ),
+                map(
+                    tuple((tag("shr"), ws(parse_expr), ws(parse_expr))),
+                    |(_, a, b)| Expr::Shr(Box::new(a), Box::new(b)),
                 ),
                 map(
                     tuple((tag("pow"), ws(parse_expr), ws(parse_expr))),
@@ -276,8 +290,13 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                     |(_, name, args)| Expr::Ctor(name, args),
                 ),
                 map(
-                    tuple((tag("proj"), ws(quoted_ident), ws(parse_u64), ws(parse_expr))),
-                    |(_, ty, idx, e)| Expr::Proj(ty, idx, Box::new(e)),
+                    tuple((
+                        tag("proj"),
+                        ws(quoted_ident),
+                        ws(quoted_ident),
+                        ws(parse_expr),
+                    )),
+                    |(_, ty, field, e)| Expr::Proj(ty, field, Box::new(e)),
                 ),
                 map(
                     tuple((tag("jp"), ws(ident), ws(parse_binders), ws(parse_expr))),
@@ -295,9 +314,69 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                 map(tuple((tag("opaque"), ws(quoted_ident))), |(_, s)| {
                     Expr::Opaque(s)
                 }),
+                map(
+                    tuple((tag("extern"), ws(quoted_ident), many0(ws(parse_expr)))),
+                    |(_, name, args)| Expr::Extern(name, args),
+                ),
             )),
         ))),
         ws(char(')')),
+    )(input)
+}
+
+/// `(name Type)` — one field of a constructor declaration.
+fn parse_field(input: &str) -> IResult<&str, (String, Type)> {
+    delimited(char('('), tuple((ws(ident), ws(parse_type))), char(')'))(input)
+}
+
+/// `(ctor "Full.Name.mk" (field Type)...)`
+fn parse_ctor_decl(input: &str) -> IResult<&str, CtorDecl> {
+    map(
+        delimited(
+            char('('),
+            tuple((tag("ctor"), ws(quoted_ident), many0(ws(parse_field)))),
+            char(')'),
+        ),
+        |(_, name, fields)| CtorDecl { name, fields },
+    )(input)
+}
+
+/// `(unsupported "reason")` — a type the exporter reached but cannot describe.
+fn parse_unsupported(input: &str) -> IResult<&str, String> {
+    delimited(
+        char('('),
+        map(tuple((tag("unsupported"), ws(quoted_reason))), |(_, r)| r),
+        char(')'),
+    )(input)
+}
+
+/// A double-quoted free-text reason (unlike `quoted_ident`, spaces allowed).
+fn quoted_reason(input: &str) -> IResult<&str, String> {
+    delimited(
+        char('"'),
+        map(take_till(|c| c == '"'), String::from),
+        char('"'),
+    )(input)
+}
+
+/// `(type "Full.Name" (ctor ...)...)` or `(type "Full.Name" (unsupported "why"))`
+fn parse_type_decl(input: &str) -> IResult<&str, TypeDecl> {
+    map(
+        delimited(
+            char('('),
+            tuple((
+                terminated(tag("type"), multispace1),
+                ws(quoted_ident),
+                opt(ws(parse_unsupported)),
+                many0(ws(parse_ctor_decl)),
+            )),
+            char(')'),
+        ),
+        |(_, name, unsupported, ctors)| TypeDecl {
+            name,
+            ctors,
+            unsupported,
+        },
     )(input)
 }
 
@@ -326,18 +405,31 @@ fn parse_definition(input: &str) -> IResult<&str, Definition> {
 }
 
 pub fn parse_module(input: &str) -> IResult<&str, Module> {
-    let (rest, (_, name, definitions)) = ws(delimited(
+    let (rest, (_, name, types, definitions)) = ws(delimited(
         char('('),
-        tuple((tag("module"), ws(ident), many0(ws(parse_definition)))),
+        tuple((
+            tag("module"),
+            ws(ident),
+            many0(ws(parse_type_decl)),
+            many0(ws(parse_definition)),
+        )),
         char(')'),
     ))(input)?;
 
-    Ok((rest, Module { name, definitions }))
+    Ok((
+        rest,
+        Module {
+            name,
+            types,
+            definitions,
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     use alloc::vec;
 
     #[test]
@@ -399,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_parse_expr_add() {
-        let input = r#"(add (mul (param 0) (field (param 1) "o")) (param 2))"#;
+        let input = r#"(add (mul (param 0) (proj "UorAtlas.Instance" "O" (param 1))) (param 2))"#;
         let (rest, expr) = parse_expr(input).unwrap();
         assert!(rest.is_empty());
         match expr {
@@ -412,9 +504,9 @@ mod tests {
     fn test_parse_class_index() {
         let input = r#"
 (module UorAtlas.Kernel
-  (def classIndex ((h2 Nat) (d Nat) (l Nat) (inst Instance)) Nat
-    (add (mul (field inst "stride") h2)
-         (add (mul (field inst "o") d) l)))
+  (def classIndex ((h2 Nat) (d Nat) (l Nat) (inst (named "UorAtlas.Instance"))) Nat
+    (add (mul (call stride inst) h2)
+         (add (mul (proj "UorAtlas.Instance" "O" inst) d) l)))
 )
 "#;
         let (rest, module) = parse_module(input).unwrap();
@@ -469,12 +561,12 @@ mod tests {
 
     #[test]
     fn test_parse_proj() {
-        let (rest, expr) = parse_expr(r#"(proj "Pair" 0 (ctor "Pair" 1 2))"#).unwrap();
+        let (rest, expr) = parse_expr(r#"(proj "Pair" "fst" (ctor "Pair" 1 2))"#).unwrap();
         assert!(rest.is_empty());
         match expr {
-            Expr::Proj(ty, idx, e) => {
+            Expr::Proj(ty, field, e) => {
                 assert_eq!(ty, "Pair");
-                assert_eq!(idx, 0);
+                assert_eq!(field, "fst");
                 assert!(matches!(*e, Expr::Ctor(..)));
             }
             _ => panic!("Expected Proj, got {:?}", expr),
@@ -504,6 +596,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_shr() {
+        let (rest, expr) = parse_expr("(shr n 1)").unwrap();
+        assert!(rest.is_empty());
+        assert!(matches!(expr, Expr::Shr(..)));
+    }
+
+    #[test]
     fn test_parse_gt() {
         let (rest, expr) = parse_expr("(gt (param 0) 1)").unwrap();
         assert!(rest.is_empty());
@@ -512,7 +611,7 @@ mod tests {
 
     #[test]
     fn test_parse_pow() {
-        let (rest, expr) = parse_expr("(pow 2 (sub (proj \"Instance\" 2 i) 1))").unwrap();
+        let (rest, expr) = parse_expr("(pow 2 (sub (proj \"Instance\" \"o\" i) 1))").unwrap();
         assert!(rest.is_empty());
         match expr {
             Expr::Pow(a, b) => {
@@ -535,5 +634,80 @@ mod tests {
         let (rest, ty) = parse_type(r#"(opaque "Foo.Bar")"#).unwrap();
         assert!(rest.is_empty());
         assert_eq!(ty, Type::Opaque("Foo.Bar".into()));
+    }
+
+    #[test]
+    fn test_parse_type_decl_single_ctor() {
+        let input = r#"
+(module M
+  (type "UorAtlas.Instance"
+    (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
+)
+"#;
+        let (rest, module) = parse_module(input).unwrap();
+        assert!(rest.trim().is_empty());
+        assert_eq!(module.types.len(), 1);
+        assert_eq!(module.types[0].name, "UorAtlas.Instance");
+        assert_eq!(module.types[0].ctors.len(), 1);
+        assert_eq!(module.types[0].ctors[0].name, "UorAtlas.Instance.mk");
+        assert_eq!(
+            module.types[0].ctors[0].fields,
+            vec![
+                ("q".to_string(), Type::Nat),
+                ("T".to_string(), Type::Nat),
+                ("O".to_string(), Type::Nat),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_type_decl_multi_ctor_and_named_type() {
+        let input = r#"
+(module M
+  (type "M.Shape"
+    (ctor "M.Shape.circle" (radius Nat))
+    (ctor "M.Shape.rect" (w Nat) (h Nat)))
+  (def area ((s (named "M.Shape"))) Nat 0)
+)
+"#;
+        let (rest, module) = parse_module(input).unwrap();
+        assert!(rest.trim().is_empty());
+        assert_eq!(module.types[0].ctors.len(), 2);
+        assert_eq!(module.types[0].ctors[1].fields.len(), 2);
+        assert_eq!(
+            module.definitions[0].params[0].1,
+            Type::Named("M.Shape".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_ctor_with_no_fields() {
+        let input = r#"(module M (type "M.Unit" (ctor "M.Unit.mk")))"#;
+        let (_, module) = parse_module(input).unwrap();
+        assert!(module.types[0].ctors[0].fields.is_empty());
+    }
+
+    #[test]
+    fn test_parse_extern() {
+        let (rest, expr) = parse_expr(r#"(extern "Foo.bar" 1 2)"#).unwrap();
+        assert!(rest.is_empty());
+        match expr {
+            Expr::Extern(name, args) => {
+                assert_eq!(name, "Foo.bar");
+                assert_eq!(args.len(), 2);
+            }
+            _ => panic!("Expected Extern, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_unsupported_type_decl() {
+        let input = r#"(module M (type "M.Poly" (unsupported "type parameters")))"#;
+        let (_, module) = parse_module(input).unwrap();
+        assert_eq!(
+            module.types[0].unsupported.as_deref(),
+            Some("type parameters")
+        );
+        assert!(module.types[0].ctors.is_empty());
     }
 }

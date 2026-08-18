@@ -16,9 +16,9 @@ use prod_core::{
 // format, consumed through the same macro — nothing hand-written downstream.
 prod_macros::prod_defs! { ir = "goldens.ir" }
 
-const CANONICAL: Instance = Instance { q: 4, t: 3, o: 8 };
-const DEMO_SMALL: Instance = Instance { q: 2, t: 2, o: 4 };
-const THIRD: Instance = Instance { q: 5, t: 1, o: 3 };
+const CANONICAL: Instance = Instance { q: 4, T: 3, O: 8 };
+const DEMO_SMALL: Instance = Instance { q: 2, T: 2, O: 4 };
+const THIRD: Instance = Instance { q: 5, T: 1, O: 3 };
 
 /// Digits of a `u64` in any of the TF1 bases fit comfortably in 64 slots.
 const DIGIT_CAPACITY: usize = 64;
@@ -78,12 +78,12 @@ fn arithmetic_overflow_is_reported_not_panicked() {
     // power, and an enormous q overflows the class-count multiplication.
     // Both must surface as errors — this is the DoS surface the standard
     // cares about, since these are caller-controlled inputs.
-    let wide = Instance { q: 1, t: 1, o: 70 };
+    let wide = Instance { q: 1, T: 1, O: 70 };
     assert_eq!(belt(wide), Err(ComputeError::PowOverflow));
     let huge = Instance {
         q: u64::MAX,
-        t: 2,
-        o: 2,
+        T: 2,
+        O: 2,
     };
     assert_eq!(stride(huge), Ok(4));
     assert_eq!(class_count(huge), Err(ComputeError::MulOverflow));
@@ -205,8 +205,8 @@ fn generated_definitions_match_lean_goldens() -> Result<(), ComputeError> {
 fn generated_definitions_roundtrip_lean_examples() -> Result<(), ComputeError> {
     for inst in [CANONICAL, DEMO_SMALL, THIRD] {
         for h2 in 0..inst.q {
-            for d in 0..inst.t {
-                for l in 0..inst.o {
+            for d in 0..inst.T {
+                for l in 0..inst.O {
                     let idx = classIndex(h2, d, l, inst)?;
                     assert_eq!(classDecode(idx, inst)?, (h2, (d, l)));
                 }

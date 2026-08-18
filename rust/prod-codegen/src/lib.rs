@@ -58,19 +58,6 @@
 //!
 //! ## Other lowerings
 //!
-//! - **Instance**: the IR `Instance` type maps to `crate::Instance` (by value;
-//!   it is a small `Copy` struct in `prod-core`).
-//! - **Field access**: `(field e "name")` renders as `e.name`, except for the
-//!   legacy method-field table below, which renders as method calls. This
-//!   table is carried over as-is from `uor-atlas-macros`:
-//!
-//!   | IR field      | Rust rendering    |
-//!   |---------------|-------------------|
-//!   | `stride`      | `e.stride()`      |
-//!   | `class_count` | `e.class_count()` |
-//!   | `belt`        | `e.belt()`        |
-//!   | anything else | `e.<name>`        |
-//!
 //! - **LCNF nodes**:
 //!   - `Match` renders as a Rust `match`, with `default` becoming the `_` arm.
 //!     The Nat structural-recursion ctors are special-cased: `Nat.zero` renders
@@ -83,19 +70,14 @@
 //!     when there are no args), except `Prod.mk`, which renders as a Rust
 //!     tuple `(a, b)` — nested for right-nested pairs — and the Bool/Option
 //!     ctors, which render as `true`/`false` and `None`/`Some(x)`.
-//!   - `Proj` renders through the projection-field table below for known
-//!     structure types, and tuple-style `.idx` for unknown `(type, idx)`
-//!     pairs. The table maps Lean structure projection indices to the
-//!     runtime's named Rust fields; `("UorAtlas.Instance", i)` follows the
-//!     field declaration order `q T O` in `lean/Example/Kernel.lean`, matching
-//!     `prod_core::Instance { q, t, o }`:
-//!
-//!     | (type, idx)               | Rust rendering |
-//!     |---------------------------|----------------|
-//!     | `("UorAtlas.Instance", 0)` | `e.q`          |
-//!     | `("UorAtlas.Instance", 1)` | `e.t`          |
-//!     | `("UorAtlas.Instance", 2)` | `e.o`          |
-//!     | anything else             | `e.<idx>`      |
+//!   - `Proj` renders straight through: `(proj "Type" "field" e)` becomes
+//!     `e.field` (raw-escaped if `field` is a Rust keyword). The field name
+//!     is resolved once, in `Lower.lean`, against Lean's own structure info
+//!     — codegen holds no type-keyed lookup table, so there is no second
+//!     copy of the declaration that could disagree with the first and swap
+//!     fields silently. `crate::Instance` is generated like any other type
+//!     and mirrors the Lean structure's own field spelling (`q`, `T`, `O`)
+//!     for exactly this reason.
 //!
 //!   - `Type::Tuple` renders as a Rust tuple type, so
 //!     `(Tuple Nat (Tuple Nat Nat))` becomes `(u64, (u64, u64))`.
@@ -104,9 +86,12 @@
 //!     not inside its own body is inlined at the jump site as
 //!     `{ let p = arg; ...; <jp body> }`, and the declaration site renders as
 //!     `()`. A join point with no callers renders its body in place. Anything
-//!     else (cyclic or multi-caller join points) renders as a `loop {}`
-//!     skeleton with a `manual port required` comment — deliberately not
-//!     over-engineered.
+//!     else — cyclic, or several callers — is rejected as
+//!     [`Error::UnsupportedJoinPoint`], because it would need real control
+//!     flow. This used to emit a `loop {}` skeleton with a "manual port
+//!     required" comment, which did not compile: the join point's parameters
+//!     were never bound, and each jump site had type `()` where its arm
+//!     needed a value.
 //!
 //! ## Recursion
 //!
@@ -123,11 +108,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
-use prod_ir::{Alt, Definition, Expr, Module, Type};
-
-/// Fields rendered as method calls rather than plain field accesses.
-/// Legacy table carried over unchanged from `uor-atlas-macros`.
-const METHOD_FIELDS: &[&str] = &["stride", "class_count", "belt"];
+use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, Type, TypeDecl};
 
 /// Errors that can occur during code generation
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +123,25 @@ pub enum Error {
     UnsupportedList(String),
     /// A type that would require a heap allocation in generated code.
     HeapType(String),
+    /// A type is defined in terms of itself; needs the tier-1 memory profile.
+    RecursiveType(String),
+    /// A type takes type parameters; needs monomorphization (S5).
+    PolymorphicType(String),
+    /// A field's type cannot appear in an allocation-free generated type.
+    UnsupportedFieldType(String),
+    /// Two Lean types share a last name component, so they would collide.
+    DuplicateTypeName(String),
+    /// A type reached codegen with no rendering.
+    OpaqueType(String),
+    /// The exporter could not resolve a callee to a generated definition.
+    UnresolvedCall(String),
+    /// A projection names a field the declared type does not have. Catches a
+    /// declaration and a projection disagreeing within one IR file.
+    UnknownField(String, String),
+    /// A join point with several callers, or one that jumps to itself. Only
+    /// the single-caller form has a lowering (it inlines at its jump site);
+    /// the rest would need real control flow.
+    UnsupportedJoinPoint(String),
 }
 
 impl fmt::Display for Error {
@@ -157,9 +157,95 @@ impl fmt::Display for Error {
                 "type would require a heap allocation in generated code: {}",
                 s
             ),
+            Error::RecursiveType(s) => write!(
+                f,
+                "recursive type `{}` cannot be rendered allocation-free (needs the tier-1 profile)",
+                s
+            ),
+            Error::PolymorphicType(s) => write!(
+                f,
+                "type `{}` has type parameters; monomorphization is not implemented",
+                s
+            ),
+            Error::UnsupportedFieldType(s) => {
+                write!(f, "field type is not allowed in a generated type: {}", s)
+            }
+            Error::DuplicateTypeName(s) => {
+                write!(f, "two Lean types share the last name component `{}`", s)
+            }
+            Error::OpaqueType(s) => write!(f, "no Rust rendering for type: {}", s),
+            Error::UnresolvedCall(s) => write!(
+                f,
+                "`{}` is neither @[prod]-tagged nor a whitelisted operator, so there is nothing to call",
+                s
+            ),
+            Error::UnknownField(ty, field) => {
+                write!(f, "type `{}` declares no field `{}`", ty, field)
+            }
+            Error::UnsupportedJoinPoint(name) => write!(
+                f,
+                "join point `{}` has several callers or jumps to itself; only the single-caller form has a lowering",
+                name
+            ),
         }
     }
 }
+
+/// The rejections the generator makes, for the published subset contract
+/// (`prod subset`, `specs/lean-for-production.md`). One entry per `Error`
+/// variant, in declaration order; keep in step with `Error` above — the
+/// contract is rendered from this list, so a variant missing here is a
+/// rejection the published contract silently fails to disclose.
+pub const REJECTIONS: &[(&str, &str)] = &[
+    (
+        "OpaqueExpr",
+        "an expression with no Rust rendering",
+    ),
+    (
+        "ParamOutOfBounds",
+        "a parameter index outside the definition's parameter list",
+    ),
+    (
+        "UnsupportedList",
+        "a list value outside a supported position: nested inside another type, or used as an intermediate value rather than a slice parameter/output buffer",
+    ),
+    (
+        "HeapType",
+        "a type that would require a heap allocation in generated code",
+    ),
+    (
+        "RecursiveType",
+        "an inductive refers to itself (directly, or through one level of indirection); needs the tier-1 memory profile",
+    ),
+    (
+        "PolymorphicType",
+        "an inductive has type parameters; monomorphization is not implemented",
+    ),
+    (
+        "UnsupportedFieldType",
+        "a field type not allowed in an allocation-free generated type (e.g. a list or vector field, which would need owned storage)",
+    ),
+    (
+        "DuplicateTypeName",
+        "two Lean types share a last name component, so they would collide in Rust",
+    ),
+    (
+        "OpaqueType",
+        "a type reached codegen with no Rust rendering",
+    ),
+    (
+        "UnresolvedCall",
+        "the callee is neither @[prod]-tagged nor a whitelisted operator, so there is nothing to call",
+    ),
+    (
+        "UnknownField",
+        "a projection names a field the declared type does not have",
+    ),
+    (
+        "UnsupportedJoinPoint",
+        "a join point with several callers, or one that jumps to itself; only the single-caller form, which inlines at its jump site, has a lowering",
+    ),
+];
 
 /// How a generated definition presents itself to its callers.
 ///
@@ -180,12 +266,168 @@ pub enum Shape {
 /// Definition name → [`Shape`], for one module.
 type Signatures<'m> = BTreeMap<&'m str, Shape>;
 
+/// Rust keywords that a Lean field or constructor name may legitimately be.
+/// Escaped with the raw-identifier prefix rather than renamed, so the Rust
+/// name still matches the Lean name exactly.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+    "where", "while", "abstract", "become", "box", "do", "final", "macro", "override", "priv",
+    "typeof", "unsized", "virtual", "yield", "try", "gen",
+];
+
+/// A Lean identifier as a Rust identifier, raw-escaped if it is a keyword.
+fn rust_ident(name: &str) -> String {
+    if RUST_KEYWORDS.contains(&name) {
+        format!("r#{}", name)
+    } else {
+        String::from(name)
+    }
+}
+
+/// Last dot-separated component of a full Lean name.
+fn last_component(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// Full Lean type name → its declaration, for the module being rendered.
+type TypeTable<'m> = BTreeMap<&'m str, &'m TypeDecl>;
+
+fn type_table(types: &[TypeDecl]) -> Result<TypeTable<'_>, Error> {
+    let mut by_full: TypeTable = BTreeMap::new();
+    let mut short_seen: BTreeMap<&str, &str> = BTreeMap::new();
+    for decl in types {
+        let short = last_component(&decl.name);
+        if let Some(previous) = short_seen.insert(short, &decl.name) {
+            if previous != decl.name {
+                return Err(Error::DuplicateTypeName(String::from(short)));
+            }
+        }
+        by_full.insert(decl.name.as_str(), decl);
+    }
+    Ok(by_full)
+}
+
+/// Render one type declaration: a struct if it has exactly one constructor,
+/// otherwise an enum with named-field variants.
+///
+/// Every generated type is `Copy`, which is what keeps it inside the
+/// allocation-free tier: a type is eligible only if every field is a scalar, a
+/// tuple of eligible types, or another eligible generated type.
+fn generate_type_decl(decl: &TypeDecl, table: &TypeTable) -> Result<String, Error> {
+    // The exporter reached this type but could not describe it. It is declared
+    // anyway so that the rejection names a reason instead of an unknown type.
+    if let Some(reason) = &decl.unsupported {
+        return Err(match reason.as_str() {
+            "type parameters" => Error::PolymorphicType(decl.name.clone()),
+            "recursive" => Error::RecursiveType(decl.name.clone()),
+            other => Error::OpaqueType(format!("{} ({})", decl.name, other)),
+        });
+    }
+    for ctor in &decl.ctors {
+        for (field, ty) in &ctor.fields {
+            check_field_type(ty, &decl.name, field, table)?;
+        }
+    }
+
+    let mut out = String::from("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
+    let short = last_component(&decl.name);
+
+    if decl.ctors.len() == 1 {
+        let ctor = &decl.ctors[0];
+        out.push_str(&format!("pub struct {} {{\n", rust_ident(short)));
+        for (name, ty) in &ctor.fields {
+            out.push_str(&format!(
+                "    pub {}: {},\n",
+                rust_ident(name),
+                type_to_rust(ty)?
+            ));
+        }
+        out.push_str("}\n");
+        return Ok(out);
+    }
+
+    out.push_str(&format!("pub enum {} {{\n", rust_ident(short)));
+    for ctor in &decl.ctors {
+        let variant = rust_ident(last_component(&ctor.name));
+        if ctor.fields.is_empty() {
+            out.push_str(&format!("    {},\n", variant));
+            continue;
+        }
+        let mut fields = Vec::with_capacity(ctor.fields.len());
+        for (name, ty) in &ctor.fields {
+            fields.push(format!("{}: {}", rust_ident(name), type_to_rust(ty)?));
+        }
+        out.push_str(&format!("    {} {{ {} }},\n", variant, fields.join(", ")));
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+/// A field type must be renderable and must not make the type recursive.
+///
+/// `owner` and `field` are the Lean constant and field name responsible, and
+/// they appear in the rejection message: the point of this milestone is that a
+/// failure names the declaration that caused it, and "a list field would need
+/// owned storage" on its own leaves the reader to grep for which one.
+fn check_field_type(ty: &Type, owner: &str, field: &str, table: &TypeTable) -> Result<(), Error> {
+    match ty {
+        Type::Named(n) => {
+            if n == owner {
+                return Err(Error::RecursiveType(String::from(owner)));
+            }
+            match table.get(n.as_str()) {
+                // One level of indirection is enough to catch the mutual case
+                // too: B referring back to A makes A reachable from A.
+                Some(other) => {
+                    for ctor in &other.ctors {
+                        for (_, inner) in &ctor.fields {
+                            if let Type::Named(m) = inner {
+                                if m == owner {
+                                    return Err(Error::RecursiveType(String::from(owner)));
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                None => Err(Error::OpaqueType(n.clone())),
+            }
+        }
+        // A sequence field would need owned storage, which the allocation-free
+        // tier does not have. Lists are supported as borrowed parameters and
+        // caller-owned output buffers only, never as owned struct fields.
+        Type::List(_) => Err(Error::UnsupportedFieldType(format!(
+            "`{}.{}`: a list field would need owned storage",
+            owner, field
+        ))),
+        Type::Vec(_) => Err(Error::UnsupportedFieldType(format!(
+            "`{}.{}`: a vector field would need heap storage",
+            owner, field
+        ))),
+        Type::Tuple(items) => {
+            for item in items {
+                check_field_type(item, owner, field, table)?;
+            }
+            Ok(())
+        }
+        Type::Option(inner) => check_field_type(inner, owner, field, table),
+        _ => Ok(()),
+    }
+}
+
 /// Render a whole module: one `pub fn` per definition.
 pub fn generate_module(module: &Module) -> Result<String, Error> {
+    let table = type_table(&module.types)?;
     let shapes = signatures(&module.definitions);
     let mut out = String::new();
+    for decl in &module.types {
+        out.push_str(&generate_type_decl(decl, &table)?);
+        out.push('\n');
+    }
     for def in &module.definitions {
-        out.push_str(&generate_def_in(def, &shapes)?);
+        out.push_str(&generate_def_in(def, &shapes, &table)?);
         out.push('\n');
     }
     Ok(out)
@@ -195,10 +437,12 @@ pub fn generate_module(module: &Module) -> Result<String, Error> {
 ///
 /// Calls to definitions outside `def` itself are assumed infallible, since
 /// there is no module to resolve them against; use [`generate_module`] when
-/// cross-definition fallibility matters.
+/// cross-definition fallibility matters. With no module, there is no type
+/// table either, so any `(named ...)` type in `def`'s signature is opaque.
 pub fn generate_def(def: &Definition) -> Result<String, Error> {
     let one = core::slice::from_ref(def);
-    generate_def_in(def, &signatures(one))
+    let table: TypeTable = BTreeMap::new();
+    generate_def_in(def, &signatures(one), &table)
 }
 
 /// Compute every definition's [`Shape`] as a least fixpoint over the call
@@ -244,10 +488,14 @@ fn is_fallible(expr: &Expr, shapes: &Signatures) -> bool {
         ),
         _ => false,
     };
-    here || children(expr).any(|child| is_fallible(child, shapes))
+    here || expr.children().any(|child| is_fallible(child, shapes))
 }
 
-fn generate_def_in<'m>(def: &'m Definition, shapes: &Signatures<'m>) -> Result<String, Error> {
+fn generate_def_in<'m>(
+    def: &'m Definition,
+    shapes: &Signatures<'m>,
+    table: &TypeTable<'m>,
+) -> Result<String, Error> {
     let shape = shapes
         .get(def.name.as_str())
         .copied()
@@ -256,6 +504,7 @@ fn generate_def_in<'m>(def: &'m Definition, shapes: &Signatures<'m>) -> Result<S
         shapes,
         params: &def.params,
         ctx: JpContext::collect(&def.body),
+        types: table,
     };
 
     let mut params = String::new();
@@ -263,8 +512,9 @@ fn generate_def_in<'m>(def: &'m Definition, shapes: &Signatures<'m>) -> Result<S
         if i > 0 {
             params.push_str(", ");
         }
-        params.push_str(&format!("{}: {}", name, param_type_to_rust(ty)?));
+        params.push_str(&format!("{}: {}", name, param_type_to_rust(ty, table)?));
     }
+    check_named_type(&def.ret, table)?;
 
     match shape {
         Shape::StaticList => {
@@ -326,7 +576,7 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
         Type::Nat => String::from("u64"),
         Type::Int => String::from("i64"),
         Type::Bool => String::from("bool"),
-        Type::Instance => String::from("crate::Instance"),
+        Type::Named(n) => format!("crate::{}", rust_ident(last_component(n))),
         Type::Option(inner) => format!("Option<{}>", type_to_rust(inner)?),
         Type::Tuple(items) => {
             let mut rendered = Vec::with_capacity(items.len());
@@ -335,7 +585,7 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
             }
             format!("({})", rendered.join(", "))
         }
-        Type::Opaque(s) => s.clone(),
+        Type::Opaque(s) => return Err(Error::OpaqueType(s.clone())),
         // Lists are only renderable at the top level of a parameter or return
         // type, where the caller supplies the storage.
         Type::List(inner) => {
@@ -354,10 +604,41 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
 }
 
 /// Rust spelling of a parameter type: a top-level list borrows as a slice.
-fn param_type_to_rust(ty: &Type) -> Result<String, Error> {
+///
+/// Checks named types against the module's type table first: parameter and
+/// return types are not fields, so [`check_field_type`] never sees them, and
+/// without this check an undeclared `(named ...)` in a signature would
+/// silently render as `crate::Whatever` instead of being rejected.
+fn param_type_to_rust(ty: &Type, table: &TypeTable) -> Result<String, Error> {
+    check_named_type(ty, table)?;
     match ty {
         Type::List(inner) => Ok(format!("&[{}]", type_to_rust(inner)?)),
         _ => type_to_rust(ty),
+    }
+}
+
+/// A `(named ...)` type occurring in a definition's signature must be
+/// declared in the module's type table, at any depth (inside `Option`,
+/// `List`, `Vec`, or `Tuple`); otherwise it has no known Rust rendering.
+fn check_named_type(ty: &Type, table: &TypeTable) -> Result<(), Error> {
+    match ty {
+        Type::Named(n) => {
+            if table.contains_key(n.as_str()) {
+                Ok(())
+            } else {
+                Err(Error::OpaqueType(n.clone()))
+            }
+        }
+        Type::Option(inner) | Type::Vec(inner) | Type::List(inner) => {
+            check_named_type(inner, table)
+        }
+        Type::Tuple(items) => {
+            for item in items {
+                check_named_type(item, table)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -400,7 +681,7 @@ impl<'a> JpContext<'a> {
             }
             _ => {}
         }
-        for child in children(expr) {
+        for child in expr.children() {
             self.walk(child);
         }
     }
@@ -429,55 +710,7 @@ fn count_jmps(expr: &Expr, name: &str) -> usize {
         Expr::Jmp(n, _) if n == name => 1,
         _ => 0,
     };
-    self_count + children(expr).map(|c| count_jmps(c, name)).sum::<usize>()
-}
-
-/// Iterate over the direct subexpressions of an expression node.
-fn children(expr: &Expr) -> impl Iterator<Item = &Expr> {
-    let mut out: Vec<&Expr> = Vec::new();
-    match expr {
-        Expr::Field(e, _) | Expr::Proj(_, _, e) => out.push(e),
-        Expr::Add(a, b)
-        | Expr::Sub(a, b)
-        | Expr::Mul(a, b)
-        | Expr::Div(a, b)
-        | Expr::Mod(a, b)
-        | Expr::Shl(a, b)
-        | Expr::Pow(a, b)
-        | Expr::Eq(a, b)
-        | Expr::Lt(a, b)
-        | Expr::Le(a, b)
-        | Expr::Gt(a, b) => {
-            out.push(a);
-            out.push(b);
-        }
-        Expr::If(c, t, f) => {
-            out.push(c);
-            out.push(t);
-            out.push(f);
-        }
-        Expr::Let(_, v, b) => {
-            out.push(v);
-            out.push(b);
-        }
-        Expr::Call(_, args) | Expr::Ctor(_, args) | Expr::Jmp(_, args) => {
-            out.extend(args.iter());
-        }
-        Expr::Match {
-            scrut,
-            alts,
-            default,
-        } => {
-            out.push(scrut);
-            out.extend(alts.iter().map(|a| &a.body));
-            if let Some(d) = default {
-                out.push(d);
-            }
-        }
-        Expr::Jp { body, .. } => out.push(body),
-        _ => {}
-    }
-    out.into_iter()
+    self_count + expr.children().map(|c| count_jmps(c, name)).sum::<usize>()
 }
 
 /// Where the expression being rendered will land.
@@ -507,11 +740,22 @@ struct Renderer<'s, 'm> {
     shapes: &'s Signatures<'m>,
     params: &'m [(String, Type)],
     ctx: JpContext<'m>,
+    types: &'s TypeTable<'m>,
 }
 
 impl<'m> Renderer<'_, 'm> {
     fn value(&self, expr: &'m Expr) -> Result<String, Error> {
         self.render(expr, &Mode::Value)
+    }
+
+    /// The declaration of a constructor, by its full Lean name.
+    fn ctor_decl(&self, name: &str) -> Option<(&'m TypeDecl, &'m CtorDecl)> {
+        self.types.values().find_map(|decl| {
+            decl.ctors
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| (*decl, c))
+        })
     }
 
     fn shape_of(&self, name: &str) -> Option<Shape> {
@@ -624,6 +868,10 @@ impl<'m> Renderer<'_, 'm> {
                 }
             }
 
+            // An unresolved callee: refuse it outright rather than rendering
+            // a call to a function nobody generated, in either mode.
+            Expr::Extern(name, _) => Err(Error::UnresolvedCall(name.clone())),
+
             // Remaining nodes are value-typed; reaching them in builder mode
             // means the IR put a non-list where a list was declared.
             _ => match mode {
@@ -645,14 +893,6 @@ impl<'m> Renderer<'_, 'm> {
                 .get(*index)
                 .map(|(name, _)| name.clone())
                 .ok_or(Error::ParamOutOfBounds(*index)),
-            Expr::Field(obj, field) => {
-                let obj = self.value(obj)?;
-                if METHOD_FIELDS.contains(&field.as_str()) {
-                    Ok(format!("{}.{}()", obj, field))
-                } else {
-                    Ok(format!("{}.{}", obj, field))
-                }
-            }
             Expr::Add(a, b) => self.checked_binop(a, b, "checked_add", "AddOverflow"),
             Expr::Mul(a, b) => self.checked_binop(a, b, "checked_mul", "MulOverflow"),
             Expr::Sub(a, b) => {
@@ -673,6 +913,18 @@ impl<'m> Renderer<'_, 'm> {
                 "ShiftExponentTooLarge",
                 "ShiftOverflow",
             ),
+            // Unlike `Shl`, `Nat.shiftRight` is total and infallible: Lean's
+            // `Nat` is unbounded, so `a >>> b = 0` for any `b >= 64` once `a`
+            // fits `u64`. `checked_shr` already returns `None` exactly there
+            // (and for `b >= 2^32`, via the `try_from` fallback to
+            // `u32::MAX`), so `unwrap_or(0)` is the exact answer, not a
+            // fallback for a real error — there is no `ComputeError` variant
+            // for this because none is needed.
+            Expr::Shr(a, b) => Ok(format!(
+                "(({}) as u64).checked_shr(u32::try_from({}).unwrap_or(u32::MAX)).unwrap_or(0)",
+                self.value(a)?,
+                self.value(b)?
+            )),
             Expr::Pow(a, b) => {
                 self.checked_exponent_op(a, b, "checked_pow", "PowExponentTooLarge", "PowOverflow")
             }
@@ -692,18 +944,63 @@ impl<'m> Renderer<'_, 'm> {
                     Ok(String::from("None"))
                 } else if name == "Option.some" && args.len() == 1 {
                     Ok(format!("Some({})", args[0]))
+                } else if let Some((decl, cdecl)) = self.ctor_decl(name) {
+                    if args.len() != cdecl.fields.len() {
+                        return Err(Error::UnsupportedFieldType(format!(
+                            "`{}` takes {} field(s) but got {} argument(s)",
+                            name,
+                            cdecl.fields.len(),
+                            args.len()
+                        )));
+                    }
+                    let path = if decl.ctors.len() == 1 {
+                        format!("crate::{}", rust_ident(last_component(&decl.name)))
+                    } else {
+                        format!(
+                            "crate::{}::{}",
+                            rust_ident(last_component(&decl.name)),
+                            rust_ident(last_component(&cdecl.name))
+                        )
+                    };
+                    if cdecl.fields.is_empty() {
+                        Ok(path)
+                    } else {
+                        let mut bound = Vec::with_capacity(args.len());
+                        for ((field, _), arg) in cdecl.fields.iter().zip(args.iter()) {
+                            bound.push(format!("{}: {}", rust_ident(field), arg));
+                        }
+                        Ok(format!("{} {{ {} }}", path, bound.join(", ")))
+                    }
+                } else if name.contains('.') {
+                    // No declaration for this constructor, and its Lean name
+                    // is dotted. The tuple-style fallthrough below would emit
+                    // the dots verbatim — `Conformance.NoProp.mk(n, n)` — and
+                    // that is not a Rust path in expression position; it
+                    // parses as field access on a value named `Conformance`,
+                    // so even `syn::parse_str` waves it through and the
+                    // failure surfaces as a rustc error about the generated
+                    // file. Refuse it here, naming the constructor. The
+                    // bare-name form below stays: a dot-free ctor is at least
+                    // a syntactically valid path to a type the host may
+                    // supply by hand.
+                    Err(Error::UnresolvedCall(name.clone()))
                 } else if args.is_empty() {
                     Ok(name.clone())
                 } else {
                     Ok(format!("{}({})", name, args.join(", ")))
                 }
             }
-            Expr::Proj(ty, idx, e) => {
-                let e = self.value(e)?;
-                match instance_field(ty, *idx) {
-                    Some(field) => Ok(format!("({}).{}", e, field)),
-                    None => Ok(format!("({}).{}", e, idx)),
+            Expr::Proj(ty, field, e) => {
+                if let Some(decl) = self.types.get(ty.as_str()) {
+                    let declared = decl
+                        .ctors
+                        .iter()
+                        .any(|c| c.fields.iter().any(|(name, _)| name == field));
+                    if !declared {
+                        return Err(Error::UnknownField(ty.clone(), field.clone()));
+                    }
                 }
+                Ok(format!("({}).{}", self.value(e)?, rust_ident(field)))
             }
             Expr::Jp { name, body, .. } => {
                 if self.ctx.jmp_count(name) == 0 {
@@ -717,12 +1014,14 @@ impl<'m> Renderer<'_, 'm> {
                     // Inlined at its single jump site; nothing to emit here.
                     Ok(format!("/* jp \"{}\" inlined at its jump site */ ()", name))
                 } else {
-                    // Cyclic or multi-caller: emit a skeleton, not a full lowering.
-                    Ok(format!(
-                        "loop {{\n        /* jp \"{}\": cyclic or multi-caller join point — manual port required */\n        {};\n        break;\n    }}",
-                        name,
-                        self.value(body)?
-                    ))
+                    // Cyclic or multi-caller. This used to emit a `loop {}`
+                    // skeleton with a "manual port required" comment, which is
+                    // not Rust that compiles: the join point's parameters are
+                    // never bound, and each jump site has type `()` where the
+                    // arm needs a value. Emitting it at exit 0 is exactly the
+                    // silently-broken-output failure this crate rejects
+                    // everywhere else, so it is a rejection now.
+                    Err(Error::UnsupportedJoinPoint(name.clone()))
                 }
             }
             Expr::Jmp(name, args) => match self.ctx.decls.get(name.as_str()) {
@@ -735,16 +1034,24 @@ impl<'m> Renderer<'_, 'm> {
                     out.push_str(" }");
                     Ok(out)
                 }
-                Some(_) => Ok(format!(
-                    "loop {{ /* jmp \"{}\": cyclic or multi-caller join point — manual port required */ break; }}",
+                // The declaration site rejects this too; rejecting here as
+                // well means the error names the jump the reader can see,
+                // whichever of the two codegen reaches first.
+                Some(_) => Err(Error::UnsupportedJoinPoint(name.clone())),
+                None => Ok(format!(
+                    "/* jmp \"{}\": no matching jp declaration */ ()",
                     name
                 )),
-                None => Ok(format!("/* jmp \"{}\": no matching jp declaration */ ()", name)),
             },
             Expr::Unreachable => Ok(String::from("unreachable!()")),
             Expr::Opaque(s) => Err(Error::OpaqueExpr(s.clone())),
             // Handled by `render` before it delegates here.
-            Expr::If(..) | Expr::Let(..) | Expr::Match { .. } | Expr::Var(_) | Expr::Call(..) => {
+            Expr::If(..)
+            | Expr::Let(..)
+            | Expr::Match { .. }
+            | Expr::Var(_)
+            | Expr::Call(..)
+            | Expr::Extern(..) => {
                 unreachable!("control-flow nodes are rendered by `render`")
             }
         }
@@ -813,13 +1120,53 @@ impl<'m> Renderer<'_, 'm> {
                 ("Bool.false", 0) => format!("        false => {},\n", body),
                 ("Option.none", 0) => format!("        None => {},\n", body),
                 ("Option.some", 1) => format!("        Some({}) => {},\n", alt.binders[0], body),
-                _ if alt.binders.is_empty() => format!("        {} => {},\n", alt.ctor, body),
-                _ => format!(
-                    "        {}({}) => {},\n",
-                    alt.ctor,
-                    alt.binders.join(", "),
-                    body
-                ),
+                _ => match self.ctor_decl(&alt.ctor) {
+                    Some((decl, cdecl)) if alt.binders.len() == cdecl.fields.len() => {
+                        let path = if decl.ctors.len() == 1 {
+                            format!("crate::{}", rust_ident(last_component(&decl.name)))
+                        } else {
+                            format!(
+                                "crate::{}::{}",
+                                rust_ident(last_component(&decl.name)),
+                                rust_ident(last_component(&cdecl.name))
+                            )
+                        };
+                        if cdecl.fields.is_empty() {
+                            format!("        {} => {},\n", path, body)
+                        } else {
+                            let mut bound = Vec::with_capacity(alt.binders.len());
+                            for ((field, _), binder) in cdecl.fields.iter().zip(alt.binders.iter())
+                            {
+                                bound.push(format!("{}: {}", rust_ident(field), binder));
+                            }
+                            format!("        {} {{ {} }} => {},\n", path, bound.join(", "), body)
+                        }
+                    }
+                    // Declared, but the alt's binder count does not match the
+                    // constructor's field count: this must be rejected, not
+                    // rendered. Falling through to the positional arms below
+                    // would emit a dotted name used as a Rust path with
+                    // positional fields — e.g. `M.Shape.circle(r, extra)` —
+                    // which does not compile. Symmetric with the arity check
+                    // on the construction side.
+                    Some((_, cdecl)) => {
+                        return Err(Error::UnsupportedFieldType(format!(
+                            "`{}` takes {} field(s) but got {} binder(s)",
+                            alt.ctor,
+                            cdecl.fields.len(),
+                            alt.binders.len()
+                        )));
+                    }
+                    None if alt.binders.is_empty() => {
+                        format!("        {} => {},\n", alt.ctor, body)
+                    }
+                    None => format!(
+                        "        {}({}) => {},\n",
+                        alt.ctor,
+                        alt.binders.join(", "),
+                        body
+                    ),
+                },
             };
             out.push_str(&arm);
         }
@@ -928,25 +1275,6 @@ fn lookup<'m>(env: &[(&'m str, &'m Expr)], name: &str) -> Option<&'m Expr> {
         .rev()
         .find(|(bound, _)| *bound == name)
         .map(|(_, value)| *value)
-}
-
-/// The projection-field table (see the module docs): Lean structure
-/// projection indices → the runtime's named Rust fields. The
-/// `UorAtlas.Instance` row is verified against the field declaration order
-/// `q T O` in `lean/Example/Kernel.lean` (LCNF projection indices follow
-/// declaration order) and `prod_core::Instance { q, t, o }`. Unknown
-/// `(type, idx)` pairs fall back to tuple-style `.idx`.
-fn instance_field(type_name: &str, idx: u64) -> Option<&'static str> {
-    if type_name == "UorAtlas.Instance" || type_name == "Instance" {
-        match idx {
-            0 => Some("q"),
-            1 => Some("t"),
-            2 => Some("o"),
-            _ => None,
-        }
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

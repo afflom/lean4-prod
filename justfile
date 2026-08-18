@@ -10,6 +10,12 @@ prod: lean-fixtures prod-export conformance test test-assertions no-alloc roots-
 lean-fixtures:
     cd lean && lake build ProofFixtures
 
+# Generate a C header and matching Rust FFI wrappers into ./output. Override
+# `ir` for a project's exported module and `stem` for the artifact basename.
+c-headers ir="rust/prod-core/goldens.ir" stem="lean4-prod":
+    mkdir -p output
+    cargo run --manifest-path rust/Cargo.toml -p prod-cli -- header {{ir}} --output output/{{stem}}.h --rust-output output/{{stem}}_ffi.rs
+
 # Export prod from lean
 prod-export:
     cd lean && lake exe prod-export

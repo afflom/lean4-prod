@@ -8,12 +8,8 @@
 //! if not). That division of labour is why this function returns a `String`
 //! rather than a `Result`: there is nothing left here to refuse.
 //!
-//! `prod-codegen` is a facade over this crate and [`prod_lower`]: every byte
-//! of generated Rust comes from [`emit_types`] and [`emit_body`].
-
-#![no_std]
-
-extern crate alloc;
+//! `prod-codegen` owns this printer alongside the language-neutral lowering;
+//! every byte of generated Rust comes from [`emit_types`] and [`emit_body`].
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -780,7 +776,7 @@ fn ident(name: &str) -> String {
 /// refuses it. Generated code that is merely plausible is worse than
 /// generated code that does not build.
 fn unsupported(why: &str) -> String {
-    format!("compile_error!(\"prod-emit-rust: {}\")", why)
+    format!("compile_error!(\"prod-codegen Rust emitter: {}\")", why)
 }
 
 /// A constructor's declaration, found by the Lean name the Target IR carries.
@@ -908,7 +904,7 @@ fn value_type(ty: &Type) -> String {
         // `element_type` handle those. Nested, it has no rendering at all,
         // and neither do `Vec` and `Opaque`, which the lowering rejects.
         Type::List(_) | Type::Vec(_) | Type::Opaque(_) => {
-            "prod_emit_rust_unsupported_type".to_string()
+            "prod_codegen_rust_unsupported_type".to_string()
         }
     }
 }
@@ -1037,4 +1033,5 @@ fn count_expr(e: &TExpr, out: &mut BTreeMap<String, Usage>, same_level: bool) {
 }
 
 #[cfg(test)]
+#[path = "emit_rust_tests.rs"]
 mod tests;

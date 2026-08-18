@@ -87,13 +87,12 @@ prod-lower       LANGUAGE-NEUTRAL. IR -> Target IR (`target::Body`, `TypeDef`).
   |              name mangling and injectivity (`names`), every REJECTION
   |              (`error::LowerError`).
   |
-prod-emit-rust   The Rust printer. Total by construction: `emit_types` and
-  |              `emit_body` return `String`, never `Result`. Spelling only.
-  |
-prod-codegen     FACADE. Owns `Error` and `REJECTIONS` -- the published subset
-                 contract -- and the two entry points `generate_module` /
-                 `generate_def`. Nothing else. Its public API is consumed by
-                 prod-cli, prod-macros, prod-wasm and
+prod-codegen     FACADE plus the internal Rust printer. Owns `Error` and
+                 `REJECTIONS` -- the published subset contract -- and the two
+                 entry points `generate_module` / `generate_def`. Its internal
+                 `emit_rust` module is total by construction: `emit_types` and
+                 `emit_body` return `String`, never `Result`. Its public API is
+                 consumed by prod-cli, prod-macros, prod-wasm and
                  prod-codegen-compile-tests, and does not change.
 ```
 
@@ -123,7 +122,7 @@ Two rules keep this from collapsing back into one crate:
 A corollary: **a printer cannot refuse.** Every rejection has to be made in
 `prod-lower`, including ones that look like rendering questions -- a signature
 type with no rendering, a constructor name that is not a valid path in the
-target. `prod-emit-rust` renders an unrenderable type as a placeholder
+target. The internal Rust emitter renders an unrenderable type as a placeholder
 identifier rather than an error, so a rejection missing from `prod-lower` does
 not surface as a `Result`; it surfaces as generated code that does not compile.
 
@@ -220,7 +219,7 @@ make, so a rejection that must keep its published kind has to keep it in
   - Buffer exhaustion is an explicit bounds check emitted by `prod-lower`
     beside every append, whose else-branch returns `OutputTooSmall`. That is
     what makes exhaustion an `Err`. Separately, the generated code contains no
-    slice index at all: `prod-emit-rust` spells the append as
+    slice index at all: the internal Rust printer spells the append as
     `if let Some(__slot) = output.get_mut(__len)` and the recursive tail as
     `output.get_mut(__len..).unwrap_or(&mut [])`, so the absence of a panic
     path is a property of the emitted TEXT and does not rest on the bounds
@@ -381,7 +380,7 @@ make, so a rejection that must keep its published kind has to keep it in
     - **`Int.ofNat` is owned by the constructor path, not by the conversion
       table**, even though it converts `Nat → Int`. (Since the multi-backend
       split: admitted by `prod_lower::lower`'s builtin-constructor list and
-      spelled by `prod_emit_rust`'s `Printer::ctor`.) `Int` is
+      spelled by the internal Rust printer's constructor path.) `Int` is
       `inductive Int | ofNat : Nat → Int | negSucc : Nat → Int`, so
       `Int.ofNat` is a *constructor*, and `Lower.lean`'s `lowerLetValue`
       checks `isCtorName` before consulting any operator/conversion

@@ -2,13 +2,13 @@
 //!
 //! Usage:
 //!   prod parse module.ir
-//!   prod gen module.ir [--output generated.rs]
+//!   prod gen module.ir [--output generated.rs | --stdout]
 //!   prod validate module.ir
 
 mod roots;
 
 use clap::{Parser, Subcommand};
-use std::fs;
+use std::{fs, path::Path};
 
 #[derive(Parser)]
 #[command(name = "prod")]
@@ -25,13 +25,16 @@ enum Commands {
         /// Path to the IR file
         path: String,
     },
-    /// Generate Rust code from an IR file (prints to stdout unless --output is given)
+    /// Generate Rust code into output/rust/<module>.rs by default
     Gen {
         /// Path to the IR file
         path: String,
         /// Output path for generated Rust code
         #[arg(short, long)]
         output: Option<String>,
+        /// Print generated Rust to stdout instead of writing a file
+        #[arg(long, conflicts_with = "output")]
+        stdout: bool,
     },
     /// Validate an IR file (check for unsupported constructs)
     Validate {
@@ -51,6 +54,17 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+}
+
+fn default_generated_path(module: &prod_ir::Module) -> String {
+    let stem = module
+        .name
+        .rsplit('.')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("generated")
+        .to_ascii_lowercase();
+    format!("output/rust/{stem}.rs")
 }
 
 /// The Lean half of the subset contract, written by `prod-export`
@@ -211,7 +225,11 @@ fn main() {
                 println!("    Body: {:?}", def.body);
             }
         }
-        Commands::Gen { path, output } => {
+        Commands::Gen {
+            path,
+            output,
+            stdout,
+        } => {
             let content = fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("Failed to read {}: {}", path, e));
             let (_, module) = prod_ir::parser::parse_module(&content)
@@ -227,8 +245,16 @@ fn main() {
             ));
             out.push_str(&body);
 
+            let output = output.or_else(|| (!stdout).then(|| default_generated_path(&module)));
             match output {
                 Some(output) => {
+                    if let Some(parent) = Path::new(&output).parent() {
+                        if !parent.as_os_str().is_empty() {
+                            fs::create_dir_all(parent).unwrap_or_else(|e| {
+                                panic!("Failed to create {}: {}", parent.display(), e)
+                            });
+                        }
+                    }
                     fs::write(&output, out)
                         .unwrap_or_else(|e| panic!("Failed to write {}: {}", output, e));
                     println!("Generated: {}", output);
@@ -374,5 +400,20 @@ fn main() {
                 None => print!("{}", rendered),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_generated_path;
+
+    #[test]
+    fn generated_rust_defaults_under_output_rust() {
+        let module = prod_ir::Module {
+            name: String::from("UorAtlas.Kernel"),
+            types: Vec::new(),
+            definitions: Vec::new(),
+        };
+        assert_eq!(default_generated_path(&module), "output/rust/kernel.rs");
     }
 }

@@ -78,7 +78,7 @@ pub fn lower_def_in(
         // It goes through `bind_source` like every other binder, so a
         // definition whose own source already writes `output` gets a fresh
         // name rather than two live bindings sharing one -- which
-        // `prod-emit-rust`'s `uses()`, counting reads by name with no scope of
+        // the Rust emitter's `uses()`, counting reads by name with no scope of
         // its own, would silently pool.
         Shape::Buffer | Shape::StaticList => {
             // `prod-codegen`'s own pre-check, kept DISTINCT from the
@@ -129,7 +129,7 @@ pub fn lower_def_in(
 /// `(named ...)` in one must be declared in this module.
 ///
 /// The printers are total by construction, so nothing downstream can refuse a
-/// signature: `prod-emit-rust`'s `value_type` renders an unrenderable type as
+/// signature: the Rust emitter's `value_type` renders an unrenderable type as
 /// a placeholder identifier rather than an error. `prod-codegen` refused these
 /// in `param_type_to_rust`/`type_to_rust`/`check_named_type`, before it
 /// rendered the body, and the checks are in that order here so a signature
@@ -1963,7 +1963,7 @@ fn kind_type(kind: NumKind) -> Type {
 ///
 /// [`Signatures`] records each definition's [`Shape`], not its return type, so
 /// a call's result is untyped here, as are constructors and projections.
-/// Rust's `let` infers, so `prod-emit-rust` never reads the field; a C backend
+/// Rust's `let` infers, so the Rust emitter never reads the field; a C backend
 /// will, and widening the table consulted here is what that backend will need.
 /// Spelled `Opaque` deliberately rather than guessed: a printer that does read
 /// it then fails loudly instead of declaring the wrong type.
@@ -4152,7 +4152,7 @@ mod tests {
 
     /// A signature's types are checked HERE, before the body is lowered.
     ///
-    /// Nothing downstream can refuse one: `prod-emit-rust` is total by
+    /// Nothing downstream can refuse one: the Rust emitter is total by
     /// construction and renders an unrenderable type as a placeholder
     /// identifier rather than an error. `prod-codegen` refused these in
     /// `param_type_to_rust`/`type_to_rust`, and the rejections came across

@@ -117,6 +117,9 @@ Lean side:
 
 ```sh
 cd lean && lake exe prod-export   # → rust/prod-core/{kernel,goldens}.ir, roots.json, coverage.md
+
+cargo run --manifest-path rust/Cargo.toml -- gen rust/prod-core/kernel.ir
+# → output/rust/kernel.rs (use --stdout to print instead)
 ```
 
 Rust side:
@@ -160,10 +163,12 @@ those as warnings while using the dependency names to resolve graph edges.
   coverage, emit. Generic; not tied to the example.
 - `lean/Example/` — worked example: the UOR Atlas coordinate kernel with
   machine-checked proofs (no mathlib — `decide`/`omega`/`rfl` discipline).
-- `rust/prod-ir`, `rust/prod-codegen` — `no_std` + `alloc` portable core.
+- `rust/prod-ir`, `rust/prod-codegen` — `no_std` + `alloc` portable core;
+  `prod-codegen` contains the internal Rust emitter.
 - `rust/prod-macros`, `rust/prod-cli` — thin native shells.
 - `rust/prod-wasm` — wasm-bindgen API: `generate(ir)` and `roots_pareto(json)`.
 - `rust/prod-core` — runtime types + generated definitions + golden tests.
+- `output/rust/` — ignored source files written by `prod gen`.
 
 ## Roadmap
 

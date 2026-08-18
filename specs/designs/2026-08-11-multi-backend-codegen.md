@@ -131,9 +131,8 @@ lean/  (unchanged)
 |---|---|---|
 | `prod-ir` | LCNF surface. **Loses `NumKind::rust_type`** | DONE (plan 1) |
 | `prod-lower` | Target IR + lowering + `TargetProfile` + name injectivity | DONE (plan 1) |
-| `prod-emit-rust` | Rust printer | DONE (plan 1) |
 | `prod-emit-python` | Python printer | plan 2 |
-| `prod-codegen` | Thin facade preserving today's public API | DONE (plan 1) |
+| `prod-codegen` | Thin facade plus internal Rust printer, preserving today's public API | DONE (plan 1) |
 | `prod-runtime-python` | Hand-written Python prelude | plan 2 |
 
 `prod-codegen` must keep its current surface so `prod-cli`, `prod-macros`,
@@ -399,11 +398,11 @@ contracts, the registry, and CI. **It should be executed as two plans**, both
 written from this document:
 
 1. **The split.** `prod-lower`, Target IR, `TargetProfile`, name injectivity,
-   `prod-emit-rust` at behavioural parity, printer snapshots. Nothing new ships
+   the internal Rust printer at behavioural parity, printer snapshots. Nothing new ships
    to users; the deliverable is that Rust still works through the new seam.
    **DONE 2026-08-17**, plan `specs/plans/2026-08-11-multi-backend-split.md`.
    The old renderer is deleted; `prod-codegen` is a facade over `prod-lower` +
-   `prod-emit-rust` with its public API unchanged. Parity is *behavioural* and
+   the internal Rust printer with `prod-codegen`'s public API unchanged. Parity is *behavioural* and
    what certifies it is `just prod`, which compiles the generated Rust and
    executes every Lean-computed golden. Text differs in five known places:
    flat statement lists rather than nested braces, `return` terminators in

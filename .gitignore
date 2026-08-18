@@ -1,4 +1,7 @@
 /target
+output/
+rust/output/
+skills.lock
 **/*.rs.bk
 .result
 lean/.lake

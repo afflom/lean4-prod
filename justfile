@@ -14,7 +14,12 @@ lean-fixtures:
 # `ir` for a project's exported module and `stem` for the artifact basename.
 c-headers ir="rust/prod-core/goldens.ir" stem="lean4-prod":
     mkdir -p output
-    cargo run --manifest-path rust/Cargo.toml -p prod-cli -- header {{ir}} --output output/{{stem}}.h --rust-output output/{{stem}}_ffi.rs
+    RUSTC_WRAPPER= cargo run --manifest-path rust/Cargo.toml -p prod-cli -- header {{ir}} --output output/{{stem}}.h --rust-output output/{{stem}}_ffi.rs
+
+# Generate the complete scalar SDK bundle under ./output/<stem>.
+sdks ir="rust/prod-core/goldens.ir" stem="lean4-prod" library_name="lean4_prod":
+    mkdir -p output
+    RUSTC_WRAPPER= cargo run --manifest-path rust/Cargo.toml -p prod-cli -- sdks {{ir}} --output output --stem {{stem}} --library-name {{library_name}}
 
 # Export prod from lean
 prod-export:

@@ -33,6 +33,17 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Generate a C header and matching Rust `extern "C"` wrappers.
+    Header {
+        /// Path to the IR file
+        path: String,
+        /// Output path for the generated C header
+        #[arg(short, long)]
+        output: String,
+        /// Output path for the matching Rust wrapper source
+        #[arg(long)]
+        rust_output: String,
+    },
     /// Validate an IR file (check for unsupported constructs)
     Validate {
         /// Path to the IR file
@@ -189,6 +200,24 @@ fn main() {
                 }
                 None => print!("{}", out),
             }
+        }
+        Commands::Header {
+            path,
+            output,
+            rust_output,
+        } => {
+            let content = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {}", path, e));
+            let (_, module) = prod_ir::parser::parse_module(&content)
+                .unwrap_or_else(|e| panic!("Parse error: {:?}", e));
+            let bindings = prod_codegen::generate_c_bindings(&module)
+                .unwrap_or_else(|e| panic!("C ABI generation error: {}", e));
+            fs::write(&output, bindings.header)
+                .unwrap_or_else(|e| panic!("Failed to write {}: {}", output, e));
+            fs::write(&rust_output, bindings.rust)
+                .unwrap_or_else(|e| panic!("Failed to write {}: {}", rust_output, e));
+            println!("Generated: {}", output);
+            println!("Generated: {}", rust_output);
         }
         Commands::Validate { path } => {
             let content = fs::read_to_string(&path)

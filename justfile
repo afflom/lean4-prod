@@ -3,7 +3,12 @@ default:
     @just --list
 
 # Full pipeline: export from Lean, then verify the Rust build against it.
-prod: prod-export conformance test test-assertions no-alloc roots-check subset-check
+prod: lean-fixtures prod-export conformance test test-assertions no-alloc roots-check subset-check
+
+# Compile the standalone Lean proof-fixture library. These declarations are
+# real kernel-checked proofs, but are not part of the production export target.
+lean-fixtures:
+    cd lean && lake build ProofFixtures
 
 # Export prod from lean
 prod-export:

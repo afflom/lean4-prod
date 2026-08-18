@@ -12,6 +12,82 @@ fn generate_err(ir: &str) -> Error {
 }
 
 #[test]
+fn test_generate_c_header_and_matching_scalar_wrappers() {
+    let ir = r#"
+(module Demo
+  (def add ((a Nat) (b Nat)) Nat (add a b))
+  (def less ((a Nat) (b Nat)) Bool (lt a b))
+  (def echo ((value Bool)) Bool value)
+  (def riskyFlag ((x Nat)) Bool (let n (add x 1) (lt n 2)))
+)
+"#;
+    let (_, module) = parse_module(ir).unwrap();
+    let bindings = generate_c_bindings(&module).unwrap();
+    assert!(bindings.header.contains("#include <stdint.h>"));
+    assert!(bindings
+        .header
+        .contains("prod_demo_add_result_t prod_demo_add(uint64_t a, uint64_t b);"));
+    assert!(bindings.header.contains(
+        "typedef struct prod_demo_add { prod_status_t status; uint64_t value; } prod_demo_add_result_t;"
+    ));
+    assert!(bindings
+        .header
+        .contains("uint8_t prod_demo_less(uint64_t a, uint64_t b);"));
+    assert!(bindings
+        .header
+        .contains("uint8_t prod_demo_echo(uint8_t value);"));
+
+    // The Rust adapter uses Rust ABI types internally and converts bool at
+    // the boundary, so the file can be included in an unsafe-forbidden crate.
+    assert!(bindings.rust.contains(
+        "pub extern \"C\" fn prod_demo_add(a: u64, b: u64) -> ProdFfi_prod_demo_add_Result"
+    ));
+    assert!(bindings.rust.contains("add(a, b)"));
+    assert!(bindings
+        .rust
+        .contains("pub extern \"C\" fn prod_demo_less(a: u64, b: u64) -> u8"));
+    assert!(bindings.rust.contains("if less(a, b) { 1 } else { 0 }"));
+    assert!(bindings
+        .rust
+        .contains("pub extern \"C\" fn prod_demo_echo(value: u8) -> u8"));
+    assert!(bindings.rust.contains("echo(value != 0)"));
+    assert!(bindings
+        .header
+        .contains("prod_demo_riskyflag_result_t prod_demo_riskyflag(uint64_t x);"));
+    assert!(bindings
+        .rust
+        .contains("pub value: u8,\n}\n\n#[no_mangle]\npub extern \"C\" fn prod_demo_riskyflag"));
+    assert!(bindings.rust.contains("value: 0"));
+}
+
+#[test]
+fn test_c_header_omits_list_abi_without_guessing_ownership() {
+    let ir = r#"
+(module M
+  (def digits ((n Nat)) (List Nat) (ctor "List.nil"))
+  (def scalar () Nat 7)
+)
+"#;
+    let (_, module) = parse_module(ir).unwrap();
+    let bindings = generate_c_bindings(&module).unwrap();
+    assert!(bindings
+        .header
+        .contains("Definitions omitted from this scalar ABI"));
+    assert!(bindings.header.contains("uint64_t prod_m_scalar(void);"));
+
+    let only_list = r#"
+(module M
+  (def digits ((n Nat)) (List Nat) (ctor "List.nil"))
+)
+"#;
+    let (_, module) = parse_module(only_list).unwrap();
+    assert!(matches!(
+        generate_c_bindings(&module),
+        Err(CAbiError::UnsupportedDefinition { .. })
+    ));
+}
+
+#[test]
 fn test_generate_class_index() {
     let ir = r#"
 (module UorAtlas.Kernel

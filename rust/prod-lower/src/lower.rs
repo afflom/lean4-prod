@@ -54,6 +54,7 @@ pub fn lower_def_in(
         .get(def.name.as_str())
         .copied()
         .unwrap_or(Shape::Value);
+    check_signature(def, decls)?;
     let mut lowering = Lowering {
         params: &def.params,
         shapes,
@@ -87,7 +88,7 @@ pub fn lower_def_in(
             // values, not work. Collapsing the two would report the wrong
             // cause for a definition that has this one.
             if shape == Shape::StaticList && crate::shape::is_fallible(&def.body, shapes, profile) {
-                return Err(LowerError::UnsupportedKind(format!(
+                return Err(LowerError::UnsupportedList(format!(
                     "`{}` computes its list elements, so it cannot be a promoted &'static slice",
                     def.name
                 )));
@@ -124,6 +125,99 @@ pub fn lower_def_in(
     })
 }
 
+/// Every type in a definition's signature must have a rendering, and a
+/// `(named ...)` in one must be declared in this module.
+///
+/// The printers are total by construction, so nothing downstream can refuse a
+/// signature: `prod-emit-rust`'s `value_type` renders an unrenderable type as
+/// a placeholder identifier rather than an error. `prod-codegen` refused these
+/// in `param_type_to_rust`/`type_to_rust`/`check_named_type`, before it
+/// rendered the body, and the checks are in that order here so a signature
+/// that trips several of them is still refused for the reason it is refused
+/// today.
+fn check_signature(def: &Definition, decls: &[TypeDecl]) -> Result<(), LowerError> {
+    for (_, ty) in &def.params {
+        // A top-level list borrows as a slice, so it is the ELEMENT type that
+        // has to be renderable by value; nested any deeper, a list has no
+        // rendering at all.
+        match ty {
+            Type::List(inner) => check_value_type(inner, decls)?,
+            _ => check_value_type(ty, decls)?,
+        }
+    }
+    match &def.ret {
+        Type::List(inner) => check_value_type(inner, decls),
+        other => check_value_type(other, decls),
+    }
+}
+
+/// A type in ordinary (owned, by-value) position.
+///
+/// The rejections and their wording are `prod-codegen`'s. The payloads name
+/// the offending type in the **IR's** own spelling rather than any target's:
+/// this crate is the language-neutral half of the split, and a Rust type name
+/// in a diagnostic here would be exactly the backend knowledge the seam
+/// exists to keep out.
+fn check_value_type(ty: &Type, decls: &[TypeDecl]) -> Result<(), LowerError> {
+    match ty {
+        Type::Named(n) => {
+            if decls.iter().any(|d| d.name == *n) {
+                Ok(())
+            } else {
+                Err(LowerError::OpaqueType(n.clone()))
+            }
+        }
+        Type::Option(inner) => check_value_type(inner, decls),
+        Type::Tuple(items) => {
+            for item in items {
+                check_value_type(item, decls)?;
+            }
+            Ok(())
+        }
+        Type::Opaque(what) => Err(LowerError::OpaqueType(what.clone())),
+        Type::List(inner) => Err(LowerError::UnsupportedList(format!(
+            "(List {}) is only supported directly as a parameter or return type",
+            describe_type(inner)
+        ))),
+        Type::Vec(inner) => Err(LowerError::HeapType(format!(
+            "(Vec {})",
+            describe_type(inner)
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// A type in the IR's own surface syntax, for a diagnostic payload.
+fn describe_type(ty: &Type) -> String {
+    match ty {
+        Type::Nat => String::from("Nat"),
+        Type::Int => String::from("Int"),
+        Type::Bool => String::from("Bool"),
+        Type::UInt(k) => match k {
+            NumKind::U8 => String::from("U8"),
+            NumKind::U16 => String::from("U16"),
+            NumKind::U32 => String::from("U32"),
+            NumKind::U64 => String::from("U64"),
+            NumKind::Nat => String::from("Nat"),
+            NumKind::Int => String::from("Int"),
+        },
+        Type::Named(n) => format!("(named {:?})", n),
+        Type::Opaque(n) => format!("(opaque {:?})", n),
+        Type::Option(inner) => format!("(Option {})", describe_type(inner)),
+        Type::List(inner) => format!("(List {})", describe_type(inner)),
+        Type::Vec(inner) => format!("(Vec {})", describe_type(inner)),
+        Type::Tuple(items) => {
+            let mut out = String::from("(Tuple");
+            for item in items {
+                out.push(' ');
+                out.push_str(&describe_type(item));
+            }
+            out.push(')');
+            out
+        }
+    }
+}
+
 /// The source name a list-shaped definition's output sequence asks for.
 ///
 /// A *request*, not a guarantee: it goes through `bind_source` like any other
@@ -146,7 +240,7 @@ fn check_constant_list(stmts: &[Stmt]) -> Result<(), LowerError> {
     if constant {
         Ok(())
     } else {
-        Err(LowerError::UnsupportedKind(String::from(
+        Err(LowerError::UnsupportedList(String::from(
             "zero-argument list definitions must be constant cons chains",
         )))
     }
@@ -405,25 +499,25 @@ fn check_representable(ty: &Type) -> Result<(), LowerError> {
 /// What is accepted is therefore the whole **total** fragment, not merely the
 /// boolean one: `Nat` subtraction saturates, sized arithmetic wraps, `Nat`
 /// shift-right truncates, and unsigned division is total -- all of which
-/// `prod-codegen` renders inside a checked constructor today, as a single
-/// expression with no `?` in it. Refusing them would narrow the published
+/// the renderer this replaced rendered inside a checked constructor, as a
+/// single expression with no `?` in it. Refusing them would narrow the published
 /// subset for a shape (`1 <= q - T`) that is entirely plausible in a
 /// Lean-proved structure.
 ///
 /// What is refused, and this is a **deliberate divergence** from
 /// `prod-codegen` rather than a deferral:
 ///
-/// * An operation that can fail. `prod-codegen` does render it -- `new`
-///   returns a `Result`, so `checked_mul(..)?` compiles -- but the result is a
-///   checked constructor that reports `MulOverflow` when the thing that
+/// * An operation that can fail. The renderer this replaced did render it --
+///   `new` returns a `Result`, so `checked_mul(..)?` compiled -- but the
+///   result is a checked constructor that reports `MulOverflow` when the thing that
 ///   actually failed was the invariant it was checking. Refusing to generate
 ///   the type is the better answer, and it gets a named rejection saying so.
 /// * A node with no total-expression form in the Target IR at all: `If`,
-///   `Let` and `Match` are statements here. Those stay
-///   [`LowerError::NotYetLowered`], which is what they are.
-/// * `Expr::Ctor`, until `prod-emit-rust` can print a [`TExpr::Ctor`]. Passing
-///   it through would put a `compile_error!` in generated output, which is
-///   strictly worse than a rejection.
+///   `Let` and `Match` are statements here, and so are `Jp`/`Jmp`. Those are
+///   [`LowerError::OpaqueExpr`] and [`LowerError::UnsupportedJoinPoint`],
+///   which is what they are. None can appear in a Lean-exported invariant:
+///   `lowerProp` and the invariant fold in `lean/Prod/Lower.lean` emit
+///   comparisons, connectives, arithmetic and projections and nothing else.
 ///
 /// Field references resolve to the *target* field identifiers, so the
 /// predicate reads the same names the fields and the constructor parameters
@@ -530,12 +624,104 @@ fn lower_invariant(
         // invariant renderer with `params: &[]` and reports exactly this.
         Expr::Param(index) => Err(LowerError::ParamOutOfBounds(*index)),
 
-        other => Err(LowerError::NotYetLowered(format!(
+        // A constructor application in an invariant. The renderer this
+        // replaced rendered one -- its invariant renderer was the same
+        // renderer as everywhere else -- so refusing here would have narrowed
+        // the published subset at the cutover. Admitted on the same terms the
+        // body path admits it, through the same arity and resolvability
+        // checks.
+        Expr::Ctor(name, args) => {
+            let mut lowered = Vec::with_capacity(args.len());
+            for arg in args {
+                lowered.push(sub(arg)?);
+            }
+            ctor_expr(decls, name, lowered)
+        }
+
+        // The exporter reached a construct it could not describe, and a call
+        // it could not resolve. Both had names in `prod-codegen`; they keep
+        // them rather than degrading into a generic refusal.
+        Expr::Opaque(what) => Err(LowerError::OpaqueExpr(what.clone())),
+        Expr::Extern(name, _) => Err(LowerError::UnresolvedCall(name.clone())),
+
+        // Control flow inside an invariant. `Jp` and `Jmp` are join points,
+        // and this lowering places none in a predicate that has no statement
+        // list to place them into. The renderer this replaced rendered them,
+        // so this is a DIVERGENCE, in the safe direction. Neither can appear in a
+        // Lean-exported invariant: `lowerProp` and the invariant fold in
+        // `lean/Prod/Lower.lean` emit comparisons, connectives, arithmetic
+        // and projections, and nothing that introduces a join point.
+        Expr::Jp { name, .. } | Expr::Jmp(name, _) => {
+            Err(LowerError::UnsupportedJoinPoint(name.clone()))
+        }
+
+        // `If`, `Let`, `Match` and `Unreachable`: statements in this IR, and
+        // an invariant is one total expression with no statement list around
+        // it.
+        other => Err(LowerError::OpaqueExpr(format!(
             "{} in `{}`'s invariant",
             node_name(other),
             owner
         ))),
     }
+}
+
+/// A constructor application, resolved against the module's declarations.
+///
+/// One implementation for the body path and the invariant path, because the
+/// two questions -- does the arity agree with the declaration, and is the name
+/// something a target can spell at all -- are the same question in both.
+///
+/// A dotted name with no declaration is REFUSED rather than passed to a
+/// printer: a Lean name is not a Rust path in expression position
+/// (`Conformance.NoProp.mk(n, n)` parses as field access on a value called
+/// `Conformance`), so it would surface as a compiler error far from the IR
+/// that caused it. A dot-free name is at least a syntactically valid path to
+/// a type the host may supply by hand, so it passes through -- exactly
+/// `prod-codegen`'s split.
+fn ctor_expr(decls: &[TypeDecl], name: &str, args: Vec<TExpr>) -> Result<TExpr, LowerError> {
+    match ctor_decl(decls, name) {
+        Some((decl, cdecl)) => {
+            // Arity is an agreement between the declaration and this use, so
+            // a disagreement is the IR contradicting itself. Rendering it
+            // would emit a call with the wrong number of arguments.
+            if args.len() != cdecl.fields.len() {
+                return Err(LowerError::UnsupportedFieldType(format!(
+                    "`{}` takes {} field(s) but got {} argument(s)",
+                    name,
+                    cdecl.fields.len(),
+                    args.len()
+                )));
+            }
+            Ok(TExpr::Ctor(decl.name.clone(), String::from(name), args))
+        }
+        None if is_builtin_ctor(name, args.len()) => {
+            Ok(TExpr::Ctor(String::new(), String::from(name), args))
+        }
+        None if name.contains('.') => Err(LowerError::UnresolvedCall(String::from(name))),
+        None => Ok(TExpr::Ctor(String::new(), String::from(name), args)),
+    }
+}
+
+/// The constructors every backend knows without a declaration: Lean's own
+/// `Bool`, `Option`, `Prod` and `Int`.
+///
+/// Named here rather than in a printer because whether one is *admitted* is a
+/// question about the source language -- `prod-codegen` answered it in exactly
+/// this list -- while how each is spelled is the printer's business. The
+/// arities are part of the answer: `Option.some` with two arguments is not
+/// Lean's `Option.some`.
+fn is_builtin_ctor(name: &str, arity: usize) -> bool {
+    matches!(
+        (name, arity),
+        ("Prod.mk", _)
+            | ("Bool.true", 0)
+            | ("Bool.false", 0)
+            | ("Option.none", 0)
+            | ("Option.some", 1)
+            | ("Int.ofNat", 1)
+            | ("Int.negSucc", 1)
+    )
 }
 
 /// One arithmetic node inside an invariant: total, or a named rejection.
@@ -555,8 +741,9 @@ fn invariant_arith(
 
 /// The rejection for an invariant that contains a failing operation.
 ///
-/// `prod-codegen` renders this rather than refusing it, and the divergence is
-/// deliberate: the generated `new` would report the *arithmetic's* error --
+/// The renderer this replaced rendered this rather than refusing it, and the
+/// divergence is deliberate: the generated `new` would report the
+/// *arithmetic's* error --
 /// `MulOverflow` -- for a caller whose actual mistake was violating the
 /// invariant. A checked constructor that misattributes its own failure is
 /// worse than a type that is not generated at all.
@@ -895,7 +1082,7 @@ impl<'a> Lowering<'a> {
                     // fallible -- and `TExpr` has no unary minus to fall back
                     // on, so a profile that made it total would need a node
                     // this slice does not define.
-                    Err(LowerError::NotYetLowered(String::from("total Neg")))
+                    Err(LowerError::OpaqueExpr(String::from("total Neg")))
                 }
             }
 
@@ -920,10 +1107,11 @@ impl<'a> Lowering<'a> {
                 if self.jps.jmp_count(name) == 0 {
                     self.expr(body, stmts)
                 } else if self.jps.is_inlineable(name) {
-                    Err(LowerError::NotYetLowered(format!(
-                        "jp `{}` declared outside a `let` binding",
-                        name
-                    )))
+                    // Inlineable, but reached somewhere `bind_let` could not
+                    // elide the `let` LCNF wraps it in, so there is no jump
+                    // site to inline it at. Still a join point this lowering
+                    // will not place, which is what the name says.
+                    Err(LowerError::UnsupportedJoinPoint(name.clone()))
                 } else {
                     Err(LowerError::UnsupportedJoinPoint(name.clone()))
                 }
@@ -952,7 +1140,7 @@ impl<'a> Lowering<'a> {
                     // intermediate. `prod-codegen` refuses this in the same
                     // words, and the refusal outlives Task 7.
                     Some(Shape::Buffer) | Some(Shape::StaticList) => {
-                        Err(LowerError::UnsupportedKind(format!(
+                        Err(LowerError::UnsupportedList(format!(
                             "`{}` returns a list; its result cannot be used as an intermediate value",
                             name
                         )))
@@ -969,7 +1157,7 @@ impl<'a> Lowering<'a> {
                 if (name == "List.nil" && args.is_empty())
                     || (name == "List.cons" && args.len() == 2) =>
             {
-                Err(LowerError::UnsupportedKind(format!(
+                Err(LowerError::UnsupportedList(format!(
                     "`{}` outside a list return position",
                     name
                 )))
@@ -990,25 +1178,7 @@ impl<'a> Lowering<'a> {
                 for arg in args {
                     lowered.push(self.expr(arg, stmts)?);
                 }
-                let owner = match ctor_decl(self.decls, name) {
-                    Some((decl, cdecl)) => {
-                        // Arity is an agreement between the declaration and
-                        // this use, so a disagreement is the IR contradicting
-                        // itself. Rendering it would emit a call with the
-                        // wrong number of arguments, which does not compile.
-                        if lowered.len() != cdecl.fields.len() {
-                            return Err(LowerError::UnsupportedFieldType(format!(
-                                "`{}` takes {} field(s) but got {} argument(s)",
-                                name,
-                                cdecl.fields.len(),
-                                lowered.len()
-                            )));
-                        }
-                        decl.name.clone()
-                    }
-                    None => String::new(),
-                };
-                Ok(TExpr::Ctor(owner, name.clone(), lowered))
+                ctor_expr(self.decls, name, lowered)
             }
 
             Expr::Proj(ty, field, value) => {
@@ -1017,7 +1187,24 @@ impl<'a> Lowering<'a> {
                 Ok(TExpr::Proj(ty.clone(), field.clone(), Box::new(value)))
             }
 
-            other => Err(LowerError::NotYetLowered(String::from(node_name(other)))),
+            // The exporter reached a construct it could not describe.
+            // `prod-codegen` reported `Error::OpaqueExpr` here and so does
+            // this.
+            Expr::Opaque(what) => Err(LowerError::OpaqueExpr(what.clone())),
+
+            // A callee that is neither `@[prod]`-tagged nor whitelisted:
+            // there is nothing to call. `prod-codegen`'s `UnresolvedCall`,
+            // kept under its own name rather than folded into a generic
+            // refusal.
+            Expr::Extern(name, _) => Err(LowerError::UnresolvedCall(name.clone())),
+
+            // `If`, `Match` and `Unreachable` are STATEMENTS in this IR --
+            // `flow` lowers all three -- so in operand position they have no
+            // total-expression form to become. LCNF's A-normal form puts them
+            // in tail position, where `flow` sees them first; reaching here
+            // means one was nested inside an operand, which is a shape this
+            // slice does not lower.
+            other => Err(LowerError::OpaqueExpr(String::from(node_name(other)))),
         }
     }
 
@@ -1030,8 +1217,8 @@ impl<'a> Lowering<'a> {
     /// identical either way -- an `if` in a list-shaped definition is still an
     /// `if`, and its branches are still separate statement lists -- so there
     /// is one implementation of it rather than one per position. The two
-    /// diverged in `prod-codegen`, where `Mode::Value` and `Mode::Builder`
-    /// each re-derive the same match lowering.
+    /// diverged in the renderer this replaced, where `Mode::Value` and
+    /// `Mode::Builder` each re-derived the same match lowering.
     ///
     /// # Why branches get their own accumulator
     ///
@@ -1257,7 +1444,7 @@ impl<'a> Lowering<'a> {
                     env.extend(inner);
                     out
                 }
-                None => Err(LowerError::UnsupportedKind(format!(
+                None => Err(LowerError::UnsupportedList(format!(
                     "`{}` is not a list built in this definition",
                     name
                 ))),
@@ -1293,12 +1480,12 @@ impl<'a> Lowering<'a> {
             // Both messages are `prod-codegen`'s, verbatim: the rejection
             // wording is pinned by the published subset contract, so it moves
             // across the split without being improved.
-            Expr::Call(name, _) => Err(LowerError::UnsupportedKind(format!(
+            Expr::Call(name, _) => Err(LowerError::UnsupportedList(format!(
                 "`{}` does not build its list into a caller buffer",
                 name
             ))),
 
-            _ => Err(LowerError::UnsupportedKind(String::from(
+            _ => Err(LowerError::UnsupportedList(String::from(
                 "expression does not build a list",
             ))),
         }
@@ -1358,7 +1545,7 @@ impl<'a> Lowering<'a> {
         let mut lazy: Vec<Stmt> = Vec::new();
         let b = self.expr(b, &mut lazy)?;
         if !lazy.is_empty() {
-            return Err(LowerError::NotYetLowered(format!(
+            return Err(LowerError::OpaqueExpr(format!(
                 "{} whose right operand needs statements, which would evaluate it eagerly",
                 node_name(node)
             )));
@@ -1541,10 +1728,10 @@ impl<'a> Lowering<'a> {
 /// is the behaviour the Task 7 cutover has to reproduce, so it moves without
 /// being widened.
 ///
-/// *Behaviour*, not text. The two generators no longer agree byte for byte
-/// anywhere: a list body renders here as a flat `__len` cursor where
-/// `prod-codegen` nests `split_first_mut`, which computes the same function
-/// and does not spell it the same way.
+/// *Behaviour*, not text. The cutover kept the function and not the spelling:
+/// a list body renders as a flat `__len` cursor where the renderer this
+/// replaced nested `split_first_mut`, which computes the same function and
+/// does not spell it the same way.
 struct JpContext<'a> {
     /// name -> (params, body) of each `jp` declaration in the body
     decls: BTreeMap<&'a str, (&'a [String], &'a Expr)>,
@@ -1685,11 +1872,12 @@ fn collect_bound(e: &Expr, out: &mut BTreeSet<String>) {
     }
 }
 
-/// The variant name reported by [`LowerError::NotYetLowered`].
+/// The node name a rejection reports.
 ///
 /// Exhaustive on purpose: a new `Expr` variant is a compile error here, which
 /// is the prompt to give it a lowering rather than let it fall into a
-/// wildcard.
+/// wildcard. That is the property `LowerError::NotYetLowered` used to buy at
+/// runtime, kept at compile time now that the variant is gone.
 fn node_name(e: &Expr) -> &'static str {
     match e {
         Expr::Nat(_) => "Nat",
@@ -2628,7 +2816,7 @@ mod tests {
     /// The total arithmetic an invariant may contain.
     ///
     /// `Nat` subtraction saturates, so `1 <= q - T` is a single total
-    /// expression and `prod-codegen` renders it today. Refusing it would
+    /// expression and the renderer this replaced rendered it. Refusing it would
     /// narrow the published subset for a shape that is entirely plausible in a
     /// Lean-proved structure, so the accepted fragment is the whole total one,
     /// not merely the boolean one.
@@ -2658,12 +2846,12 @@ mod tests {
     /// The half of `prod-codegen`'s invariant fragment this lowering
     /// deliberately does NOT keep.
     ///
-    /// `prod-codegen` renders `q * T <= 100` -- `new` returns a `Result`, so
-    /// the `?` on `checked_mul` compiles. The result is a checked constructor
+    /// The renderer this replaced rendered `q * T <= 100` -- `new` returns a
+    /// `Result`, so the `?` on `checked_mul` compiled. The result is a checked constructor
     /// that reports `MulOverflow` to a caller whose actual mistake was
     /// violating the invariant. Refusing to generate the type is the better
-    /// answer, and it has to be a named rejection rather than
-    /// `NotYetLowered`, because nothing later is going to lower it.
+    /// answer, and it has to be a named rejection, because nothing later is
+    /// going to lower it.
     #[test]
     fn an_invariant_containing_a_failing_operation_is_rejected_by_name() {
         for (ir, node) in [
@@ -2734,8 +2922,8 @@ mod tests {
 
     /// The construction-side twin of the divergence above.
     ///
-    /// `prod-codegen` renders `Option.some` with one argument as `Some(x)`
-    /// before it ever looks the constructor up, so a module declaring its own
+    /// The renderer this replaced rendered `Option.some` with one argument as
+    /// `Some(x)` before it ever looked the constructor up, so a module declaring its own
     /// two-field `Option.some` silently gets the builtin spelling. Here the
     /// declaration is consulted first and the arity disagreement is named.
     #[test]
@@ -2813,7 +3001,7 @@ mod tests {
     /// An invariant is a predicate over fields, so it has no parameters and
     /// every `(param n)` in one is out of bounds. `prod-codegen` builds its
     /// invariant renderer with `params: &[]` and reports exactly this, so the
-    /// rejection keeps its name rather than degrading to `NotYetLowered`.
+    /// rejection keeps its own name.
     #[test]
     fn a_parameter_reference_inside_an_invariant_is_out_of_bounds() {
         let module = parse(
@@ -3002,7 +3190,7 @@ mod tests {
         let shapes = signatures(&module.definitions, &TargetProfile::RUST);
         assert_eq!(
             lower_def(&module.definitions[0], &shapes, &TargetProfile::RUST).err(),
-            Some(LowerError::UnsupportedKind(String::from(
+            Some(LowerError::UnsupportedList(String::from(
                 "zero-argument list definitions must be constant cons chains"
             )))
         );
@@ -3053,7 +3241,7 @@ mod tests {
             let def = module.definitions.last().expect("a definition");
             assert_eq!(
                 lower_def_in(def, &shapes, &TargetProfile::RUST, &module.types).err(),
-                Some(LowerError::UnsupportedKind(String::from(*expected))),
+                Some(LowerError::UnsupportedList(String::from(*expected))),
                 "for {}",
                 ir
             );
@@ -3061,12 +3249,15 @@ mod tests {
     }
 
     /// Every definition and every type declaration in both IN-REPO corpora
-    /// lowers, with no `NotYetLowered` anywhere.
+    /// lowers.
     ///
-    /// This is the property Task 7 turns into a proof, pinned here on the two
-    /// corpora a fresh checkout actually has. `prod-core/kernel.ir` and
-    /// `prod-core/goldens.ir` are generated and gitignored, so they cannot be
-    /// pinned by a test; they were swept by hand and lower too.
+    /// This is the sweep that let `LowerError::NotYetLowered` be deleted: no
+    /// corpus definition reached it, so it was scaffolding rather than a
+    /// rejection, and the compiler now finds a node with no lowering where a
+    /// runtime rejection used to. Pinned on the two corpora a fresh checkout
+    /// actually has; `prod-core/kernel.ir` and `prod-core/goldens.ir` are
+    /// generated and gitignored, so they cannot be pinned by a test -- they
+    /// were swept during the cutover and lower too.
     #[test]
     fn both_in_repo_corpora_lower_completely() {
         let corpora = [
@@ -3113,7 +3304,7 @@ mod tests {
         let shapes = signatures(&module.definitions, &TargetProfile::RUST);
         assert_eq!(
             lower_def(&module.definitions[0], &shapes, &TargetProfile::RUST).err(),
-            Some(LowerError::UnsupportedKind(String::from(
+            Some(LowerError::UnsupportedList(String::from(
                 "`List.cons` outside a list return position"
             )))
         );
@@ -3136,7 +3327,7 @@ mod tests {
 
     /// A comparison in a definition BODY. `lower_invariant` served the
     /// invariant path from Task 5; `Lowering::expr` had no arm at all, so any
-    /// corpus body containing one was `NotYetLowered`.
+    /// corpus body containing one was refused.
     ///
     /// All four are TOTAL -- none can fail under any profile -- so each is a
     /// `TExpr` and never a `TryLet`, and the operand order is preserved:
@@ -3226,7 +3417,7 @@ mod tests {
         assert!(
             matches!(
                 lower_def(&module.definitions[0], &shapes, &TargetProfile::RUST).err(),
-                Some(LowerError::NotYetLowered(_))
+                Some(LowerError::OpaqueExpr(_))
             ),
             "a hoisted right operand would be a different function"
         );
@@ -3326,5 +3517,156 @@ mod tests {
             ),
             "the invariant path must refuse what the body path refuses"
         );
+    }
+
+    /// The rejection a whole module's LAST definition produces.
+    fn lower_err(ir: &str) -> LowerError {
+        let module = parse(ir);
+        let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+        let def = module.definitions.last().expect("a definition");
+        lower_def_in(def, &shapes, &TargetProfile::RUST, &module.types)
+            .expect_err("must be rejected")
+    }
+
+    /// The rejection a one-field structure's invariant produces.
+    fn invariant_err(invariant: &str) -> LowerError {
+        let module = parse(&format!(
+            r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat)) {}))"#,
+            invariant
+        ));
+        lower_types(&module, &crate::names::NamePolicy::RUST).expect_err("must be rejected")
+    }
+
+    // ------------------------------- Task 7: the rejections that outlive
+    //                                 `NotYetLowered`
+
+    /// Deleting `NotYetLowered` orphaned a handful of arms that must still
+    /// refuse. Each was mapped onto an EXISTING published rejection rather
+    /// than getting a new one, because `REJECTIONS` and
+    /// `specs/lean-for-production.md` are pinned -- so what is at risk is not
+    /// that a rejection disappears but that it changes KIND, which
+    /// `prod-codegen`'s "every variant appears in REJECTIONS" loop cannot
+    /// see. This pins the kind for each mapping.
+    #[test]
+    fn every_arm_that_outlived_not_yet_lowered_kept_a_published_kind() {
+        // A lazy connective whose right operand needs statements. `&&` is
+        // lazy, and hoisting the operand would report an overflow where Lean
+        // has none.
+        let ir = "(module M (def m ((a Nat) (b Nat)) Bool (and (lt a b) (lt (add Nat a b) b))))";
+        assert!(matches!(lower_err(ir), LowerError::OpaqueExpr(_)));
+
+        // `Opaque` and `Extern` in a definition body: the names
+        // `prod-codegen` gave them.
+        assert_eq!(
+            lower_err(r#"(module M (def m ((a Nat)) Nat (opaque "why")))"#),
+            LowerError::OpaqueExpr(String::from("why"))
+        );
+        assert_eq!(
+            lower_err(r#"(module M (def m ((a Nat)) Nat (extern "Foo.helper" a)))"#),
+            LowerError::UnresolvedCall(String::from("Foo.helper"))
+        );
+
+        // ...and inside an invariant, where they used to degrade.
+        assert_eq!(
+            invariant_err(r#"(invariant (opaque "why"))"#),
+            LowerError::OpaqueExpr(String::from("why"))
+        );
+        assert_eq!(
+            invariant_err(r#"(invariant (extern "Foo.helper" q))"#),
+            LowerError::UnresolvedCall(String::from("Foo.helper"))
+        );
+
+        // `Jp`, `Jmp` and `Unreachable` inside an invariant. `prod-codegen`
+        // renders all three; refusing is a DIVERGENCE, in the safe direction,
+        // and none can appear in a Lean-exported invariant. They are named
+        // here so the divergence is recorded rather than discovered.
+        assert_eq!(
+            invariant_err(r#"(invariant (jp g (a) (le 1 q)))"#),
+            LowerError::UnsupportedJoinPoint(String::from("g"))
+        );
+        assert_eq!(
+            invariant_err(r#"(invariant (jmp g q))"#),
+            LowerError::UnsupportedJoinPoint(String::from("g"))
+        );
+        assert!(matches!(
+            invariant_err(r#"(invariant (unreachable))"#),
+            LowerError::OpaqueExpr(_)
+        ));
+    }
+
+    /// The list rejections carry `UnsupportedList`, not `UnsupportedKind`.
+    ///
+    /// Both names are separately published, and `From<LowerError>` at the
+    /// facade is name-for-name, so it cannot recover one from the other: the
+    /// distinction has to exist here or a published rejection silently
+    /// changes kind at the cutover.
+    #[test]
+    fn the_list_rejections_carry_the_list_kind_not_the_numeric_one() {
+        for ir in [
+            r#"(module M (def g ((a Nat)) Nat a) (def m ((a Nat)) (List Nat) (call g a)))"#,
+            r#"(module M (def m ((a Nat)) (List Nat) (add Nat a 1)))"#,
+            r#"(module M (def m ((a Nat)) (List Nat) a))"#,
+            r#"(module M (def m () (List Nat) (ctor "List.cons" (add Nat 1 2) (ctor "List.nil"))))"#,
+            r#"(module M (def m () (List Nat) (if (lt 1 2) (ctor "List.nil") (ctor "List.nil"))))"#,
+            r#"(module M (def m ((a Nat)) Nat (ctor "List.cons" a (ctor "List.nil"))))"#,
+            r#"(module M (def m ((a Nat)) (Option (List Nat)) (ctor "Option.none")))"#,
+        ] {
+            assert!(
+                matches!(lower_err(ir), LowerError::UnsupportedList(_)),
+                "must be UnsupportedList, got {:?} for {}",
+                lower_err(ir),
+                ir
+            );
+        }
+    }
+
+    /// A signature's types are checked HERE, before the body is lowered.
+    ///
+    /// Nothing downstream can refuse one: `prod-emit-rust` is total by
+    /// construction and renders an unrenderable type as a placeholder
+    /// identifier rather than an error. `prod-codegen` refused these in
+    /// `param_type_to_rust`/`type_to_rust`, and the rejections came across
+    /// with it.
+    #[test]
+    fn a_signature_type_with_no_rendering_is_refused_before_the_body_is() {
+        assert_eq!(
+            lower_err(r#"(module M (def m ((x (named "M.Nope"))) Nat 0))"#),
+            LowerError::OpaqueType(String::from("M.Nope"))
+        );
+        assert_eq!(
+            lower_err(r#"(module M (def m ((x Nat)) (named "M.Nope") x))"#),
+            LowerError::OpaqueType(String::from("M.Nope"))
+        );
+        assert_eq!(
+            lower_err(r#"(module M (def m ((x (opaque "Foo.Bar"))) Nat 0))"#),
+            LowerError::OpaqueType(String::from("Foo.Bar"))
+        );
+        assert_eq!(
+            lower_err(r#"(module M (def m ((xs (Vec Nat))) Nat 0))"#),
+            LowerError::HeapType(String::from("(Vec Nat)"))
+        );
+    }
+
+    /// A dotted constructor the module does not declare is refused, not
+    /// rendered: a Lean name is not a target path in expression position, so
+    /// `Conformance.NoProp.mk(n, n)` would surface as a compiler error far
+    /// from the IR that caused it. A dot-free name is at least a syntactically
+    /// valid path to something the host may supply by hand, so it survives --
+    /// exactly `prod-codegen`'s split.
+    #[test]
+    fn an_undeclared_dotted_constructor_is_unresolved_but_a_bare_one_is_not() {
+        assert_eq!(
+            lower_err(r#"(module M (def m ((n Nat)) Nat (ctor "Conformance.NoProp.mk" n n)))"#),
+            LowerError::UnresolvedCall(String::from("Conformance.NoProp.mk"))
+        );
+        let module = parse(r#"(module M (def m ((n Nat)) Nat (ctor "Pair" n 2)))"#);
+        let shapes = signatures(&module.definitions, &TargetProfile::RUST);
+        assert!(lower_def_in(
+            &module.definitions[0],
+            &shapes,
+            &TargetProfile::RUST,
+            &module.types
+        )
+        .is_ok());
     }
 }

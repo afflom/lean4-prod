@@ -1,30 +1,53 @@
 use alloc::string::String;
 
+/// Why a lowering refused.
+///
+/// **Every variant is named after the `prod_codegen::Error` variant it becomes
+/// at the facade**, and carries the same payload, because that is what renders
+/// the message the published subset contract pins. The mapping is total and
+/// name-for-name on purpose: `From<LowerError> for Error` cannot invent a
+/// distinction the lowering did not make, so a rejection that has to keep its
+/// published kind has to keep it *here*.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerError {
     ParamOutOfBounds(usize),
-    /// Scaffolding. Task 7 proves no corpus definition can produce this, then
-    /// deletes the variant so the compiler finds any node without a lowering.
-    NotYetLowered(String),
+    /// An expression with no rendering in the Target IR at all. `prod-codegen`
+    /// reported the same set as `Error::OpaqueExpr`, and this is the variant
+    /// the arms orphaned by deleting `NotYetLowered` were rehomed onto.
+    OpaqueExpr(String),
+    /// The callee is not something the generated code can call: an `extern`
+    /// the exporter could not resolve, or a dotted constructor name this
+    /// module does not declare (a Lean name is not a Rust path in expression
+    /// position, so rendering it produces output that does not compile).
+    UnresolvedCall(String),
     /// A construct no backend will ever render: a shift on `Int`, `pow` on a
-    /// sized kind, negation of a non-`Int`. Distinct from `NotYetLowered`,
-    /// which is scaffolding Task 7 deletes -- these rejections outlive it.
+    /// sized kind, negation of a non-`Int`.
     /// The printers are total by construction, so a refusal has to happen
     /// here, where the semantics are.
     UnsupportedKind(String),
+    /// A list value somewhere the allocation-free lowering cannot put it:
+    /// nested inside another type, used as an intermediate value, or built by
+    /// something that is not a cons chain.
+    ///
+    /// Separate from [`LowerError::UnsupportedKind`] because `prod-codegen`
+    /// published both names, and `From<LowerError>` at the facade cannot
+    /// recover one from the other -- the distinction has to exist at the
+    /// source or a published rejection silently changes kind.
+    UnsupportedList(String),
+    /// A type that would require a heap allocation in generated code.
+    HeapType(String),
     /// A join point this lowering will not inline: cyclic, several callers,
     /// or a `jmp` with no matching `jp`. `prod-codegen` rejects exactly the
     /// same set as `Error::UnsupportedJoinPoint`, and this variant exists so
-    /// the rejection survives the Task 7 cutover with its own name rather
-    /// than being folded into `UnsupportedKind` -- widening join-point
-    /// support is future work, not a permanent refusal.
+    /// the rejection keeps its own name rather than being folded into
+    /// `UnsupportedKind` -- widening join-point support is future work, not a
+    /// permanent refusal.
     UnsupportedJoinPoint(String),
 
     // The type-declaration rejections. Each one carries the *same payload* as
-    // the `prod_codegen::Error` variant of the same name, because at the Task 7
-    // cutover that is what renders the message the published subset contract
-    // pins. A payload that drifts here changes the contract without anyone
-    // editing it.
+    // the `prod_codegen::Error` variant of the same name, because that is what
+    // renders the message the published subset contract pins. A payload that
+    // drifts here changes the contract without anyone editing it.
     /// A type takes type parameters; needs monomorphization.
     PolymorphicType(String),
     /// A type is defined in terms of itself (directly, or through one level of

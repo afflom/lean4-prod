@@ -55,7 +55,7 @@ fn render(def: &Definition) -> String {
     let defs = vec![def.clone()];
     let shapes = signatures(&defs, &TargetProfile::RUST);
     let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
-    emit_body(&body)
+    emit_body(&body, &[])
 }
 
 fn lower_err(def: &Definition) -> LowerError {
@@ -69,7 +69,7 @@ fn a_fallible_nat_add_prints_as_checked_rust() {
     let defs = alloc::vec![def_add()];
     let shapes = signatures(&defs, &TargetProfile::RUST);
     let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
-    let out = emit_body(&body);
+    let out = emit_body(&body, &[]);
     assert!(
         out.contains("-> Result<u64, crate::ComputeError>"),
         "got: {}",
@@ -346,7 +346,7 @@ fn a_call_to_a_fallible_definition_gets_a_question_mark() {
     let defs = vec![callee, caller];
     let shapes = signatures(&defs, &TargetProfile::RUST);
     let body = lower_def(&defs[1], &shapes, &TargetProfile::RUST).expect("lowers");
-    let out = emit_body(&body);
+    let out = emit_body(&body, &[]);
     assert!(out.contains("Ok(g(a, a)?)"), "got: {}", out);
 }
 
@@ -440,7 +440,7 @@ fn a_fallible_op_in_one_arm_prints_inside_that_arm() {
 
 /// A `Switch` prints as a Rust `match`, one block per arm, with the arm's
 /// binders destructured -- and a dead branch as `unreachable!()`, which is
-/// what `prod-codegen` emits for `Expr::Unreachable` today.
+/// what the renderer this replaced emitted for `Expr::Unreachable`.
 #[test]
 fn a_match_prints_as_a_rust_match_with_its_binders_destructured() {
     let def = Definition {
@@ -547,7 +547,7 @@ fn a_temporary_read_only_inside_a_branch_is_not_folded_into_it() {
 // ---------------------------------------------------------------------------
 // Type declarations, and the invariant machinery
 //
-// The behaviour under test is `prod-codegen`'s, moved across the seam: the
+// The behaviour under test is the previous renderer's, moved across the seam: the
 // decisions on the lowering side, the syntax on this one. These assertions are
 // on the *rendered* text because that is what a caller at the crate boundary
 // actually gets.
@@ -636,13 +636,13 @@ fn a_projection_renders_as_field_access() {
     let body =
         prod_lower::lower::lower_def_in(&defs[0], &shapes, &TargetProfile::RUST, &module.types)
             .expect("lowers");
-    let out = emit_body(&body);
+    let out = emit_body(&body, &[]);
     assert!(out.contains("(p).a"), "got: {}", out);
 }
 
 /// An invariant is not restricted to comparisons: `Nat.sub` saturates, so
 /// `1 <= q - T` is a single total expression, and it must render exactly as
-/// `prod-codegen` renders it -- `saturating_sub`, no `?`, no temporary.
+/// the previous renderer rendered it -- `saturating_sub`, no `?`, no temporary.
 ///
 /// The strings are pinned rather than paraphrased because narrowing what an
 /// invariant may contain narrows the published subset, and a comparison of
@@ -675,6 +675,7 @@ fn an_invariant_may_contain_total_arithmetic_and_renders_it_inline() {
 /// Every definition in an IR module, rendered.
 fn render_module(ir: &str) -> alloc::collections::BTreeMap<String, String> {
     let module = prod_ir::parser::parse_module(ir).expect("parses").1;
+    let types = lower_types(&module, &NamePolicy::RUST).expect("types lower");
     let shapes = signatures(&module.definitions, &TargetProfile::RUST);
     module
         .definitions
@@ -683,7 +684,7 @@ fn render_module(ir: &str) -> alloc::collections::BTreeMap<String, String> {
             let body =
                 prod_lower::lower::lower_def_in(def, &shapes, &TargetProfile::RUST, &module.types)
                     .unwrap_or_else(|e| panic!("`{}` must lower: {:?}", def.name, e));
-            (def.name.clone(), emit_body(&body))
+            (def.name.clone(), emit_body(&body, &types))
         })
         .collect()
 }
@@ -771,7 +772,7 @@ fn comparisons_print_in_source_order() {
     }
 }
 
-/// The boolean connectives, matching what the `Renderer` prints today.
+/// The boolean connectives, matching what the previous renderer printed.
 #[test]
 fn boolean_connectives_print_as_rust_operators() {
     let out = render_one("(module M (def m ((a Nat) (b Nat)) Bool (and (lt a b) (gt a b))))");
@@ -784,7 +785,7 @@ fn boolean_connectives_print_as_rust_operators() {
     assert!(out.contains("(!(a < b))"), "got: {}", out);
 }
 
-/// The conversions, ported from `prod-codegen` unchanged. Each rendering is a
+/// The conversions, ported from the previous renderer unchanged. Each rendering is a
 /// Lean fact: `Int.toNat` clamps negatives to zero, `Nat.toUIntN` truncates.
 #[test]
 fn the_lossless_conversions_print_exactly_as_the_renderer_does() {
@@ -875,7 +876,7 @@ fn a_trylet_that_reads_the_cursor_is_never_folded_past_a_push() {
     let usage = uses(&body.stmts).get("t0").copied().expect("`t0` is read");
     assert_eq!((usage.total, usage.same_level), (1, 1));
 
-    let out = emit_body(&body);
+    let out = emit_body(&body, &[]);
     assert!(
         out.contains("let t0 = f(&mut output[__len..])?;"),
         "the call must stay where the cursor was still 0: {}",

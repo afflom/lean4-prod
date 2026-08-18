@@ -1,9 +1,16 @@
 //! prod-codegen: renders `prod-ir` modules as Rust source text.
 //!
-//! This crate is `#![no_std]` (with `alloc`) and host-independent: it renders
-//! Rust code as a plain `String`, never as `proc_macro2::TokenStream`, so it
-//! can run on wasm32 or inside other hosts. `prod-macros` and `prod-cli` are
-//! thin drivers on top of [`generate_module`].
+//! **This crate is a facade.** It owns the published rejection contract --
+//! [`Error`] and [`REJECTIONS`] -- and nothing else: `prod-lower` decides what
+//! a definition *means* as an imperative Target IR, and `prod-emit-rust`
+//! decides how Rust *spells* it. A backend-specific decision inside this
+//! crate, or inside `prod-lower`, is the design failure the split exists to
+//! prevent; it belongs in a `prod_lower::profile::TargetProfile`.
+//!
+//! It is `#![no_std]` (with `alloc`) and host-independent: it renders Rust as
+//! a plain `String`, never as `proc_macro2::TokenStream`, so it can run on
+//! wasm32 or inside other hosts. `prod-macros` and `prod-cli` are thin drivers
+//! on top of [`generate_module`].
 //!
 //! # Code generation policy
 //!
@@ -21,12 +28,11 @@
 //!   recursion passes the tail sub-slice directly — no rebinding, no copying.
 //! - **Return position** → a caller-owned output buffer. The signature gains a
 //!   trailing `output: &mut [α]` and returns `Result<usize, ComputeError>`,
-//!   the length of the initialized prefix. The body is rendered in *builder
-//!   mode*: `List.nil` becomes `Ok(0)`; `List.cons h t` splits one element off
-//!   the front of the buffer (`split_first_mut`, so exhaustion is an `Err`,
-//!   never an index panic), writes the head, recurses the tail into the
-//!   remainder, and returns `1 +` the tail's length. `if`/`let`/`cases`
-//!   recurse into builder mode; `let`-bound list values (LCNF emits lists in
+//!   the length of the initialized prefix. The body appends through a cursor:
+//!   every append is preceded by an explicit bounds check whose else-branch
+//!   returns `OutputTooSmall`, so exhaustion is an `Err`, never an index
+//!   panic. A list-shaped callee is handed the unwritten remainder and reports
+//!   how many elements it added. `let`-bound list values (LCNF emits lists in
 //!   A-normal form) are resolved through a scoped environment rather than
 //!   materialized.
 //! - **Zero-argument definitions returning a list** (the golden values) →
@@ -51,6 +57,11 @@
 //! error"), so neither is fallible. There is no bignum fallback, so this is
 //! exact only while values fit in `u64`.
 //!
+//! **Which operations can fail is a property of the target, not of Lean**, and
+//! it is declared once in `TargetProfile` rather than re-derived per backend:
+//! the same `Nat.add` is a checked statement under a profile whose `Nat` is a
+//! `u64` and a plain expression under one whose `Nat` is unbounded.
+//!
 //! A definition returns `Result<T, crate::ComputeError>` **only if it needs
 //! to**: if its body contains a checked operation, or calls a definition that
 //! is itself fallible, or builds a list into a caller buffer. That is a least
@@ -67,33 +78,34 @@
 //!     `k` bound to `(scrut).saturating_sub(1)` (exact, since the zero arm
 //!     matches first). `Bool.true`/`Bool.false` → `true`/`false` patterns, and
 //!     `Option.none`/`Option.some v` → `None`/`Some(v)` patterns. The List
-//!     ctors use the slice patterns described above.
-//!   - `Ctor` renders as tuple-style construction `Name(args...)` (bare `Name`
-//!     when there are no args), except `Prod.mk`, which renders as a Rust
-//!     tuple `(a, b)` — nested for right-nested pairs — and the Bool/Option
-//!     ctors, which render as `true`/`false` and `None`/`Some(x)`.
+//!     ctors use the slice patterns described above. A user-declared
+//!     constructor becomes its variant path with named fields.
+//!   - `Ctor` renders as a struct literal `crate::Type { field: arg, .. }`
+//!     (or `crate::Type::Variant { .. }` for a multi-constructor type),
+//!     resolved against the module's declarations. Lean's own constructors
+//!     need no declaration: `Prod.mk` is a Rust tuple `(a, b)`, the Bool and
+//!     Option ctors are `true`/`false` and `None`/`Some(x)`, and
+//!     `Int.ofNat`/`Int.negSucc` are the casts LCNF's `Int` literals go
+//!     through. A **dotted** constructor the module does not declare is
+//!     [`Error::UnresolvedCall`]: a Lean name is not a Rust path in
+//!     expression position, so rendering it would surface as a compiler error
+//!     far from the IR that caused it.
 //!   - `Proj` renders straight through: `(proj "Type" "field" e)` becomes
 //!     `e.field` (raw-escaped if `field` is a Rust keyword). The field name
-//!     is resolved once, in `Lower.lean`, against Lean's own structure info
-//!     — codegen holds no type-keyed lookup table, so there is no second
-//!     copy of the declaration that could disagree with the first and swap
-//!     fields silently. `crate::Instance` is generated like any other type
-//!     and mirrors the Lean structure's own field spelling (`q`, `T`, `O`)
-//!     for exactly this reason.
-//!
+//!     is resolved once, in `Lower.lean`, against Lean's own structure info,
+//!     and checked against the module's declaration on the way through, so a
+//!     declaration and a projection cannot disagree inside one IR file.
 //!   - `Type::Tuple` renders as a Rust tuple type, so
 //!     `(Tuple Nat (Tuple Nat Nat))` becomes `(u64, (u64, u64))`.
-//!   - `Unreachable` renders as `unreachable!()`.
+//!   - `Unreachable` renders as `unreachable!()` — LCNF emits it only for a
+//!     branch Lean itself proved dead.
 //!   - **Jp/Jmp policy**: a join point with exactly one `jmp` caller that is
-//!     not inside its own body is inlined at the jump site as
-//!     `{ let p = arg; ...; <jp body> }`, and the declaration site renders as
-//!     `()`. A join point with no callers renders its body in place. Anything
-//!     else — cyclic, or several callers — is rejected as
-//!     [`Error::UnsupportedJoinPoint`], because it would need real control
-//!     flow. This used to emit a `loop {}` skeleton with a "manual port
-//!     required" comment, which did not compile: the join point's parameters
-//!     were never bound, and each jump site had type `()` where its arm
-//!     needed a value.
+//!     not inside its own body is inlined at the jump site, and the `let` LCNF
+//!     wrapped its declaration in disappears entirely rather than binding a
+//!     unit nobody reads. A join point with no callers renders its body in
+//!     place. Anything else — cyclic, several callers, or a `jmp` with no
+//!     matching `jp` — is [`Error::UnsupportedJoinPoint`], because it would
+//!     need real control flow.
 //!
 //! ## Recursion
 //!
@@ -105,17 +117,15 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
-use alloc::format;
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
+use alloc::string::String;
 use core::fmt;
-use prod_emit_rust::rust_type;
-use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, NumKind, Type, TypeDecl};
+use prod_ir::{Definition, Module};
+use prod_lower::error::LowerError;
+use prod_lower::lower::{lower_def, lower_def_in, lower_types};
 use prod_lower::names::{NameError, NamePolicy, NameTable};
 use prod_lower::profile::TargetProfile;
+use prod_lower::shape::signatures;
 pub use prod_lower::shape::Shape;
-use prod_lower::shape::{signatures, Signatures};
 
 /// Errors that can occur during code generation
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,279 +295,61 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     ),
 ];
 
-/// A full Lean name as a Rust identifier: its last dot-separated component
-/// (a bare, dot-free name passes through unchanged), raw-escaped if that
-/// component is a keyword.
+/// Every [`LowerError`] becomes the `Error` variant of the same name.
 ///
-/// Delegates to `prod_lower::names::NamePolicy::RUST` rather than
-/// re-deriving the last-component-plus-escape logic here: that is the exact
-/// mangling `check_type_name_collisions` uses to certify injectivity, and a
-/// second, hand-written copy of it could quietly drift from what actually
-/// gets emitted below, which would make the certification worthless without
-/// anyone noticing.
-fn rust_ident(name: &str) -> String {
-    NamePolicy::RUST.apply(name)
-}
-
-/// Full Lean type name → its declaration, for the module being rendered.
-type TypeTable<'m> = BTreeMap<&'m str, &'m TypeDecl>;
-
-fn type_table(types: &[TypeDecl]) -> Result<TypeTable<'_>, Error> {
-    check_type_name_collisions(types)?;
-    let mut by_full: TypeTable = BTreeMap::new();
-    for decl in types {
-        by_full.insert(decl.name.as_str(), decl);
-    }
-    Ok(by_full)
-}
-
-/// Two Lean types whose last name component collide, once mangled the same
-/// way the generated `struct`/`enum` name is (see `rust_ident`): this is the
-/// one implementation of that check, sourced from `NameTable` rather than
-/// re-deriving it here.
-///
-/// Deliberately scoped to types only, with every type's constructors and
-/// fields stripped before building the table: `NameTable::build` also checks
-/// constructor and field injectivity, but that was never this function's
-/// contract, and folding it in here would reject modules this function used
-/// to accept under a `DuplicateTypeName` message that would be naming the
-/// wrong kind of collision.
-fn check_type_name_collisions(types: &[TypeDecl]) -> Result<(), Error> {
-    let types_only = Module {
-        name: String::new(),
-        types: types
-            .iter()
-            .map(|decl| TypeDecl {
-                name: decl.name.clone(),
-                ctors: Vec::new(),
-                unsupported: None,
-                invariant: None,
-            })
-            .collect(),
-        definitions: Vec::new(),
-    };
-    match NameTable::build(&types_only, &NamePolicy::RUST) {
-        Ok(_) => Ok(()),
-        Err(NameError::Collision { target, .. }) => Err(Error::DuplicateTypeName(target)),
+/// The mapping is name-for-name and payload-for-payload because a rejection's
+/// kind and its message are the published subset contract; a conversion that
+/// merged two of them, or invented a payload, would change that contract
+/// without anyone editing `REJECTIONS`.
+impl From<LowerError> for Error {
+    fn from(e: LowerError) -> Self {
+        match e {
+            LowerError::ParamOutOfBounds(i) => Error::ParamOutOfBounds(i),
+            LowerError::OpaqueExpr(s) => Error::OpaqueExpr(s),
+            LowerError::UnresolvedCall(s) => Error::UnresolvedCall(s),
+            LowerError::UnsupportedKind(s) => Error::UnsupportedKind(s),
+            LowerError::UnsupportedList(s) => Error::UnsupportedList(s),
+            LowerError::HeapType(s) => Error::HeapType(s),
+            LowerError::UnsupportedJoinPoint(s) => Error::UnsupportedJoinPoint(s),
+            LowerError::PolymorphicType(s) => Error::PolymorphicType(s),
+            LowerError::RecursiveType(s) => Error::RecursiveType(s),
+            LowerError::OpaqueType(s) => Error::OpaqueType(s),
+            LowerError::UnsupportedFieldType(s) => Error::UnsupportedFieldType(s),
+            LowerError::DuplicateTypeName(s) => Error::DuplicateTypeName(s),
+            LowerError::UnknownField(ty, field) => Error::UnknownField(ty, field),
+            LowerError::ReservedFieldName(ty, field) => Error::ReservedFieldName(ty, field),
+            LowerError::Name(e) => Error::from(e),
+        }
     }
 }
 
-/// Render one type declaration: a struct if it has exactly one constructor,
-/// otherwise an enum with named-field variants.
-///
-/// Every generated type is `Copy`, which is what keeps it inside the
-/// allocation-free tier: a type is eligible only if every field is a scalar, a
-/// tuple of eligible types, or another eligible generated type.
-///
-/// A type carrying an invariant (the exporter lowered its `Prop` fields to a
-/// boolean expression over its own fields) additionally gets `pub(crate)`
-/// fields, a checked `new`, and one accessor per field — see the invariant
-/// block below for why the fields are crate-visible rather than private.
-fn generate_type_decl<'m>(decl: &'m TypeDecl, table: &TypeTable<'m>) -> Result<String, Error> {
-    // The exporter reached this type but could not describe it. It is declared
-    // anyway so that the rejection names a reason instead of an unknown type.
-    if let Some(reason) = &decl.unsupported {
-        return Err(match reason.as_str() {
-            "type parameters" => Error::PolymorphicType(decl.name.clone()),
-            "recursive" => Error::RecursiveType(decl.name.clone()),
-            other => Error::OpaqueType(format!("{} ({})", decl.name, other)),
-        });
-    }
-    for ctor in &decl.ctors {
-        for (field, ty) in &ctor.fields {
-            check_field_type(ty, &decl.name, field, table)?;
+/// A name collision is a duplicate *type* name from this crate's point of
+/// view: `NameTable` reports the target name two distinct Lean names landed
+/// on, and `DuplicateTypeName` is the published rejection for exactly that.
+impl From<NameError> for Error {
+    fn from(e: NameError) -> Self {
+        match e {
+            NameError::Collision { target, .. } => Error::DuplicateTypeName(target),
         }
-    }
-
-    let mut out = String::from("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
-    let ident = rust_ident(&decl.name);
-
-    if decl.ctors.len() == 1 {
-        let ctor = &decl.ctors[0];
-        // Generated code keeps constructing invariant-carrying types by struct
-        // literal — Lean already supplied the proof — so the fields stay
-        // reachable in-crate. Only callers outside the crate, where the proof
-        // was erased on export, are routed through the checked constructor.
-        let vis = if decl.invariant.is_some() {
-            "pub(crate)"
-        } else {
-            "pub"
-        };
-        out.push_str(&format!("pub struct {} {{\n", ident));
-        for (name, ty) in &ctor.fields {
-            out.push_str(&format!(
-                "    {} {}: {},\n",
-                vis,
-                rust_ident(name),
-                type_to_rust(ty)?
-            ));
-        }
-        out.push_str("}\n");
-
-        if let Some(invariant) = &decl.invariant {
-            let rust_name = ident;
-
-            // The accessors share an `impl` block with `new`, so a field named
-            // `new` would emit two inherent methods of that name (E0592).
-            // `new` is not a Rust keyword, so `rust_ident` leaves it alone and
-            // nothing downstream would catch it — the output would simply not
-            // compile. Reject here, naming the type and the field.
-            for (name, _) in &ctor.fields {
-                if rust_ident(name) == "new" {
-                    return Err(Error::ReservedFieldName(
-                        decl.name.clone(),
-                        String::from(name.as_str()),
-                    ));
-                }
-            }
-
-            // Render the invariant with the constructor's parameters in scope:
-            // the IR refers to fields by name, and `new`'s parameters carry
-            // those same names, so `Var("q")` resolves without any rebinding.
-            // `no_shapes` must be a named binding, not a temporary: `Renderer`
-            // holds `&'s Signatures<'m>`, so `&BTreeMap::new()` inline would be
-            // dropped at the end of the statement and fail to borrow-check.
-            let no_shapes: Signatures = BTreeMap::new();
-            let renderer = Renderer {
-                shapes: &no_shapes,
-                params: &[],
-                types: table,
-                ctx: JpContext::collect(invariant),
-            };
-            let predicate = renderer.value(invariant)?;
-
-            let mut params = Vec::with_capacity(ctor.fields.len());
-            let mut inits = Vec::with_capacity(ctor.fields.len());
-            for (name, ty) in &ctor.fields {
-                params.push(format!("{}: {}", rust_ident(name), type_to_rust(ty)?));
-                inits.push(rust_ident(name));
-            }
-
-            out.push_str(&format!("impl {} {{\n", rust_name));
-            out.push_str(&format!(
-                "    /// Re-checks the invariant Lean proved at construction.\n\
-                 \x20   ///\n\
-                 \x20   /// Generated code does not call this: inside the generated world the\n\
-                 \x20   /// proof holds, and re-checking would turn proved-total functions\n\
-                 \x20   /// fallible. It exists for callers at the crate boundary, where the\n\
-                 \x20   /// proof is not available because it was erased on export.\n\
-                 \x20   pub fn new({}) -> Result<Self, crate::ComputeError> {{\n\
-                 \x20       if {} {{\n\
-                 \x20           Ok({} {{ {} }})\n\
-                 \x20       }} else {{\n\
-                 \x20           Err(crate::ComputeError::InvariantViolated({:?}))\n\
-                 \x20       }}\n\
-                 \x20   }}\n",
-                params.join(", "),
-                predicate,
-                rust_name,
-                inits.join(", "),
-                decl.name
-            ));
-            for (name, ty) in &ctor.fields {
-                out.push_str(&format!(
-                    "    pub fn {}(&self) -> {} {{ self.{} }}\n",
-                    rust_ident(name),
-                    type_to_rust(ty)?,
-                    rust_ident(name)
-                ));
-            }
-            out.push_str("}\n");
-        }
-        return Ok(out);
-    }
-
-    // Only a single-constructor structure can carry an invariant: a `Prop`
-    // field belongs to one constructor. Reject rather than render half of it.
-    if decl.invariant.is_some() {
-        return Err(Error::UnsupportedFieldType(format!(
-            "`{}` carries an invariant but has {} constructors; only a \
-             single-constructor structure can have one",
-            decl.name,
-            decl.ctors.len()
-        )));
-    }
-
-    out.push_str(&format!("pub enum {} {{\n", ident));
-    for ctor in &decl.ctors {
-        let variant = rust_ident(&ctor.name);
-        if ctor.fields.is_empty() {
-            out.push_str(&format!("    {},\n", variant));
-            continue;
-        }
-        let mut fields = Vec::with_capacity(ctor.fields.len());
-        for (name, ty) in &ctor.fields {
-            fields.push(format!("{}: {}", rust_ident(name), type_to_rust(ty)?));
-        }
-        out.push_str(&format!("    {} {{ {} }},\n", variant, fields.join(", ")));
-    }
-    out.push_str("}\n");
-    Ok(out)
-}
-
-/// A field type must be renderable and must not make the type recursive.
-///
-/// `owner` and `field` are the Lean constant and field name responsible, and
-/// they appear in the rejection message: the point of this milestone is that a
-/// failure names the declaration that caused it, and "a list field would need
-/// owned storage" on its own leaves the reader to grep for which one.
-fn check_field_type(ty: &Type, owner: &str, field: &str, table: &TypeTable) -> Result<(), Error> {
-    match ty {
-        Type::Named(n) => {
-            if n == owner {
-                return Err(Error::RecursiveType(String::from(owner)));
-            }
-            match table.get(n.as_str()) {
-                // One level of indirection is enough to catch the mutual case
-                // too: B referring back to A makes A reachable from A.
-                Some(other) => {
-                    for ctor in &other.ctors {
-                        for (_, inner) in &ctor.fields {
-                            if let Type::Named(m) = inner {
-                                if m == owner {
-                                    return Err(Error::RecursiveType(String::from(owner)));
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
-                }
-                None => Err(Error::OpaqueType(n.clone())),
-            }
-        }
-        // A sequence field would need owned storage, which the allocation-free
-        // tier does not have. Lists are supported as borrowed parameters and
-        // caller-owned output buffers only, never as owned struct fields.
-        Type::List(_) => Err(Error::UnsupportedFieldType(format!(
-            "`{}.{}`: a list field would need owned storage",
-            owner, field
-        ))),
-        Type::Vec(_) => Err(Error::UnsupportedFieldType(format!(
-            "`{}.{}`: a vector field would need heap storage",
-            owner, field
-        ))),
-        Type::Tuple(items) => {
-            for item in items {
-                check_field_type(item, owner, field, table)?;
-            }
-            Ok(())
-        }
-        Type::Option(inner) => check_field_type(inner, owner, field, table),
-        _ => Ok(()),
     }
 }
 
-/// Render a whole module: one `pub fn` per definition.
+/// Render a whole module: its type declarations, then one `pub fn` per
+/// definition.
 pub fn generate_module(module: &Module) -> Result<String, Error> {
-    let table = type_table(&module.types)?;
-    let shapes = signatures(&module.definitions, &TargetProfile::RUST);
-    let mut out = String::new();
-    for decl in &module.types {
-        out.push_str(&generate_type_decl(decl, &table)?);
-        out.push('\n');
-    }
+    let profile = TargetProfile::RUST;
+    NameTable::build(module, &NamePolicy::RUST)?;
+    let types = lower_types(module, &NamePolicy::RUST)?;
+    let shapes = signatures(&module.definitions, &profile);
+
+    let mut out = prod_emit_rust::emit_types(&types);
     for def in &module.definitions {
-        out.push_str(&generate_def_in(def, &shapes, &table)?);
+        // `lower_def_in`, NOT `lower_def`: the type-table-aware form is what
+        // makes the constructor-arity and `UnknownField` rejections fire. The
+        // table-free `lower_def` cannot check either, so using it here would
+        // silently drop two rejections that `REJECTIONS` still advertises.
+        let body = lower_def_in(def, &shapes, &profile, &module.types)?;
+        out.push_str(&prod_emit_rust::emit_body(&body, &types));
         out.push('\n');
     }
     Ok(out)
@@ -567,1051 +359,14 @@ pub fn generate_module(module: &Module) -> Result<String, Error> {
 ///
 /// Calls to definitions outside `def` itself are assumed infallible, since
 /// there is no module to resolve them against; use [`generate_module`] when
-/// cross-definition fallibility matters. With no module, there is no type
-/// table either, so any `(named ...)` type in `def`'s signature is opaque.
+/// cross-definition fallibility matters. With no module, there are no type
+/// declarations either, so any `(named ...)` type in `def`'s signature is
+/// opaque and any user constructor in its body is unresolved.
 pub fn generate_def(def: &Definition) -> Result<String, Error> {
     let one = core::slice::from_ref(def);
-    let table: TypeTable = BTreeMap::new();
-    generate_def_in(def, &signatures(one, &TargetProfile::RUST), &table)
-}
-
-fn generate_def_in<'m>(
-    def: &'m Definition,
-    shapes: &Signatures<'m>,
-    table: &TypeTable<'m>,
-) -> Result<String, Error> {
-    let shape = shapes
-        .get(def.name.as_str())
-        .copied()
-        .unwrap_or(Shape::Value);
-    let renderer = Renderer {
-        shapes,
-        params: &def.params,
-        ctx: JpContext::collect(&def.body),
-        types: table,
-    };
-
-    let mut params = String::new();
-    for (i, (name, ty)) in def.params.iter().enumerate() {
-        if i > 0 {
-            params.push_str(", ");
-        }
-        params.push_str(&format!("{}: {}", name, param_type_to_rust(ty, table)?));
-    }
-    check_named_type(&def.ret, table)?;
-
-    match shape {
-        Shape::StaticList => {
-            let elem = list_element(&def.ret)?;
-            if prod_lower::shape::is_fallible(&def.body, shapes, &TargetProfile::RUST) {
-                return Err(Error::UnsupportedList(format!(
-                    "`{}` computes its list elements, so it cannot be a promoted &'static slice",
-                    def.name
-                )));
-            }
-            let mut items = Vec::new();
-            renderer.static_list(&def.body, &[], &mut items)?;
-            Ok(format!(
-                "pub fn {}() -> &'static [{}] {{\n    &[{}]\n}}\n",
-                def.name,
-                type_to_rust(elem)?,
-                items.join(", ")
-            ))
-        }
-        Shape::Buffer => {
-            let elem = list_element(&def.ret)?;
-            if !params.is_empty() {
-                params.push_str(", ");
-            }
-            params.push_str(&format!("output: &mut [{}]", type_to_rust(elem)?));
-            let body = renderer.render(
-                &def.body,
-                &Mode::Builder {
-                    out: "output",
-                    env: &[],
-                    depth: 0,
-                },
-            )?;
-            Ok(format!(
-                "pub fn {}({}) -> Result<usize, crate::ComputeError> {{\n    {}\n}}\n",
-                def.name, params, body
-            ))
-        }
-        Shape::Fallible => Ok(format!(
-            "pub fn {}({}) -> Result<{}, crate::ComputeError> {{\n    Ok({})\n}}\n",
-            def.name,
-            params,
-            type_to_rust(&def.ret)?,
-            renderer.value(&def.body)?
-        )),
-        Shape::Value => Ok(format!(
-            "pub fn {}({}) -> {} {{\n    {}\n}}\n",
-            def.name,
-            params,
-            type_to_rust(&def.ret)?,
-            renderer.value(&def.body)?
-        )),
-    }
-}
-
-/// Rust spelling of a type in an ordinary (owned, by-value) position.
-fn type_to_rust(ty: &Type) -> Result<String, Error> {
-    Ok(match ty {
-        Type::Nat => String::from("u64"),
-        Type::Int => String::from("i64"),
-        Type::Bool => String::from("bool"),
-        Type::UInt(k) => String::from(rust_type(*k)),
-        Type::Named(n) => format!("crate::{}", rust_ident(n)),
-        Type::Option(inner) => format!("Option<{}>", type_to_rust(inner)?),
-        Type::Tuple(items) => {
-            let mut rendered = Vec::with_capacity(items.len());
-            for item in items {
-                rendered.push(type_to_rust(item)?);
-            }
-            format!("({})", rendered.join(", "))
-        }
-        Type::Opaque(s) => return Err(Error::OpaqueType(s.clone())),
-        // Lists are only renderable at the top level of a parameter or return
-        // type, where the caller supplies the storage.
-        Type::List(inner) => {
-            return Err(Error::UnsupportedList(format!(
-                "(List {}) is only supported directly as a parameter or return type",
-                type_to_rust(inner).unwrap_or_else(|_| String::from("_"))
-            )))
-        }
-        Type::Vec(inner) => {
-            return Err(Error::HeapType(format!(
-                "(Vec {})",
-                type_to_rust(inner).unwrap_or_else(|_| String::from("_"))
-            )))
-        }
-    })
-}
-
-/// Rust spelling of a parameter type: a top-level list borrows as a slice.
-///
-/// Checks named types against the module's type table first: parameter and
-/// return types are not fields, so [`check_field_type`] never sees them, and
-/// without this check an undeclared `(named ...)` in a signature would
-/// silently render as `crate::Whatever` instead of being rejected.
-fn param_type_to_rust(ty: &Type, table: &TypeTable) -> Result<String, Error> {
-    check_named_type(ty, table)?;
-    match ty {
-        Type::List(inner) => Ok(format!("&[{}]", type_to_rust(inner)?)),
-        _ => type_to_rust(ty),
-    }
-}
-
-/// A `(named ...)` type occurring in a definition's signature must be
-/// declared in the module's type table, at any depth (inside `Option`,
-/// `List`, `Vec`, or `Tuple`); otherwise it has no known Rust rendering.
-fn check_named_type(ty: &Type, table: &TypeTable) -> Result<(), Error> {
-    match ty {
-        Type::Named(n) => {
-            if table.contains_key(n.as_str()) {
-                Ok(())
-            } else {
-                Err(Error::OpaqueType(n.clone()))
-            }
-        }
-        Type::Option(inner) | Type::Vec(inner) | Type::List(inner) => {
-            check_named_type(inner, table)
-        }
-        Type::Tuple(items) => {
-            for item in items {
-                check_named_type(item, table)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// The element type of a list return type.
-fn list_element(ty: &Type) -> Result<&Type, Error> {
-    match ty {
-        Type::List(inner) => Ok(inner),
-        _ => Err(Error::UnsupportedList(
-            "expected a list return type".to_string(),
-        )),
-    }
-}
-
-/// Join-point analysis for one definition body (two-pass jp/jmp lowering).
-struct JpContext<'a> {
-    /// name → (params, body) of each `jp` declaration in the body
-    decls: BTreeMap<&'a str, (&'a [String], &'a Expr)>,
-    /// name → total number of `jmp` sites in the body
-    jmp_counts: BTreeMap<&'a str, usize>,
-}
-
-impl<'a> JpContext<'a> {
-    fn collect(body: &'a Expr) -> Self {
-        let mut ctx = JpContext {
-            decls: BTreeMap::new(),
-            jmp_counts: BTreeMap::new(),
-        };
-        ctx.walk(body);
-        ctx
-    }
-
-    fn walk(&mut self, expr: &'a Expr) {
-        // Record decls and counts, then recurse into every subexpression.
-        match expr {
-            Expr::Jp { name, params, body } => {
-                self.decls.insert(name.as_str(), (params, body));
-            }
-            Expr::Jmp(name, _) => {
-                *self.jmp_counts.entry(name.as_str()).or_insert(0) += 1;
-            }
-            _ => {}
-        }
-        for child in expr.children() {
-            self.walk(child);
-        }
-    }
-
-    fn jmp_count(&self, name: &str) -> usize {
-        self.jmp_counts.get(name).copied().unwrap_or(0)
-    }
-
-    /// A join point is cyclic if a jump to it occurs inside its own body.
-    fn is_cyclic(&self, name: &str) -> bool {
-        match self.decls.get(name) {
-            Some((_, body)) => count_jmps(body, name) > 0,
-            None => false,
-        }
-    }
-
-    /// Inlineable: exactly one caller, and not self-referential.
-    fn is_inlineable(&self, name: &str) -> bool {
-        self.jmp_count(name) == 1 && !self.is_cyclic(name)
-    }
-}
-
-/// Number of `jmp <name>` sites within `expr`.
-fn count_jmps(expr: &Expr, name: &str) -> usize {
-    let self_count = match expr {
-        Expr::Jmp(n, _) if n == name => 1,
-        _ => 0,
-    };
-    self_count + expr.children().map(|c| count_jmps(c, name)).sum::<usize>()
-}
-
-/// Which of Lean's two total-but-differently-zero integer operations
-/// [`Renderer::div_or_mod`] is rendering.
-#[derive(Clone, Copy)]
-enum DivMod {
-    Div,
-    Mod,
-}
-
-/// Where the expression being rendered will land.
-///
-/// The two modes share one traversal: control flow (`if`, `let`, `cases`)
-/// is rendered identically and simply propagates the mode into its branches,
-/// while the leaves differ.
-enum Mode<'x, 'm> {
-    /// Ordinary value position. The rendered text has the expression's own
-    /// Rust type, with `?` embedded wherever an operation can fail.
-    Value,
-    /// List builder position. The rendered text has type
-    /// `Result<usize, crate::ComputeError>` and fills `out`.
-    Builder {
-        /// The `&mut [T]` expression this list is written into.
-        out: &'x str,
-        /// `let`-bound list values in scope, innermost last. LCNF emits lists
-        /// in A-normal form, so cons cells arrive as chains of `let`s rather
-        /// than as one nested expression.
-        env: &'x [(&'m str, &'m Expr)],
-        /// Nesting depth, used to keep generated temporaries unique.
-        depth: usize,
-    },
-}
-
-struct Renderer<'s, 'm> {
-    shapes: &'s Signatures<'m>,
-    params: &'m [(String, Type)],
-    ctx: JpContext<'m>,
-    types: &'s TypeTable<'m>,
-}
-
-impl<'m> Renderer<'_, 'm> {
-    fn value(&self, expr: &'m Expr) -> Result<String, Error> {
-        self.render(expr, &Mode::Value)
-    }
-
-    /// The declaration of a constructor, by its full Lean name.
-    fn ctor_decl(&self, name: &str) -> Option<(&'m TypeDecl, &'m CtorDecl)> {
-        self.types.values().find_map(|decl| {
-            decl.ctors
-                .iter()
-                .find(|c| c.name == name)
-                .map(|c| (*decl, c))
-        })
-    }
-
-    fn shape_of(&self, name: &str) -> Option<Shape> {
-        self.shapes.get(name).copied()
-    }
-
-    /// Is this expression a list value (and therefore only renderable in
-    /// builder position or as a `let` binding resolved through `env`)?
-    fn is_list_valued(&self, expr: &Expr, env: &[(&'m str, &'m Expr)]) -> bool {
-        match expr {
-            Expr::Ctor(name, _) => name == "List.nil" || name == "List.cons",
-            Expr::Call(name, _) => matches!(
-                self.shape_of(name),
-                Some(Shape::Buffer) | Some(Shape::StaticList)
-            ),
-            Expr::Var(name) => lookup(env, name).is_some(),
-            _ => false,
-        }
-    }
-
-    fn render(&self, expr: &'m Expr, mode: &Mode<'_, 'm>) -> Result<String, Error> {
-        match expr {
-            // ---- control flow: identical in both modes ----
-            Expr::If(cond, t, f) => Ok(format!(
-                "if {} {{ {} }} else {{ {} }}",
-                self.value(cond)?,
-                self.render(t, mode)?,
-                self.render(f, mode)?
-            )),
-            Expr::Let(name, val, body) => match mode {
-                Mode::Builder { out, env, depth } if self.is_list_valued(val, env) => {
-                    // A list binding has no runtime representation to emit;
-                    // record it and resolve uses through the environment.
-                    let mut extended = env.to_vec();
-                    extended.push((name.as_str(), val));
-                    self.render(
-                        body,
-                        &Mode::Builder {
-                            out,
-                            env: &extended,
-                            depth: *depth,
-                        },
-                    )
-                }
-                _ => Ok(format!(
-                    "{{ let {} = {}; {} }}",
-                    name,
-                    self.value(val)?,
-                    self.render(body, mode)?
-                )),
-            },
-            Expr::Match {
-                scrut,
-                alts,
-                default,
-            } => self.render_match(scrut, alts, default.as_deref(), mode),
-
-            // ---- list-shaped leaves ----
-            Expr::Ctor(name, args) if name == "List.nil" && args.is_empty() => match mode {
-                // Turbofished: an empty list is the one builder leaf that
-                // constrains neither type parameter on its own, and it can
-                // appear under a `?` (as the tail of a cons).
-                Mode::Builder { .. } => Ok(String::from("Ok::<usize, crate::ComputeError>(0)")),
-                Mode::Value => Err(Error::UnsupportedList(
-                    "`List.nil` outside a list return position".to_string(),
-                )),
-            },
-            Expr::Ctor(name, args) if name == "List.cons" && args.len() == 2 => match mode {
-                Mode::Builder { out, env, depth } => {
-                    self.render_cons(&args[0], &args[1], out, env, *depth)
-                }
-                Mode::Value => Err(Error::UnsupportedList(
-                    "`List.cons` outside a list return position".to_string(),
-                )),
-            },
-
-            // ---- everything else ----
-            Expr::Var(name) => match mode {
-                Mode::Builder { env, .. } => match lookup(env, name) {
-                    Some(bound) => self.render(bound, mode),
-                    None => Err(Error::UnsupportedList(format!(
-                        "`{}` is not a list built in this definition",
-                        name
-                    ))),
-                },
-                // Raw-escaped, because a `Var` can name a structure field: an
-                // invariant refers to the fields by name, and the `new` that
-                // renders it declares its parameters (and the struct declares
-                // its fields) through `rust_ident`. Emitting the use raw would
-                // give `pub fn new(r#type: u64) { if (1 <= type)`. The lookup
-                // key above stays raw — only the emitted text is escaped.
-                //
-                // `rust_ident` is the identity on every non-keyword name, so
-                // this changes no rendering that compiles today.
-                Mode::Value => Ok(rust_ident(name)),
-            },
-            Expr::Call(name, args) => {
-                let rendered = self.render_args(args)?;
-                match (mode, self.shape_of(name)) {
-                    (Mode::Builder { out, .. }, Some(Shape::Buffer)) => {
-                        // The callee writes straight into our remaining buffer
-                        // and reports how much of it it used.
-                        let mut all = rendered;
-                        all.push((*out).to_string());
-                        Ok(format!("{}({})", name, all.join(", ")))
-                    }
-                    (Mode::Builder { .. }, _) => Err(Error::UnsupportedList(format!(
-                        "`{}` does not build its list into a caller buffer",
-                        name
-                    ))),
-                    (Mode::Value, Some(Shape::Buffer)) => Err(Error::UnsupportedList(format!(
-                        "`{}` returns a list; its result cannot be used as an intermediate value",
-                        name
-                    ))),
-                    (Mode::Value, Some(Shape::Fallible)) => {
-                        Ok(format!("{}({})?", name, rendered.join(", ")))
-                    }
-                    (Mode::Value, _) => Ok(format!("{}({})", name, rendered.join(", "))),
-                }
-            }
-
-            // An unresolved callee: refuse it outright rather than rendering
-            // a call to a function nobody generated, in either mode.
-            Expr::Extern(name, _) => Err(Error::UnresolvedCall(name.clone())),
-
-            // Remaining nodes are value-typed; reaching them in builder mode
-            // means the IR put a non-list where a list was declared.
-            _ => match mode {
-                Mode::Builder { .. } => Err(Error::UnsupportedList(
-                    "expression does not build a list".to_string(),
-                )),
-                Mode::Value => self.render_value_leaf(expr),
-            },
-        }
-    }
-
-    fn render_value_leaf(&self, expr: &'m Expr) -> Result<String, Error> {
-        match expr {
-            Expr::Nat(n) => Ok(format!("{}", n)),
-            Expr::Int(n) => Ok(format!("{}", n)),
-            Expr::Bool(b) => Ok(format!("{}", b)),
-            Expr::Param(index) => self
-                .params
-                .get(*index)
-                .map(|(name, _)| name.clone())
-                .ok_or(Error::ParamOutOfBounds(*index)),
-            // `Nat`/`Int` are checked (overflow is a real failure); sized
-            // integers wrap (`UInt8.add a b = ⟨a.toBitVec + b.toBitVec⟩` —
-            // wrapping IS the semantics), so they must not emit a `?` that
-            // `op_is_fallible` already promised does not exist.
-            Expr::Add(k, a, b) => match k {
-                NumKind::Nat | NumKind::Int => {
-                    self.checked_binop(*k, a, b, "checked_add", "AddOverflow")
-                }
-                _ => self.wrapping_binop(*k, a, b, "wrapping_add"),
-            },
-            Expr::Mul(k, a, b) => match k {
-                NumKind::Nat | NumKind::Int => {
-                    self.checked_binop(*k, a, b, "checked_mul", "MulOverflow")
-                }
-                _ => self.wrapping_binop(*k, a, b, "wrapping_mul"),
-            },
-            Expr::Sub(k, a, b) => match k {
-                NumKind::Nat => Ok(format!(
-                    "(({}) as u64).saturating_sub({})",
-                    self.value(a)?,
-                    self.value(b)?
-                )),
-                NumKind::Int => self.checked_binop(*k, a, b, "checked_sub", "SubOverflow"),
-                _ => self.wrapping_binop(*k, a, b, "wrapping_sub"),
-            },
-            Expr::Div(k, a, b) => self.div_or_mod(*k, a, b, DivMod::Div),
-            Expr::Mod(k, a, b) => self.div_or_mod(*k, a, b, DivMod::Mod),
-            // `Nat` shifts are checked (`Nat` is unbounded, so an
-            // out-of-range `Nat` shift amount can genuinely overflow `u64`).
-            // Sized shifts mask the amount mod the width instead — see
-            // `wrapping_shift`'s doc comment — which is exactly Rust's
-            // `wrapping_shl`.
-            Expr::Shl(k, a, b) => match k {
-                NumKind::Nat => self.checked_exponent_op(
-                    *k,
-                    a,
-                    b,
-                    "checked_shl",
-                    "ShiftExponentTooLarge",
-                    "ShiftOverflow",
-                ),
-                NumKind::Int => Err(Error::UnsupportedKind(String::from(
-                    "shifts are not supported for Int",
-                ))),
-                _ => self.wrapping_shift(*k, a, b, "wrapping_shl"),
-            },
-            // `Nat.shiftRight` is total and infallible: `Nat` is unbounded,
-            // so `a >>> b = 0` for any `b >= 64` once `a` fits `u64` —
-            // `total_shift` (`checked_shr(..).unwrap_or(0)`) is the faithful
-            // rendering, and stays. Sized-integer `shiftRight` masks the
-            // amount instead, like `shiftLeft` — see `wrapping_shift`.
-            // Shifts on `Int` are a deliberate non-goal and are rejected
-            // outright.
-            Expr::Shr(k, a, b) => match k {
-                NumKind::Int => Err(Error::UnsupportedKind(String::from(
-                    "shifts are not supported for Int",
-                ))),
-                NumKind::Nat => self.total_shift(*k, a, b, "checked_shr"),
-                _ => self.wrapping_shift(*k, a, b, "wrapping_shr"),
-            },
-            // Sized `pow` is deliberately rejected, not rendered. Nothing in
-            // `sizedOpSuffixes` (`lean/Prod/Lower.lean`) whitelists a sized
-            // `pow`, so no Lean input can reach this arm today — but
-            // hand-written IR can, and `wrapping_pow`'s exponent has no
-            // absorbing failure case the way `checked_shl`/`wrapping_shl` do
-            // (any shift amount past the width masks harmlessly to the same
-            // small set of outcomes). `u32::try_from(..).unwrap_or(u32::MAX)`
-            // — the narrowing every other exponent helper here uses — would
-            // silently compute `x.wrapping_pow(u32::MAX)` for a `U64`
-            // exponent that overflows `u32`, which is simply a different
-            // number from `x^e mod 2^64`, not a faithful truncation of it.
-            // Rejecting outright is honest about that gap; a correct
-            // rendering (e.g. binary exponentiation performed at the
-            // simulated bit width) is future work if a real input ever needs
-            // it.
-            Expr::Pow(k, a, b) => match k {
-                NumKind::Nat | NumKind::Int => self.checked_exponent_op(
-                    *k,
-                    a,
-                    b,
-                    "checked_pow",
-                    "PowExponentTooLarge",
-                    "PowOverflow",
-                ),
-                _ => Err(Error::UnsupportedKind(alloc::format!(
-                    "pow is not supported for sized kind {:?} (unsound u32 exponent narrowing)",
-                    k
-                ))),
-            },
-            Expr::Neg(k, a) => {
-                if *k == NumKind::Int {
-                    Ok(format!(
-                        "(({}) as i64).checked_neg().ok_or(crate::ComputeError::NegOverflow)?",
-                        self.value(a)?
-                    ))
-                } else {
-                    Err(Error::UnsupportedKind(alloc::format!(
-                        "unary negation is only supported for Int, not {:?}",
-                        k
-                    )))
-                }
-            }
-            Expr::Convert(from, to, e) => {
-                use NumKind::*;
-                let v = self.value(e)?;
-                match (from, to) {
-                    // Nat → Int widens; u64 values above i64::MAX cannot arise
-                    // from Lean's Nat under the bounded-u64 policy without
-                    // having already overflowed, so this is a plain cast.
-                    (Nat, Int) => Ok(format!("(({}) as i64)", v)),
-                    // Lean's Int.toNat clamps negatives to 0. A bare cast
-                    // would wrap them to enormous values.
-                    (Int, Nat) => Ok(format!("(({}).max(0) as u64)", v)),
-                    // Lean's Nat.toUIntN truncates, matching BitVec.
-                    (Nat, U8) | (Nat, U16) | (Nat, U32) | (Nat, U64) => {
-                        Ok(format!("(({}) as {})", v, rust_type(*to)))
-                    }
-                    // UIntN → Nat widens.
-                    (U8, Nat) | (U16, Nat) | (U32, Nat) | (U64, Nat) => {
-                        Ok(format!("(({}) as u64)", v))
-                    }
-                    _ => Err(Error::UnsupportedKind(format!(
-                        "no conversion from {:?} to {:?}; cross-width sized conversions are a deliberate non-goal",
-                        from, to
-                    ))),
-                }
-            }
-            Expr::Eq(a, b) => self.binop(a, b, "=="),
-            Expr::Lt(a, b) => self.binop(a, b, "<"),
-            Expr::Le(a, b) => self.binop(a, b, "<="),
-            Expr::Gt(a, b) => self.binop(a, b, ">"),
-            Expr::Ctor(name, args) => {
-                let args = self.render_args(args)?;
-                if name == "Prod.mk" {
-                    Ok(format!("({})", args.join(", ")))
-                } else if name == "Bool.true" && args.is_empty() {
-                    Ok(String::from("true"))
-                } else if name == "Bool.false" && args.is_empty() {
-                    Ok(String::from("false"))
-                } else if name == "Option.none" && args.is_empty() {
-                    Ok(String::from("None"))
-                } else if name == "Option.some" && args.len() == 1 {
-                    Ok(format!("Some({})", args[0]))
-                } else if name == "Int.ofNat" && args.len() == 1 {
-                    // `Int`'s own non-negative constructor: an `Int` literal
-                    // like `(1 : Int)` (or any `Nat`-typed subexpression
-                    // reaching an `Int` position) elaborates through this,
-                    // not through a bare numeral — LCNF still sees it as a
-                    // constructor application (`isCtorName` in `Lower.lean`
-                    // is right that it is one), so it must render here rather
-                    // than fall through to `UnresolvedCall`.
-                    Ok(format!("(({}) as i64)", args[0]))
-                } else if name == "Int.negSucc" && args.len() == 1 {
-                    // `Int`'s negative constructor: `Int.negSucc n = -(n + 1)`.
-                    Ok(format!("(-(({}) as i64) - 1)", args[0]))
-                } else if let Some((decl, cdecl)) = self.ctor_decl(name) {
-                    if args.len() != cdecl.fields.len() {
-                        return Err(Error::UnsupportedFieldType(format!(
-                            "`{}` takes {} field(s) but got {} argument(s)",
-                            name,
-                            cdecl.fields.len(),
-                            args.len()
-                        )));
-                    }
-                    let path = if decl.ctors.len() == 1 {
-                        format!("crate::{}", rust_ident(&decl.name))
-                    } else {
-                        format!(
-                            "crate::{}::{}",
-                            rust_ident(&decl.name),
-                            rust_ident(&cdecl.name)
-                        )
-                    };
-                    if cdecl.fields.is_empty() {
-                        Ok(path)
-                    } else {
-                        let mut bound = Vec::with_capacity(args.len());
-                        for ((field, _), arg) in cdecl.fields.iter().zip(args.iter()) {
-                            bound.push(format!("{}: {}", rust_ident(field), arg));
-                        }
-                        Ok(format!("{} {{ {} }}", path, bound.join(", ")))
-                    }
-                } else if name.contains('.') {
-                    // No declaration for this constructor, and its Lean name
-                    // is dotted. The tuple-style fallthrough below would emit
-                    // the dots verbatim — `Conformance.NoProp.mk(n, n)` — and
-                    // that is not a Rust path in expression position; it
-                    // parses as field access on a value named `Conformance`,
-                    // so even `syn::parse_str` waves it through and the
-                    // failure surfaces as a rustc error about the generated
-                    // file. Refuse it here, naming the constructor. The
-                    // bare-name form below stays: a dot-free ctor is at least
-                    // a syntactically valid path to a type the host may
-                    // supply by hand.
-                    Err(Error::UnresolvedCall(name.clone()))
-                } else if args.is_empty() {
-                    Ok(name.clone())
-                } else {
-                    Ok(format!("{}({})", name, args.join(", ")))
-                }
-            }
-            Expr::Proj(ty, field, e) => {
-                if let Some(decl) = self.types.get(ty.as_str()) {
-                    let declared = decl
-                        .ctors
-                        .iter()
-                        .any(|c| c.fields.iter().any(|(name, _)| name == field));
-                    if !declared {
-                        return Err(Error::UnknownField(ty.clone(), field.clone()));
-                    }
-                }
-                Ok(format!("({}).{}", self.value(e)?, rust_ident(field)))
-            }
-            Expr::Jp { name, body, .. } => {
-                if self.ctx.jmp_count(name) == 0 {
-                    // No jump sites: the declaration is just a block.
-                    Ok(format!(
-                        "{{ /* jp \"{}\": no jump sites */ {} }}",
-                        name,
-                        self.value(body)?
-                    ))
-                } else if self.ctx.is_inlineable(name) {
-                    // Inlined at its single jump site; nothing to emit here.
-                    Ok(format!("/* jp \"{}\" inlined at its jump site */ ()", name))
-                } else {
-                    // Cyclic or multi-caller. This used to emit a `loop {}`
-                    // skeleton with a "manual port required" comment, which is
-                    // not Rust that compiles: the join point's parameters are
-                    // never bound, and each jump site has type `()` where the
-                    // arm needs a value. Emitting it at exit 0 is exactly the
-                    // silently-broken-output failure this crate rejects
-                    // everywhere else, so it is a rejection now.
-                    Err(Error::UnsupportedJoinPoint(name.clone()))
-                }
-            }
-            Expr::Jmp(name, args) => match self.ctx.decls.get(name.as_str()) {
-                Some((jp_params, body)) if self.ctx.is_inlineable(name) => {
-                    let mut out = String::from("{ ");
-                    for (p, a) in jp_params.iter().zip(args.iter()) {
-                        out.push_str(&format!("let {} = {}; ", p, self.value(a)?));
-                    }
-                    out.push_str(&self.value(body)?);
-                    out.push_str(" }");
-                    Ok(out)
-                }
-                // The declaration site rejects this too; rejecting here as
-                // well means the error names the jump the reader can see,
-                // whichever of the two codegen reaches first.
-                Some(_) => Err(Error::UnsupportedJoinPoint(name.clone())),
-                None => Ok(format!(
-                    "/* jmp \"{}\": no matching jp declaration */ ()",
-                    name
-                )),
-            },
-            Expr::Unreachable => Ok(String::from("unreachable!()")),
-            Expr::Opaque(s) => Err(Error::OpaqueExpr(s.clone())),
-            // Boolean connectives. Fully parenthesised, so the rendering never
-            // depends on Rust's precedence agreeing with the IR's nesting.
-            Expr::And(a, b) => Ok(format!("({} && {})", self.value(a)?, self.value(b)?)),
-            Expr::Or(a, b) => Ok(format!("({} || {})", self.value(a)?, self.value(b)?)),
-            Expr::Not(a) => Ok(format!("(!{})", self.value(a)?)),
-            // Handled by `render` before it delegates here.
-            Expr::If(..)
-            | Expr::Let(..)
-            | Expr::Match { .. }
-            | Expr::Var(_)
-            | Expr::Call(..)
-            | Expr::Extern(..) => {
-                unreachable!("control-flow nodes are rendered by `render`")
-            }
-        }
-    }
-
-    /// `List.cons head tail` in builder position: take one element off the
-    /// front of the buffer, write the head, and recurse the tail into what is
-    /// left. `split_first_mut` makes exhaustion an `Err` rather than an index
-    /// panic, so the generated code has no bounds-check panic path at all.
-    fn render_cons(
-        &self,
-        head: &'m Expr,
-        tail: &'m Expr,
-        out: &str,
-        env: &[(&'m str, &'m Expr)],
-        depth: usize,
-    ) -> Result<String, Error> {
-        let head = self.value(head)?;
-        let (slot, rest_buf) = (format!("__head{}", depth), format!("__rest{}", depth));
-        let rest = self.render(
-            tail,
-            &Mode::Builder {
-                out: &rest_buf,
-                env,
-                depth: depth + 1,
-            },
-        )?;
-        Ok(format!(
-            "match ({}).split_first_mut() {{ None => Err(crate::ComputeError::OutputTooSmall), Some(({}, {})) => {{ *{} = {}; let __len{} = {}?; Ok(__len{} + 1) }} }}",
-            out, slot, rest_buf, slot, head, depth, rest, depth
-        ))
-    }
-
-    fn render_match(
-        &self,
-        scrut: &'m Expr,
-        alts: &'m [Alt],
-        default: Option<&'m Expr>,
-        mode: &Mode<'_, 'm>,
-    ) -> Result<String, Error> {
-        let scrut = self.value(scrut)?;
-        let mut out = format!("match {} {{\n", scrut);
-        for alt in alts {
-            let body = self.render(&alt.body, mode)?;
-            let arm = match (alt.ctor.as_str(), alt.binders.len()) {
-                // LCNF structural recursion on Nat cases: `Nat.zero` is the
-                // literal `0`; `Nat.succ k` binds the predecessor. Since the
-                // zero arm matches first, the succ arm's scrutinee is ≥ 1 and
-                // `saturating_sub(1)` is the exact predecessor (and stays
-                // within the crate's bounded-Nat policy).
-                ("Nat.zero", 0) => format!("        0 => {},\n", body),
-                ("Nat.succ", 1) => format!(
-                    "        _ => {{ let {} = ({}).saturating_sub(1); {} }},\n",
-                    alt.binders[0], scrut, body
-                ),
-                // Lists are slices: the empty and non-empty slice patterns are
-                // exhaustive, and the tail binds as a sub-slice at no cost.
-                // Match ergonomics bind the head by reference; rebind it by
-                // value so arithmetic on it needs no dereference syntax.
-                ("List.nil", 0) => format!("        [] => {},\n", body),
-                ("List.cons", 2) => format!(
-                    "        [{}, {} @ ..] => {{ let {} = *{}; {} }},\n",
-                    alt.binders[0], alt.binders[1], alt.binders[0], alt.binders[0], body
-                ),
-                ("Bool.true", 0) => format!("        true => {},\n", body),
-                ("Bool.false", 0) => format!("        false => {},\n", body),
-                ("Option.none", 0) => format!("        None => {},\n", body),
-                ("Option.some", 1) => format!("        Some({}) => {},\n", alt.binders[0], body),
-                _ => match self.ctor_decl(&alt.ctor) {
-                    Some((decl, cdecl)) if alt.binders.len() == cdecl.fields.len() => {
-                        let path = if decl.ctors.len() == 1 {
-                            format!("crate::{}", rust_ident(&decl.name))
-                        } else {
-                            format!(
-                                "crate::{}::{}",
-                                rust_ident(&decl.name),
-                                rust_ident(&cdecl.name)
-                            )
-                        };
-                        if cdecl.fields.is_empty() {
-                            format!("        {} => {},\n", path, body)
-                        } else {
-                            let mut bound = Vec::with_capacity(alt.binders.len());
-                            for ((field, _), binder) in cdecl.fields.iter().zip(alt.binders.iter())
-                            {
-                                bound.push(format!("{}: {}", rust_ident(field), binder));
-                            }
-                            format!("        {} {{ {} }} => {},\n", path, bound.join(", "), body)
-                        }
-                    }
-                    // Declared, but the alt's binder count does not match the
-                    // constructor's field count: this must be rejected, not
-                    // rendered. Falling through to the positional arms below
-                    // would emit a dotted name used as a Rust path with
-                    // positional fields — e.g. `M.Shape.circle(r, extra)` —
-                    // which does not compile. Symmetric with the arity check
-                    // on the construction side.
-                    Some((_, cdecl)) => {
-                        return Err(Error::UnsupportedFieldType(format!(
-                            "`{}` takes {} field(s) but got {} binder(s)",
-                            alt.ctor,
-                            cdecl.fields.len(),
-                            alt.binders.len()
-                        )));
-                    }
-                    None if alt.binders.is_empty() => {
-                        format!("        {} => {},\n", alt.ctor, body)
-                    }
-                    None => format!(
-                        "        {}({}) => {},\n",
-                        alt.ctor,
-                        alt.binders.join(", "),
-                        body
-                    ),
-                },
-            };
-            out.push_str(&arm);
-        }
-        if let Some(d) = default {
-            out.push_str(&format!("        _ => {},\n", self.render(d, mode)?));
-        }
-        out.push_str("    }");
-        Ok(out)
-    }
-
-    /// Flatten a constant `List.cons`/`List.nil` chain into array elements for
-    /// a promoted `&'static [T]`. Only `let`-bound list values are followed;
-    /// anything computed belongs in builder mode instead.
-    fn static_list(
-        &self,
-        expr: &'m Expr,
-        env: &[(&'m str, &'m Expr)],
-        items: &mut Vec<String>,
-    ) -> Result<(), Error> {
-        match expr {
-            Expr::Var(name) => match lookup(env, name) {
-                Some(bound) => self.static_list(bound, env, items),
-                None => Err(Error::UnsupportedList(format!(
-                    "`{}` is not a constant list",
-                    name
-                ))),
-            },
-            Expr::Let(name, val, body) if self.is_list_valued(val, env) => {
-                let mut extended = env.to_vec();
-                extended.push((name.as_str(), val));
-                self.static_list(body, &extended, items)
-            }
-            Expr::Ctor(name, args) if name == "List.nil" && args.is_empty() => Ok(()),
-            Expr::Ctor(name, args) if name == "List.cons" && args.len() == 2 => {
-                items.push(self.value(&args[0])?);
-                self.static_list(&args[1], env, items)
-            }
-            _ => Err(Error::UnsupportedList(
-                "zero-argument list definitions must be constant cons chains".to_string(),
-            )),
-        }
-    }
-
-    fn render_args(&self, args: &'m [Expr]) -> Result<Vec<String>, Error> {
-        args.iter().map(|a| self.value(a)).collect()
-    }
-
-    fn binop(&self, a: &'m Expr, b: &'m Expr, op: &str) -> Result<String, Error> {
-        Ok(format!("({} {} {})", self.value(a)?, op, self.value(b)?))
-    }
-
-    /// `checked_add`/`checked_mul`: report overflow instead of panicking.
-    ///
-    /// The `as` cast pins the receiver's type: method calls on an inferred
-    /// `{integer}` (a let-bound literal, e.g. LCNF's `let _x := 1`) fail
-    /// method resolution (E0689). It is a no-op when the receiver already has
-    /// the kind's type.
-    fn checked_binop(
-        &self,
-        kind: NumKind,
-        a: &'m Expr,
-        b: &'m Expr,
-        method: &str,
-        error: &str,
-    ) -> Result<String, Error> {
-        Ok(format!(
-            "(({}) as {}).{}({}).ok_or(crate::ComputeError::{})?",
-            self.value(a)?,
-            rust_type(kind),
-            method,
-            self.value(b)?,
-            error
-        ))
-    }
-
-    /// `checked_shl`/`checked_pow`: the exponent must also narrow to `u32`,
-    /// which is a second, distinct failure mode.
-    fn checked_exponent_op(
-        &self,
-        kind: NumKind,
-        a: &'m Expr,
-        b: &'m Expr,
-        method: &str,
-        exponent_error: &str,
-        overflow_error: &str,
-    ) -> Result<String, Error> {
-        Ok(format!(
-            "(({}) as {}).{}(u32::try_from({}).map_err(|_| crate::ComputeError::{})?).ok_or(crate::ComputeError::{})?",
-            self.value(a)?,
-            rust_type(kind),
-            method,
-            self.value(b)?,
-            exponent_error,
-            overflow_error
-        ))
-    }
-
-    /// Lean division and modulo by zero are both total, but NOT the same
-    /// value: `x / 0 = 0` for every kind (`Nat.div n 0 = 0`, `Int.ediv _ 0 =
-    /// 0`, and the same for sized integers), while `x % 0 = x` — the
-    /// dividend, not zero. This is `Nat.mod`'s own doc comment ("When the
-    /// divisor is `0`, the result is the dividend rather than an error",
-    /// doctest `5 % 0 = 5`) and `Int`'s `emod_zero : a % 0 = a` (doctest `(7 :
-    /// Int) % (0 : Int) = 7`) — so the two branches share a divisor-is-zero
-    /// guard but NOT a zero-branch value; `which` selects it, along with the
-    /// rest of the div-vs-mod-specific spelling (operator, Euclidean method).
-    ///
-    /// `Int` is Euclidean on top of that (`Int.ediv`/`Int.emod`, "for
-    /// compatibility with SMT-LIB" per their own doc comment), which differs
-    /// from Rust's truncating `/`/`%` on every negative operand:
-    /// `(-12).ediv 7 = -2` and `(-12).emod 7 = 2`, where Rust's `/`/`%` give
-    /// `-1`/`-5`. It can also overflow at `i64::MIN / -1` — so it keeps the
-    /// zero-guard and adds a check (`DivOverflow` for both: `checked_rem_euclid`
-    /// fails exactly where `checked_div_euclid` does, `i64::MIN % -1`, since
-    /// the Euclidean remainder is defined in terms of the division).
-    fn div_or_mod(
-        &self,
-        kind: NumKind,
-        a: &'m Expr,
-        b: &'m Expr,
-        which: DivMod,
-    ) -> Result<String, Error> {
-        let (op, euclid_method, zero_is_dividend) = match which {
-            DivMod::Div => ("/", "checked_div_euclid", false),
-            DivMod::Mod => ("%", "checked_rem_euclid", true),
-        };
-        let (a, b) = (self.value(a)?, self.value(b)?);
-        let zero = if zero_is_dividend {
-            a.clone()
-        } else {
-            String::from("0")
-        };
-        if kind == NumKind::Int {
-            return Ok(format!(
-                "if ({}) == 0 {{ {} }} else {{ (({}) as i64).{}({}).ok_or(crate::ComputeError::DivOverflow)? }}",
-                b, zero, a, euclid_method, b
-            ));
-        }
-        Ok(format!(
-            "if ({}) == 0 {{ {} }} else {{ ({}) {} ({}) }}",
-            b, zero, a, op, b
-        ))
-    }
-
-    /// Sized-integer arithmetic wraps — that is Lean's semantics
-    /// (`UInt8.add a b = ⟨a.toBitVec + b.toBitVec⟩`), not a failure.
-    fn wrapping_binop(
-        &self,
-        kind: NumKind,
-        a: &'m Expr,
-        b: &'m Expr,
-        method: &str,
-    ) -> Result<String, Error> {
-        Ok(format!(
-            "(({}) as {}).{}({})",
-            self.value(a)?,
-            rust_type(kind),
-            method,
-            self.value(b)?
-        ))
-    }
-
-    /// `Nat.shiftRight` is total: `Nat` is unbounded, so `a >>> b = 0` for
-    /// any `b >= 64` once `a` fits `u64` — there is no width to mask by, only
-    /// a genuine "shifted past everything" case. `checked_shr` returns
-    /// `None` exactly there (and for `b >= 2^32`, via the `try_from`
-    /// fallback to `u32::MAX`), so `unwrap_or(0)` is the exact answer, not a
-    /// fallback for a real error — there is no `ComputeError` variant for
-    /// this because none is needed.
-    ///
-    /// NOTE: this is `Nat`-only. `UIntN` shifts do NOT truncate to 0 — see
-    /// `wrapping_shift` below, which is what sized shifts actually use.
-    fn total_shift(
-        &self,
-        kind: NumKind,
-        a: &'m Expr,
-        b: &'m Expr,
-        method: &str,
-    ) -> Result<String, Error> {
-        Ok(format!(
-            "(({}) as {}).{}(u32::try_from({}).unwrap_or(u32::MAX)).unwrap_or(0)",
-            self.value(a)?,
-            rust_type(kind),
-            method,
-            self.value(b)?
-        ))
-    }
-
-    /// Sized-integer shifts mask the amount mod the width, they do NOT
-    /// truncate to 0 past the width (unlike `Nat`, handled by
-    /// `total_shift` above). Lean's own definition:
-    ///
-    /// ```text
-    /// protected def UInt8.shiftLeft (a b : UInt8) : UInt8 :=
-    ///   ⟨a.toBitVec <<< (UInt8.mod b 8).toBitVec⟩
-    /// ```
-    /// (`Init/Data/UInt/Basic.lean:126`; the same shape at 133 for
-    /// `shiftRight`, and at 297/304, 491/498, 662/669 for `UInt16`/`UInt32`/
-    /// `UInt64`) — the shift amount is reduced mod the width *first*, so
-    /// `(1 : UInt8) <<< 8 = 1 <<< (8 % 8) = 1 <<< 0 = 1`, not `0`.
-    ///
-    /// This is exactly Rust's `wrapping_shl`/`wrapping_shr`: both mask the
-    /// shift amount to the low bits of the type, which is equivalent to
-    /// `rhs % width` because every sized width (8/16/32/64) is a power of
-    /// two. The amount narrows to `u32` (the signature `wrapping_shl`
-    /// requires) with a plain `as u32`, not the `try_from(..).unwrap_or(..)`
-    /// saturation `total_shift`/`checked_exponent_op` use: those helpers
-    /// need the saturating form because their `None` case aborts the whole
-    /// operation on an out-of-range amount, but `wrapping_shl` never aborts,
-    /// and truncating a `u64` amount to `u32` cannot disturb the low 6 bits
-    /// that the mod-64 mask actually reads.
-    fn wrapping_shift(
-        &self,
-        kind: NumKind,
-        a: &'m Expr,
-        b: &'m Expr,
-        method: &str,
-    ) -> Result<String, Error> {
-        Ok(format!(
-            "(({}) as {}).{}(({}) as u32)",
-            self.value(a)?,
-            rust_type(kind),
-            method,
-            self.value(b)?
-        ))
-    }
-}
-
-/// Innermost-first lookup in a builder-mode list environment.
-fn lookup<'m>(env: &[(&'m str, &'m Expr)], name: &str) -> Option<&'m Expr> {
-    env.iter()
-        .rev()
-        .find(|(bound, _)| *bound == name)
-        .map(|(_, value)| *value)
+    let shapes = signatures(one, &TargetProfile::RUST);
+    let body = lower_def(def, &shapes, &TargetProfile::RUST)?;
+    Ok(prod_emit_rust::emit_body(&body, &[]))
 }
 
 #[cfg(test)]

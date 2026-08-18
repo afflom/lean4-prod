@@ -1,4 +1,5 @@
 use super::*;
+use alloc::string::ToString;
 use prod_ir::parser::parse_module;
 
 fn generate(ir: &str) -> String {
@@ -47,7 +48,7 @@ fn test_generate_match() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn f(x: u64) -> u64 {\n    match x {\n        Some(v) => v,\n        _ => 0,\n    }\n}\n\n"
+        "pub fn f(x: u64) -> u64 {\n    match x {\n        Some(v) => {\n            return v;\n        }\n        _ => {\n            return 0;\n        }\n    }\n}\n\n"
     );
 }
 
@@ -70,7 +71,7 @@ fn test_generate_list_param_is_a_slice_and_return_is_a_buffer() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn digitSum(xs: &[u64]) -> Result<u64, crate::ComputeError> {\n    Ok(match xs {\n        [] => 0,\n        [h, t @ ..] => { let h = *h; ((h) as u64).checked_add(digitSum(t)?).ok_or(crate::ComputeError::AddOverflow)? },\n    })\n}\n\npub fn digits(n: u64, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    if (n < 8) { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = n; let __len0 = Ok::<usize, crate::ComputeError>(0)?; Ok(__len0 + 1) } } } else { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = if (8) == 0 { n } else { (n) % (8) }; let __len0 = digits(if (8) == 0 { 0 } else { (n) / (8) }, __rest0)?; Ok(__len0 + 1) } } }\n}\n\n"
+        "pub fn digitSum(xs: &[u64]) -> Result<u64, crate::ComputeError> {\n    match xs {\n        [] => {\n            return Ok(0);\n        }\n        [h, t @ ..] => {\n            let h = *h;\n            let t0 = digitSum(t)?;\n            let t1 = ((h) as u64).checked_add(t0).ok_or(crate::ComputeError::AddOverflow)?;\n            return Ok(t1);\n        }\n    }\n}\n\npub fn digits(n: u64, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    let mut __len: usize = 0;\n    if (n < 8) {\n        if (__len < output.len()) {\n        } else {\n            return Err(crate::ComputeError::OutputTooSmall);\n        }\n        output[__len] = n;\n        __len += 1;\n        return Ok(__len);\n    } else {\n        if (__len < output.len()) {\n        } else {\n            return Err(crate::ComputeError::OutputTooSmall);\n        }\n        output[__len] = if (8) == 0 { n } else { (n) % (8) };\n        __len += 1;\n        let t0 = digits(if (8) == 0 { 0 } else { (n) / (8) }, &mut output[__len..])?;\n        __len += t0;\n        return Ok(__len);\n    }\n}\n\n"
     );
 }
 
@@ -101,7 +102,7 @@ fn test_generate_list_builder_resolves_anf_let_bindings() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn digits(fuel: u64, n: u64, i: crate::Instance, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    match fuel {\n        0 => Ok::<usize, crate::ComputeError>(0),\n        _ => { let n_25 = (fuel).saturating_sub(1); { let _x_47 = (i).O; if (n < _x_47) { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = n; let __len0 = Ok::<usize, crate::ComputeError>(0)?; Ok(__len0 + 1) } } } else { { let _x_50 = if (_x_47) == 0 { n } else { (n) % (_x_47) }; { let _x_51 = if (_x_47) == 0 { 0 } else { (n) / (_x_47) }; match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = _x_50; let __len0 = digits(n_25, _x_51, i, __rest0)?; Ok(__len0 + 1) } } } } } } },\n    }\n}\n\n"
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn digits(fuel: u64, n: u64, i: crate::Instance, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    let mut __len: usize = 0;\n    match fuel {\n        0 => {\n            return Ok(__len);\n        }\n        _ => {\n            let n_25 = (fuel).saturating_sub(1);\n            let _x_47 = (i).O;\n            if (n < _x_47) {\n                if (__len < output.len()) {\n                } else {\n                    return Err(crate::ComputeError::OutputTooSmall);\n                }\n                output[__len] = n;\n                __len += 1;\n                return Ok(__len);\n            } else {\n                let _x_50 = if (_x_47) == 0 { n } else { (n) % (_x_47) };\n                let _x_51 = if (_x_47) == 0 { 0 } else { (n) / (_x_47) };\n                if (__len < output.len()) {\n                } else {\n                    return Err(crate::ComputeError::OutputTooSmall);\n                }\n                output[__len] = _x_50;\n                __len += 1;\n                let t0 = digits(n_25, _x_51, i, &mut output[__len..])?;\n                __len += t0;\n                return Ok(__len);\n            }\n        }\n    }\n}\n\n"
     );
 }
 
@@ -144,7 +145,11 @@ fn test_fallibility_is_precise_not_uniform() {
     assert!(out.contains("Ok(risky(x)?)"));
     // A recursive definition reaches its own fixpoint.
     assert!(out.contains("pub fn loops(fuel: u64, x: u64) -> Result<u64, crate::ComputeError> {"));
-    assert!(out.contains("loops(k, ((x) as u64).checked_add(1)"));
+    // The argument is computed into a branch-local temporary and passed by
+    // name: a `TryLet` inside a match arm is never folded into its use, so
+    // the checked add cannot be evaluated on the arm that does not run.
+    assert!(out.contains("checked_add(1).ok_or(crate::ComputeError::AddOverflow)?;"));
+    assert!(out.contains("loops(k, "));
 }
 
 #[test]
@@ -187,7 +192,10 @@ fn test_vec_type_is_rejected_as_heap_allocating() {
   (def f ((xs (Vec Nat))) Nat 0)
 )
 "#;
-    assert_eq!(generate_err(ir), Error::HeapType("(Vec u64)".to_string()));
+    // The payload names the offending type in the IR's own spelling: the
+    // rejection is made in `prod-lower`, which has no business knowing Rust's
+    // type names.
+    assert_eq!(generate_err(ir), Error::HeapType("(Vec Nat)".to_string()));
 }
 
 #[test]
@@ -217,7 +225,7 @@ fn test_generate_option_and_bool() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn tryDecode(idx: u64) -> Option<u64> {\n    if (idx <= 96) { Some(idx) } else { None }\n}\n\npub fn fromOpt(x: Option<u64>) -> bool {\n    match x {\n        Some(v) => true,\n        None => false,\n    }\n}\n\n"
+        "pub fn tryDecode(idx: u64) -> Option<u64> {\n    if (idx <= 96) {\n        return Some(idx);\n    } else {\n        return None;\n    }\n}\n\npub fn fromOpt(x: Option<u64>) -> bool {\n    match x {\n        Some(v) => {\n            return true;\n        }\n        None => {\n            return false;\n        }\n    }\n}\n\n"
     );
 }
 
@@ -236,7 +244,7 @@ fn test_generate_nat_cases_recursion() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn digitCount(fuel: u64, n: u64) -> Result<u64, crate::ComputeError> {\n    Ok(match fuel {\n        0 => 0,\n        _ => { let k = (fuel).saturating_sub(1); if (n < 8) { 1 } else { ((1) as u64).checked_add(digitCount(k, if (8) == 0 { 0 } else { (n) / (8) })?).ok_or(crate::ComputeError::AddOverflow)? } },\n    })\n}\n\n"
+        "pub fn digitCount(fuel: u64, n: u64) -> Result<u64, crate::ComputeError> {\n    match fuel {\n        0 => {\n            return Ok(0);\n        }\n        _ => {\n            let k = (fuel).saturating_sub(1);\n            if (n < 8) {\n                return Ok(1);\n            } else {\n                let t0 = digitCount(k, if (8) == 0 { 0 } else { (n) / (8) })?;\n                let t1 = ((1) as u64).checked_add(t0).ok_or(crate::ComputeError::AddOverflow)?;\n                return Ok(t1);\n            }\n        }\n    }\n}\n\n"
     );
 }
 
@@ -300,7 +308,7 @@ fn test_generate_kernel_ir_shapes() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn stride(i: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok({ let _x_4 = (i).T; { let _x_5 = (i).O; { let _x_13 = ((_x_4) as u64).checked_mul(_x_5).ok_or(crate::ComputeError::MulOverflow)?; _x_13 } } })\n}\n\npub fn classDecode(idx: u64, i: crate::Instance) -> Result<(u64, (u64, u64)), crate::ComputeError> {\n    Ok({ let _x_4 = stride(i)?; { let h2 = if (_x_4) == 0 { 0 } else { (idx) / (_x_4) }; { let rem = if (_x_4) == 0 { idx } else { (idx) % (_x_4) }; { let _x_10 = (i).O; { let d = if (_x_10) == 0 { 0 } else { (rem) / (_x_10) }; { let l = if (_x_10) == 0 { rem } else { (rem) % (_x_10) }; { let _x_13 = (d, l); { let _x_14 = (h2, _x_13); _x_14 } } } } } } } })\n}\n\n"
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn stride(i: crate::Instance) -> Result<u64, crate::ComputeError> {\n    let _x_4 = (i).T;\n    let _x_5 = (i).O;\n    let _x_13 = ((_x_4) as u64).checked_mul(_x_5).ok_or(crate::ComputeError::MulOverflow)?;\n    Ok(_x_13)\n}\n\npub fn classDecode(idx: u64, i: crate::Instance) -> Result<(u64, (u64, u64)), crate::ComputeError> {\n    let _x_4 = stride(i)?;\n    let h2 = if (_x_4) == 0 { 0 } else { (idx) / (_x_4) };\n    let rem = if (_x_4) == 0 { idx } else { (idx) % (_x_4) };\n    let _x_10 = (i).O;\n    let d = if (_x_10) == 0 { 0 } else { (rem) / (_x_10) };\n    let l = if (_x_10) == 0 { rem } else { (rem) % (_x_10) };\n    let _x_13 = (d, l);\n    let _x_14 = (h2, _x_13);\n    Ok(_x_14)\n}\n\n"
     );
 }
 
@@ -490,9 +498,12 @@ fn test_generate_jp_jmp_inlined() {
 )
 "#;
     let out = generate(ir);
+    // The `let` LCNF wraps the declaration in disappears entirely rather than
+    // binding a unit nobody reads: the join point has one jump site, and its
+    // body belongs there.
     assert_eq!(
         out,
-        "pub fn f(x: u64) -> Result<u64, crate::ComputeError> {\n    Ok({ let g = /* jp \"g\" inlined at its jump site */ (); { let a = x; ((a) as u64).checked_add(1).ok_or(crate::ComputeError::AddOverflow)? } })\n}\n\n"
+        "pub fn f(x: u64) -> Result<u64, crate::ComputeError> {\n    let a = x;\n    Ok(((a) as u64).checked_add(1).ok_or(crate::ComputeError::AddOverflow)?)\n}\n\n"
     );
 }
 
@@ -542,7 +553,9 @@ fn test_join_point_with_no_callers_still_renders() {
     (jp g (a) x))
 )
 "#;
-    assert!(generate(ir).contains("no jump sites"));
+    // Nothing jumps to `g`, so its body IS the definition's body and renders
+    // in place -- no binding, no placeholder.
+    assert_eq!(generate(ir), "pub fn f(x: u64) -> u64 {\n    x\n}\n\n");
 }
 
 #[test]
@@ -593,7 +606,7 @@ fn test_generate_decide_unwrapped_comparison_is_a_plain_bool() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn c_bool(a: u64, b: u64) -> bool {\n    { let x = (a < b); x }\n}\n\n"
+        "pub fn c_bool(a: u64, b: u64) -> bool {\n    let x = (a < b);\n    x\n}\n\n"
     );
 }
 
@@ -626,7 +639,8 @@ fn test_generate_nat_arithmetic_policy_never_panics() {
 fn test_generate_unreachable() {
     let ir = "(module M (def f ((x Nat)) Nat (unreachable)))";
     let out = generate(ir);
-    assert_eq!(out, "pub fn f(x: u64) -> u64 {\n    unreachable!()\n}\n\n");
+    // A `Fail` is a terminator, so it prints as one.
+    assert_eq!(out, "pub fn f(x: u64) -> u64 {\n    unreachable!();\n}\n\n");
 }
 
 #[test]
@@ -775,7 +789,7 @@ fn test_generate_enum_construction_and_patterns() {
   (def unit ((r Nat)) (named "M.Shape") (ctor "M.Shape.circle" r)))
 "#;
     let out = generate(ir);
-    assert!(out.contains("crate::Shape::circle { radius: r } => r,"));
+    assert!(out.contains("crate::Shape::circle { radius: r } => {"));
     assert!(out.contains("crate::Shape::rect { w: w, h: h } =>"));
     assert!(out.contains("crate::Shape::circle { radius: r }"));
 }
@@ -1174,4 +1188,96 @@ fn test_keyword_field_name_is_raw_escaped_inside_the_checked_constructor() {
     );
     assert!(out.contains("Ok(Kw { r#type, r#fn })"), "got: {}", out);
     assert!(out.contains("pub fn r#type(&self) -> u64 { self.r#type }"));
+}
+
+/// The rejections that changed their INTERNAL home at the cutover must arrive
+/// here under the published name they had before it.
+///
+/// `test_every_error_variant_is_published_in_rejections` checks that every
+/// variant *appears* in `REJECTIONS`; it cannot see a given input starting to
+/// produce a different one. That is the property at risk when a rejection
+/// moves from `prod-codegen`'s renderer into `prod-lower`, because
+/// `From<LowerError>` is name-for-name and cannot recover a distinction the
+/// lowering did not make.
+#[test]
+fn test_the_rehomed_rejections_keep_their_published_kind() {
+    // Five list rejections. In `prod-lower` these are `UnsupportedList`, a
+    // variant added for exactly this reason: they would otherwise have
+    // arrived as `UnsupportedKind`, which is separately published.
+    for ir in [
+        r#"(module M (def g ((a Nat)) Nat a) (def m ((a Nat)) (List Nat) (call g a)))"#,
+        r#"(module M (def m ((a Nat)) (List Nat) (add Nat a 1)))"#,
+        r#"(module M (def m ((a Nat)) (List Nat) a))"#,
+        r#"(module M (def m () (List Nat) (ctor "List.cons" (add Nat 1 2) (ctor "List.nil"))))"#,
+        r#"(module M (def m ((a Nat)) Nat (ctor "List.cons" a (ctor "List.nil"))))"#,
+    ] {
+        assert!(
+            matches!(generate_err(ir), Error::UnsupportedList(_)),
+            "for {}: got {:?}",
+            ir,
+            generate_err(ir)
+        );
+    }
+
+    // An unresolved callee and an opaque expression, in a body and inside an
+    // invariant. Both used to be `prod-codegen`'s own named rejections and
+    // both degraded when the lowering took them over.
+    assert_eq!(
+        generate_err(r#"(module M (def m ((a Nat)) Nat (extern "Foo.helper" a)))"#),
+        Error::UnresolvedCall("Foo.helper".to_string())
+    );
+    assert_eq!(
+        generate_err(r#"(module M (def m ((a Nat)) Nat (opaque "why")))"#),
+        Error::OpaqueExpr("why".to_string())
+    );
+    assert_eq!(
+        generate_err(
+            r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat)) (invariant (extern "Foo.helper" q))))"#
+        ),
+        Error::UnresolvedCall("Foo.helper".to_string())
+    );
+
+    // A join point the lowering will not place, including the two shapes that
+    // reach it only inside an invariant.
+    assert!(matches!(
+        generate_err(r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat)) (invariant (jmp g q))))"#),
+        Error::UnsupportedJoinPoint(_)
+    ));
+
+    // A lazy connective whose right operand needs statements.
+    assert!(matches!(
+        generate_err(
+            "(module M (def m ((a Nat) (b Nat)) Bool (and (lt a b) (lt (add Nat a b) b))))"
+        ),
+        Error::OpaqueExpr(_)
+    ));
+}
+
+/// `generate_module` must call `lower_def_in`, not `lower_def`.
+///
+/// The table-free form cannot see the module's declarations, so it can check
+/// neither a constructor's arity nor a projected field's existence -- two
+/// rejections `REJECTIONS` still advertises. Both are pinned separately above;
+/// this asserts the reason they still fire, by checking that the SAME IR is
+/// accepted by the single-definition entry point, which documents having no
+/// module to resolve against.
+#[test]
+fn test_generate_module_resolves_against_the_module_but_generate_def_cannot() {
+    let ir = r#"
+(module M
+  (type "M.Rec" (ctor "M.Rec.mk" (alpha Nat)))
+  (def f ((r (named "M.Rec"))) Nat (proj "M.Rec" "beta" r)))
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::UnknownField("M.Rec".to_string(), "beta".to_string())
+    );
+
+    let (_, module) = parse_module(ir).unwrap();
+    // No module, so no declaration to disagree with -- and no `(named ...)`
+    // to resolve either, which is the documented cost of the entry point.
+    assert_eq!(
+        generate_def(&module.definitions[0]),
+        Err(Error::OpaqueType("M.Rec".to_string()))
+    );
 }

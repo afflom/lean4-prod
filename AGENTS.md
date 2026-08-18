@@ -74,6 +74,58 @@ What that means in practice, and what you must not regress:
 - No `git add`/`git commit`/other git mutations without the user's explicit go-ahead.
 - Verify gates below must actually pass before claiming a milestone done.
 
+## Crate topology (multi-backend split, 2026-08-11)
+
+Code generation is three crates, not one. The split exists so a second target
+(Python, C) costs a printer and a profile rather than a fork of the generator.
+
+```
+prod-ir          sexp IR: Module / TypeDecl / Definition / Expr. Parsing only.
+  |
+prod-lower       LANGUAGE-NEUTRAL. IR -> Target IR (`target::Body`, `TypeDef`).
+  |              Owns: TargetProfile, the fallibility fixpoint (`shape`),
+  |              name mangling and injectivity (`names`), every REJECTION
+  |              (`error::LowerError`).
+  |
+prod-emit-rust   The Rust printer. Total by construction: `emit_types` and
+  |              `emit_body` return `String`, never `Result`. Spelling only.
+  |
+prod-codegen     FACADE. Owns `Error` and `REJECTIONS` -- the published subset
+                 contract -- and the two entry points `generate_module` /
+                 `generate_def`. Nothing else. Its public API is consumed by
+                 prod-cli, prod-macros, prod-wasm and
+                 prod-codegen-compile-tests, and does not change.
+```
+
+Two rules keep this from collapsing back into one crate:
+
+- **Backend-specific knowledge belongs in a `TargetProfile`, never in a branch
+  inside `prod-lower`.** Whether `Nat.add` can fail is a property of the
+  target's `Nat`, declared once as `NatRepr`; whether division needs a
+  Euclidean correction is `DivisionSemantics`; whether a list needs a bounds
+  check is `ListStrategy`. A `if target == Rust` anywhere in `prod-lower` is
+  the design failure this split exists to prevent. The check is
+  `grep -rn "rust\|Rust" rust/prod-lower/src`, which should return doc
+  comments and the two `RUST` constants and nothing else.
+- **`TExpr` is total by construction; anything that can fail is a `Stmt`.**
+  Rust and Python can propagate an error inside an expression; C cannot. A
+  printer returning a `String` per expression node can serve the first two and
+  never the third, so the fallibility decision is made once, in `prod-lower`,
+  and read off the statement list by every printer.
+
+A corollary: **a printer cannot refuse.** Every rejection has to be made in
+`prod-lower`, including ones that look like rendering questions -- a signature
+type with no rendering, a constructor name that is not a valid path in the
+target. `prod-emit-rust` renders an unrenderable type as a placeholder
+identifier rather than an error, so a rejection missing from `prod-lower` does
+not surface as a `Result`; it surfaces as generated code that does not compile.
+
+`prod-codegen::Error` and `prod_lower::error::LowerError` are name-for-name and
+payload-for-payload, and `From<LowerError>` is the identity on names. That is
+deliberate: the conversion cannot invent a distinction the lowering did not
+make, so a rejection that must keep its published kind has to keep it in
+`LowerError`.
+
 ## Toolchain quirks (IMPORTANT)
 
 - lean/lake are NOT on PATH. Always run via the nix dev shell.
@@ -158,11 +210,12 @@ What that means in practice, and what you must not regress:
     `let`-bound list values. That environment is NOT optional: LCNF emits
     lists in A-normal form, so `digits`'s cons cells arrive as chains of
     `let`s, and materializing them would need the heap.
-  - Buffer exhaustion uses `split_first_mut`, not indexing — the generated
-    code has no bounds-check panic path at all.
-  - `Ok::<usize, crate::ComputeError>(0)` for `List.nil` is turbofished on
-    purpose: it is the one builder leaf that constrains neither type parameter
-    and it can sit under a `?`.
+  - Buffer exhaustion is an explicit bounds check emitted by `prod-lower`
+    beside every append, whose else-branch returns `OutputTooSmall`; the
+    generated code has no bounds-check panic path at all. (Until the
+    multi-backend cutover this was a nest of `split_first_mut`, which computes
+    the same function. The check moved into the lowering so three printers
+    cannot forget it three times.)
   - `prod-ir`'s `parse_i64` parses the magnitude as `i128` before narrowing;
     the old `digits.parse::<i64>().unwrap()` panicked on `i64::MIN`.
 
@@ -308,8 +361,10 @@ What that means in practice, and what you must not regress:
     `i64::MAX` cannot arise from Lean's bounded-`u64` `Nat` policy without
     already having overflowed). `Nat→UIntN` truncates and `UIntN→Nat` widens,
     both plain casts.
-    - **`Int.ofNat` is owned by `prod-codegen`'s `Expr::Ctor` arm, not by the
-      conversion table**, even though it converts `Nat → Int`. `Int` is
+    - **`Int.ofNat` is owned by the constructor path, not by the conversion
+      table**, even though it converts `Nat → Int`. (Since the multi-backend
+      split: admitted by `prod_lower::lower`'s builtin-constructor list and
+      spelled by `prod_emit_rust`'s `Printer::ctor`.) `Int` is
       `inductive Int | ofNat : Nat → Int | negSucc : Nat → Int`, so
       `Int.ofNat` is a *constructor*, and `Lower.lean`'s `lowerLetValue`
       checks `isCtorName` before consulting any operator/conversion

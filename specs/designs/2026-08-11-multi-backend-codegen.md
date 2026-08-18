@@ -1,6 +1,7 @@
 # Multi-backend code generation: the IR as a hub
 
-**Status:** design approved, not yet planned.
+**Status:** Plan 1 (the split) DONE, 2026-08-17. Plan 2 (Python end-to-end)
+not started.
 **Supersedes nothing.** Extends the pipeline described in
 `specs/designs/2026-08-08-lean-for-production-coverage.md` and builds on the
 invariant machinery from `specs/designs/2026-08-09-s2-scalar-completeness-and-invariants.md`.
@@ -128,12 +129,12 @@ lean/  (unchanged)
 
 | Crate | Responsibility | Status |
 |---|---|---|
-| `prod-ir` | LCNF surface. **Loses `NumKind::rust_type`** | exists, edited |
-| `prod-lower` | Target IR + lowering + `TargetProfile` + name injectivity | new |
-| `prod-emit-rust` | Rust printer | new, from existing code |
-| `prod-emit-python` | Python printer | new |
-| `prod-codegen` | Thin facade preserving today's public API | exists, gutted |
-| `prod-runtime-python` | Hand-written Python prelude | new |
+| `prod-ir` | LCNF surface. **Loses `NumKind::rust_type`** | DONE (plan 1) |
+| `prod-lower` | Target IR + lowering + `TargetProfile` + name injectivity | DONE (plan 1) |
+| `prod-emit-rust` | Rust printer | DONE (plan 1) |
+| `prod-emit-python` | Python printer | plan 2 |
+| `prod-codegen` | Thin facade preserving today's public API | DONE (plan 1) |
+| `prod-runtime-python` | Hand-written Python prelude | plan 2 |
 
 `prod-codegen` must keep its current surface so `prod-cli`, `prod-macros`,
 `prod-wasm` and `prod-codegen-compile-tests` do not churn. The proc macro in
@@ -400,6 +401,16 @@ written from this document:
 1. **The split.** `prod-lower`, Target IR, `TargetProfile`, name injectivity,
    `prod-emit-rust` at behavioural parity, printer snapshots. Nothing new ships
    to users; the deliverable is that Rust still works through the new seam.
+   **DONE 2026-08-17**, plan `specs/plans/2026-08-11-multi-backend-split.md`.
+   The old renderer is deleted; `prod-codegen` is a facade over `prod-lower` +
+   `prod-emit-rust` with its public API unchanged. Parity is *behavioural* and
+   what certifies it is `just prod`, which compiles the generated Rust and
+   executes every Lean-computed golden. Text differs in five known places, all
+   recorded in the Task 7 report: flat statement lists rather than nested
+   braces, `return` terminators in branches rather than block values,
+   branch-local temporaries never folded into their single use, a `__len`
+   cursor rather than nested `split_first_mut`, and an elided rather than
+   unit-bound join-point `let`.
 2. **Python end-to-end.** `prod-emit-python`, the prelude, generated
    assertions, the divergence registry, per-backend contracts, nix and CI.
 

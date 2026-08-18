@@ -8,9 +8,8 @@
 //! if not). That division of labour is why this function returns a `String`
 //! rather than a `Result`: there is nothing left here to refuse.
 //!
-//! This is the strangler-stage printer. `prod-codegen`'s `Renderer` still
-//! produces every byte of real output; nothing outside this crate's own tests
-//! calls [`emit_body`] or [`emit_types`] until the Task 7 cutover.
+//! `prod-codegen` is a facade over this crate and [`prod_lower`]: every byte
+//! of generated Rust comes from [`emit_types`] and [`emit_body`].
 
 #![no_std]
 
@@ -58,7 +57,7 @@ pub const fn rust_type(kind: NumKind) -> &'static str {
 pub fn emit_types(types: &[TypeDef]) -> String {
     let mut out = String::new();
     for def in types {
-        out.push_str(&emit_type(def));
+        out.push_str(&emit_type(def, types));
         out.push('\n');
     }
     out
@@ -66,7 +65,7 @@ pub fn emit_types(types: &[TypeDef]) -> String {
 
 /// One type: a struct if it has exactly one constructor, otherwise an enum
 /// with named-field variants.
-fn emit_type(def: &TypeDef) -> String {
+fn emit_type(def: &TypeDef, types: &[TypeDef]) -> String {
     let mut out = String::from("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
     if let [ctor] = &def.ctors[..] {
         // How "reachable only from generated code" is spelled. The decision
@@ -83,7 +82,7 @@ fn emit_type(def: &TypeDef) -> String {
         }
         out.push_str("}\n");
         if let Some(invariant) = &def.invariant {
-            out.push_str(&emit_checked_constructor(def, ctor, invariant));
+            out.push_str(&emit_checked_constructor(def, ctor, invariant, types));
         }
         return out;
     }
@@ -112,7 +111,12 @@ fn emit_type(def: &TypeDef) -> String {
 /// The invariant's field references are already the target identifiers the
 /// parameters are declared with, so the predicate reads them without any
 /// rebinding.
-fn emit_checked_constructor(def: &TypeDef, ctor: &CtorDef, invariant: &TExpr) -> String {
+fn emit_checked_constructor(
+    def: &TypeDef,
+    ctor: &CtorDef,
+    invariant: &TExpr,
+    types: &[TypeDef],
+) -> String {
     // An empty printer: the invariant is one total expression over the
     // structure's own fields, with no statement list around it and therefore
     // no temporary to fold and no `?` to place.
@@ -120,6 +124,7 @@ fn emit_checked_constructor(def: &TypeDef, ctor: &CtorDef, invariant: &TExpr) ->
         fallible: false,
         inline: BTreeMap::new(),
         uses: BTreeMap::new(),
+        types,
     };
     let predicate = printer.expr(invariant);
 
@@ -166,13 +171,20 @@ fn emit_checked_constructor(def: &TypeDef, ctor: &CtorDef, invariant: &TExpr) ->
 }
 
 /// Render one lowered definition as Rust source.
-pub fn emit_body(body: &Body) -> String {
+///
+/// `types` is the module's lowered type declarations, and it is not optional
+/// decoration: a Rust struct literal names its fields and a Rust match pattern
+/// names its variant, while the Target IR carries a constructor's arguments
+/// positionally under its Lean name. Without the table a
+/// [`TExpr::Ctor`] and a user-declared match arm have no spelling at all.
+pub fn emit_body(body: &Body, types: &[TypeDef]) -> String {
     let mut printer = Printer {
         // A caller-buffer definition returns `Result<usize, _>`, so its
         // `Return` needs the same `Ok(..)` a `Fallible` one does.
         fallible: matches!(body.shape, Shape::Fallible | Shape::Buffer),
         inline: BTreeMap::new(),
         uses: uses(&body.stmts),
+        types,
     };
 
     // A zero-argument list definition is promoted to a `&'static` slice, so
@@ -244,8 +256,8 @@ pub fn emit_body(body: &Body) -> String {
 /// Rust's spelling of [`SeqQuery::Len`]: how many elements have been appended
 /// to the output sequence so far.
 ///
-/// A generated name, in the same `__`-prefixed family `prod-codegen` already
-/// uses for its own buffer temporaries.
+/// A generated name, in the `__`-prefixed family the renderer this replaced
+/// used for its own buffer temporaries.
 const CURSOR: &str = "__len";
 
 /// The output buffer's parameter name, chosen by the lowering so that it
@@ -279,13 +291,17 @@ fn element_type(ty: &Type) -> String {
     }
 }
 
-struct Printer {
+struct Printer<'t> {
     fallible: bool,
     /// Temporaries that were folded back into their single use, and the text
     /// they render as.
     inline: BTreeMap<String, String>,
     /// How often each bound name is read, at every nesting level.
     uses: BTreeMap<String, Usage>,
+    /// The module's lowered type declarations: how a constructor's positional
+    /// arguments become named struct-literal fields, and how a match arm
+    /// becomes a variant pattern.
+    types: &'t [TypeDef],
 }
 
 #[derive(Default, Clone, Copy)]
@@ -296,7 +312,7 @@ struct Usage {
     same_level: usize,
 }
 
-impl Printer {
+impl Printer<'_> {
     fn block(&mut self, stmts: &[Stmt], depth: usize) -> String {
         let pad = "    ".repeat(depth);
         let mut out = String::new();
@@ -395,13 +411,12 @@ impl Printer {
 
     /// A `Switch` prints as a Rust `match`, one block per arm.
     ///
-    /// The constructor spellings that need no type table are the ones this
-    /// slice can render: the `Nat` structural-recursion pair LCNF emits, and
-    /// `Bool`/`Option`/`List`, whose Rust patterns are fixed. A user-declared
-    /// constructor needs the module's type table to know its path and its
-    /// field names, and that table reaches this printer at the Task 7
-    /// cutover; until then it renders positionally, exactly as `prod-codegen`
-    /// does for a constructor it cannot resolve.
+    /// The constructor spellings that need no type table are fixed here: the
+    /// `Nat` structural-recursion pair LCNF emits, and `Bool`/`Option`/`List`.
+    /// A user-declared constructor needs the module's type table to know its
+    /// path and its field names; anything the module does not declare renders
+    /// positionally, exactly as the renderer this replaced did for a
+    /// constructor it could not resolve.
     ///
     /// What it can no longer do is render an alternative whose binder count
     /// disagrees with the declaration: `prod_lower::lower::lower_def_in`
@@ -419,7 +434,7 @@ impl Printer {
         let scrut = self.expr(scrut);
         let mut out = format!("{}match {} {{\n", pad, scrut);
         for arm in arms {
-            let (pattern, prologue) = arm_pattern(&arm.ctor, &arm.binders, &scrut);
+            let (pattern, prologue) = arm_pattern(&arm.ctor, &arm.binders, &scrut, self.types);
             out.push_str(&format!("{}{} => {{\n", inner, pattern));
             for line in &prologue {
                 out.push_str(&format!("{}    {}\n", inner, line));
@@ -465,14 +480,60 @@ impl Printer {
             // lowering already checked against the declaration -- so there is
             // nothing here to refuse, only to spell.
             TExpr::Proj(_, field, value) => format!("({}).{}", self.expr(value), ident(field)),
-            // A constructor application does need the module's type table: a
-            // Rust struct literal names its fields, and the constructor's
-            // arguments arrive positionally. Threading the table into this
-            // printer is the Task 7 cutover's job, since that is where the
-            // lowered types and the lowered bodies first meet.
-            TExpr::Ctor(..) => {
-                unsupported("a struct literal needs the module's type table for its field names")
-            }
+            // A constructor application needs the module's type table: a Rust
+            // struct literal names its fields, and the constructor's
+            // arguments arrive positionally.
+            TExpr::Ctor(_, name, args) => self.ctor(name, args),
+        }
+    }
+
+    /// A constructor application.
+    ///
+    /// The first group are Lean's own constructors, which every module may use
+    /// without declaring: `Prod`, `Bool`, `Option` and `Int`'s two. Each has a
+    /// fixed Rust spelling, and `Int.ofNat`/`Int.negSucc` are the ones that
+    /// are easy to miss -- LCNF sees `(1 : Int)` as a constructor
+    /// application, so without them an `Int` literal would fall through to the
+    /// unresolved case.
+    ///
+    /// Everything else resolves against the module's declarations. The field
+    /// names come from the table because Rust's struct literal is by name and
+    /// the IR's argument list is by position; `prod_lower` has already checked
+    /// that the two have the same length, so the zip cannot drop one.
+    fn ctor(&self, name: &str, args: &[TExpr]) -> String {
+        let rendered: Vec<String> = args.iter().map(|a| self.expr(a)).collect();
+        match (name, rendered.len()) {
+            ("Prod.mk", _) => format!("({})", rendered.join(", ")),
+            ("Bool.true", 0) => String::from("true"),
+            ("Bool.false", 0) => String::from("false"),
+            ("Option.none", 0) => String::from("None"),
+            ("Option.some", 1) => format!("Some({})", rendered[0]),
+            // `Int`'s non-negative constructor: `(1 : Int)`, or any
+            // `Nat`-typed subexpression in an `Int` position, elaborates
+            // through this rather than through a bare numeral.
+            ("Int.ofNat", 1) => format!("(({}) as i64)", rendered[0]),
+            // `Int.negSucc n = -(n + 1)`.
+            ("Int.negSucc", 1) => format!("(-(({}) as i64) - 1)", rendered[0]),
+            _ => match resolve(self.types, name) {
+                Some((def, ctor)) if ctor.fields.is_empty() => ctor_path(def, ctor),
+                Some((def, ctor)) => {
+                    let bound = ctor
+                        .fields
+                        .iter()
+                        .zip(rendered.iter())
+                        .map(|((field, _), arg)| format!("{}: {}", field, arg))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{} {{ {} }}", ctor_path(def, ctor), bound)
+                }
+                // Undeclared. A DOTTED name never reaches here --
+                // `prod_lower` refuses it, because a Lean name is not a Rust
+                // path in expression position -- so what is left is a bare
+                // name, which is at least a valid path to something the host
+                // may supply by hand.
+                None if rendered.is_empty() => String::from(name),
+                None => format!("{}({})", name, rendered.join(", ")),
+            },
         }
     }
 
@@ -536,7 +597,7 @@ impl Printer {
         }
     }
 
-    /// The conversions, ported from `prod-codegen` unchanged. Each is a
+    /// The conversions, ported from the previous renderer unchanged. Each is a
     /// Lean fact: `Int.toNat` clamps, `Nat.toUIntN` truncates.
     ///
     /// The pairs with no rendering never arrive -- `prod_lower::lower`
@@ -689,6 +750,30 @@ fn unsupported(why: &str) -> String {
     format!("compile_error!(\"prod-emit-rust: {}\")", why)
 }
 
+/// A constructor's declaration, found by the Lean name the Target IR carries.
+///
+/// Keyed on the constructor rather than on the owner because that is the name
+/// both a [`TExpr::Ctor`] and an [`Arm`] actually write; the owner is what the
+/// lookup produces, since the Rust path needs it.
+fn resolve<'t>(types: &'t [TypeDef], lean_ctor: &str) -> Option<(&'t TypeDef, &'t CtorDef)> {
+    types.iter().find_map(|def| {
+        def.ctors
+            .iter()
+            .find(|ctor| ctor.lean_name == lean_ctor)
+            .map(|ctor| (def, ctor))
+    })
+}
+
+/// Where a constructor lives in Rust: one constructor means the type IS the
+/// struct, several mean it is a variant of the enum.
+fn ctor_path(def: &TypeDef, ctor: &CtorDef) -> String {
+    if def.ctors.len() == 1 {
+        format!("crate::{}", def.name)
+    } else {
+        format!("crate::{}::{}", def.name, ctor.name)
+    }
+}
+
 /// The Rust pattern for one arm, plus any bindings that have to happen inside
 /// the arm rather than in the pattern.
 ///
@@ -698,7 +783,12 @@ fn unsupported(why: &str) -> String {
 /// `saturating_sub(1)` is exact -- and stays inside the crate's bounded-`Nat`
 /// policy. Match ergonomics bind a slice's head by reference, so the cons arm
 /// rebinds it by value and arithmetic on it needs no dereference syntax.
-fn arm_pattern(ctor: &str, binders: &[String], scrut: &str) -> (String, Vec<String>) {
+fn arm_pattern(
+    ctor: &str,
+    binders: &[String],
+    scrut: &str,
+    types: &[TypeDef],
+) -> (String, Vec<String>) {
     let bound = |i: usize| ident(&binders[i]);
     match (ctor, binders.len()) {
         ("Nat.zero", 0) => (String::from("0"), Vec::new()),
@@ -715,25 +805,45 @@ fn arm_pattern(ctor: &str, binders: &[String], scrut: &str) -> (String, Vec<Stri
             format!("[{}, {} @ ..]", bound(0), bound(1)),
             alloc::vec![format!("let {} = *{};", bound(0), bound(0))],
         ),
-        (_, 0) => (String::from(ctor), Vec::new()),
-        _ => (
-            format!(
-                "{}({})",
-                ctor,
-                binders
-                    .iter()
-                    .map(|b| ident(b))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+        // A user-declared constructor: a variant path with named fields.
+        // `prod_lower` has already checked the binder count against the
+        // declaration, so the zip cannot silently drop a field.
+        _ => match resolve(types, ctor) {
+            Some((def, cdecl)) if cdecl.fields.is_empty() => (ctor_path(def, cdecl), Vec::new()),
+            Some((def, cdecl)) => (
+                format!(
+                    "{} {{ {} }}",
+                    ctor_path(def, cdecl),
+                    cdecl
+                        .fields
+                        .iter()
+                        .zip(binders.iter())
+                        .map(|((field, _), binder)| format!("{}: {}", field, ident(binder)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Vec::new(),
             ),
-            Vec::new(),
-        ),
+            None if binders.is_empty() => (String::from(ctor), Vec::new()),
+            None => (
+                format!(
+                    "{}({})",
+                    ctor,
+                    binders
+                        .iter()
+                        .map(|b| ident(b))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Vec::new(),
+            ),
+        },
     }
 }
 
 /// A `Fail` is a terminator, so it prints as one.
 ///
-/// `Unreachable` keeps `prod-codegen`'s `unreachable!()`: LCNF emits it only
+/// `Unreachable` keeps the previous renderer's `unreachable!()`: LCNF emits it only
 /// for a branch Lean itself proved dead, so it is not reachable on
 /// caller-controlled input, and there is no `ComputeError` variant for "the
 /// impossible happened" to report instead.

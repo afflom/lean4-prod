@@ -13,5 +13,9 @@ lean_lib Example where
   roots := #[`Example]
 
 @[default_target]
+lean_lib Conformance where
+  roots := #[`Conformance]
+
+@[default_target]
 lean_exe «prod-export» where
   root := `Prod.Emit

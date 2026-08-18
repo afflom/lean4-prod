@@ -7,7 +7,26 @@ members = [
     "prod-core",
     "prod-cli",
     "prod-wasm",
+    "prod-alloc-counter",
 ]
+
+# Baseline guardrails for every crate that opts in with `[lints] workspace =
+# true`. `prod-wasm` cannot: `#[wasm_bindgen]` expands to `unsafe` code in the
+# annotated crate, and `forbid` is not overridable. `prod-alloc-counter` cannot
+# either — a `GlobalAlloc` implementation is inherently unsafe, which is
+# precisely why it lives in its own test-only crate instead of in `prod-core`.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+# Release build with the debug checks left on: the lane where an arithmetic
+# assumption that silently wraps in `release` still trips loudly. Generated
+# code uses `checked_*` rather than bare operators, so this mainly guards the
+# hand-written host crates and the runtime support.
+[profile.release-assertions]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
 
 [workspace.dependencies]
 nom = { version = "7", default-features = false }

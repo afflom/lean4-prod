@@ -18,13 +18,22 @@ corresponding IR nodes. Design decisions:
   counted in `LowerState.dropped` so the caller can emit an arity note.
   `let` bindings with `LetValue.erased` values (proofs) register their binder
   name but emit no binding and no opaque marker — proofs are erased by design.
-- **Operator whitelist**: `Nat.add/sub/mul/div/mod/shiftLeft/pow` map to the
-  IR binary ops (`pow` was added to prod-ir in M3 for `belt`). Any other
-  constant becomes `(call <last-component> ...)`; if the callee is not itself
-  `@[prod]`-tagged it is recorded as an *extern call* for the coverage report.
+- **Operator whitelist**: `Nat.add/sub/mul/div/mod/shiftLeft/shiftRight/pow`
+  map to the IR binary ops (`pow` was added to prod-ir in M3 for `belt`;
+  `shiftRight` maps to `shr`, a total/infallible IR node distinct from `shl`
+  — `a >>> b = 0` for `b ≥ 64` since `Nat` is unbounded, so there is no
+  overflow case to report). `Nat.shiftRight` reaches lowering both from `>>>`
+  written directly and from LCNF's `n / 2` peephole (division by a
+  power-of-two literal); either way it is just another whitelisted name by
+  the time lowering sees it. Any other constant becomes an *unresolved
+  call*: if the callee is `@[prod]`-tagged it is `(call <last-component>
+  ...)`, otherwise it is recorded for the coverage report and emitted as
+  `(extern "Full.Name" ...)` — a node codegen refuses, rather than a `call`
+  to a function nobody generated.
 - **Constructors** (detected via the environment, e.g. `Prod.mk`) become
-  `(ctor "Full.Name" ...)`; structure projections become
-  `(proj "Full.TypeName" idx x)`.
+  `(ctor "Full.Name" ...)`; structure projections resolve their LCNF index to
+  the declared field name here, where the environment is available, and
+  become `(proj "Full.TypeName" "fieldName" x)`.
 - **Decidable-if rewrite**: `if a < b then T else F` (and the `≤`/`=`
   analogues) compiles to `let c := Nat.decLt/Nat.decLe/Nat.decEq/
   instDecidableEqNat a b` followed by `cases c` over `Decidable.isFalse`/
@@ -33,6 +42,11 @@ corresponding IR nodes. Design decisions:
   as an extern `decLt` call and `Decidable.*` ctor patterns, neither of which
   has a Rust rendering. Only the immediately-bound shape is recognized;
   anything else still lowers as an extern call.
+- **Decidable-as-Bool rewrite**: `a < b : Bool` (no surrounding `if`) compiles
+  to the same decider call followed by `Decidable.decide c` rather than
+  `cases`. Lowered directly to the IR comparison expression `(lt|le|eq a b)`,
+  which is valid outside an `if` too. Same immediately-bound-shape caveat as
+  above; anything else still lowers as an extern call to `decide`.
 - **Closures** (`Code.fun`) lower to `(opaque "<name>-closure")` plus a
   coverage note — closures are phase-2 work. Impure-phase-only constructors
   never occur at the pure phase; wildcard arms keep the matches total.
@@ -44,8 +58,6 @@ namespace Prod
 
 /-- Static lowering configuration. -/
 structure LowerCtx where
-  /-- Lean type rendered as the IR `Instance` type (e.g. `UorAtlas.Instance`). -/
-  instanceType : Name
   /-- `@[prod]`-tagged names: calls to these are internal, not extern. -/
   tagged : Array Name
 
@@ -171,16 +183,21 @@ def lowerArgs (args : Array (Arg .pure)) : LowerM (Array String) := do
 private def spaced (xs : Array String) : String :=
   if xs.isEmpty then "" else " " ++ String.intercalate " " xs.toList
 
+/-- `.const` operator whitelist as an (LCNF constant name, IR binary op)
+    association list. Single source of truth for both `opWhitelist` (what the
+    lowerer accepts) and `subsetJson` (the published contract, `Prod.Emit`) —
+    extracted so the two cannot drift apart. `pow` was added to prod-ir in M3
+    for `belt`; `shiftRight` maps to `shr`, a total/infallible IR node
+    distinct from `shl` — `a >>> b = 0` for `b ≥ 64` since `Nat` is unbounded,
+    so there is no overflow case to report. -/
+def natOpNames : List (Name × String) :=
+  [ (`Nat.add, "add"), (`Nat.sub, "sub"), (`Nat.mul, "mul"), (`Nat.div, "div"),
+    (`Nat.mod, "mod"), (`Nat.shiftLeft, "shl"), (`Nat.shiftRight, "shr"),
+    (`Nat.pow, "pow") ]
+
 /-- `.const` operator whitelist: Lean kernel Nat ops → IR binary ops. -/
-def opWhitelist : Name → Option String
-  | `Nat.add => some "add"
-  | `Nat.sub => some "sub"
-  | `Nat.mul => some "mul"
-  | `Nat.div => some "div"
-  | `Nat.mod => some "mod"
-  | `Nat.shiftLeft => some "shl"
-  | `Nat.pow => some "pow"
-  | _ => none
+def opWhitelist (n : Name) : Option String :=
+  (natOpNames.find? (fun p => p.1 == n)).map (·.2)
 
 private def isCtorName (env : Environment) (n : Name) : Bool :=
   match env.find? n with
@@ -194,7 +211,22 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
   | .erased => opaqueNode "erased"
   | .proj typeName idx struct => do
     let s ← lookupFVar struct
-    return s!"(proj \"{typeName}\" {idx} {s})"
+    let env ← getEnv
+    -- Resolve the index to a field name here, where the environment is
+    -- available. Emitting the index instead would force codegen to keep a
+    -- parallel table, and a disagreement between the two swaps fields
+    -- silently. LCNF projection indices are into the *declared* field list
+    -- (including `Prop` fields), which is exactly what `getStructureFields`
+    -- returns, so no filtering is applied before indexing. No name-keyed
+    -- special cases here, not even for `UorAtlas.Instance`: the declared
+    -- spelling passes through unmodified for every structure, so the
+    -- `(type ...)` declaration and the `(proj ...)` reference can never
+    -- disagree — both are generated from the same `getStructureFields` call.
+    let fields := getStructureFields env typeName
+    let field := match fields[idx]? with
+      | some n => sanitize n
+      | none => s!"field_{idx}"
+    return s!"(proj \"{typeName}\" \"{field}\" {s})"
   | .const declName _ args => do
     let env ← getEnv
     let args' ← lowerArgs args
@@ -204,15 +236,19 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     | some op =>
       if args'.size == 2 then
         return s!"({op} {args'[0]!} {args'[1]!})"
-      -- partial/unusual application of a whitelisted op: keep it callable
+      -- partial/unusual application of a whitelisted op: not a 2-arg operator
+      -- use, and not necessarily `@[prod]`-tagged either, so it is the same
+      -- kind of unresolved callee as the `none` case below.
       modify fun st => { st with externs := st.externs.push s!"{declName} (unusual application)" }
-      return s!"(call {lastComponent declName}{spaced args'})"
+      return s!"(extern \"{declName}\"{spaced args'})"
     | none =>
       if (← read).tagged.contains declName then
         -- internal call to another @[prod]-tagged definition
         return s!"(call {lastComponent declName}{spaced args'})"
       modify fun st => { st with externs := st.externs.push (toString declName) }
-      return s!"(call {lastComponent declName}{spaced args'})"
+      -- Emit a distinct node rather than a `call`: codegen must refuse this,
+      -- not render a Rust call to a function nobody generated.
+      return s!"(extern \"{declName}\"{spaced args'})"
   | .fvar f args => do
     let nm ← lookupFVar f
     let args' ← lowerArgs args
@@ -223,15 +259,20 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     | none => return s!"(call {nm}{spaced args'})"
   | _ => opaqueNode "letvalue"  -- impure-phase-only constructors
 
+/-- The decider constants recognized by `decidableIf?`/`decideOf?`, paired
+    with their IR comparison operator. Single source of truth for both
+    `deciderOp` and `subsetJson` (`Prod.Emit`), so the published contract
+    cannot list a decider the lowerer does not actually accept, or omit one
+    it does. `instDecidableEqNat` appears in LCNF when the instance wrapper
+    is not unfolded (unlike the arithmetic dictionaries). -/
+def deciderNames : List (Name × String) :=
+  [ (``Nat.decLt, "lt"), (``Nat.decLe, "le"), (``Nat.decEq, "eq"),
+    (``instDecidableEqNat, "eq") ]
+
 /-- The decider constants recognized by `decidableIf?`, mapped to their IR
-    comparison operator. `instDecidableEqNat` appears in LCNF when the
-    instance wrapper is not unfolded (unlike the arithmetic dictionaries). -/
-def deciderOp : Name → Option String
-  | ``Nat.decLt => some "lt"
-  | ``Nat.decLe => some "le"
-  | ``Nat.decEq => some "eq"
-  | ``instDecidableEqNat => some "eq"
-  | _ => none
+    comparison operator. -/
+def deciderOp (n : Name) : Option String :=
+  (deciderNames.find? (fun p => p.1 == n)).map (·.2)
 
 /-- Recognize the LCNF shape of `if a < b then T else F` (and the `≤`/`=`
     analogues): `let c := <decider> a b` immediately followed by `cases c`
@@ -256,6 +297,24 @@ def decidableIf? (decl : LetDecl .pure) (k : Code .pure)
     | _ => failure
   return (op, a, b, ← else?, ← then?)
 
+/-- Recognize the LCNF shape of a decidable comparison used as a plain `Bool`
+    value (as opposed to the `if`-consuming shape `decidableIf?` handles):
+    `let c := <decider> a b` immediately followed by `let x := Decidable.decide
+    c`. Binds `x` directly to the IR comparison expression, skipping the
+    intermediate decider binding — `Eq`/`Lt`/`Le`/`Gt` are already valid IR
+    expressions outside an `if`, not just inside one. Returns the operator,
+    the compared fvars, the `decide` binding, and its continuation. Only the
+    immediately-bound shape is recognized; anything else still lowers as an
+    extern call to `decide`. -/
+def decideOf? (decl : LetDecl .pure) (k : Code .pure)
+    : Option (String × FVarId × FVarId × LetDecl .pure × Code .pure) := do
+  let .const decider _ #[.fvar a, .fvar b] := decl.value | failure
+  let op ← deciderOp decider
+  let .let decl2 k2 := k | failure
+  let .const ``Decidable.decide _ #[.erased, .fvar f] := decl2.value | failure
+  guard (f == decl.fvarId)
+  return (op, a, b, decl2, k2)
+
 partial def lowerCode : Code .pure → LowerM String
   | .let decl k => do
     let nm ← registerFVar decl.fvarId decl.binderName
@@ -266,6 +325,14 @@ partial def lowerCode : Code .pure → LowerM String
       let else' ← lowerCode elseCode
       let then' ← lowerCode thenCode
       return s!"(if ({op} {a'} {b'}) {then'} {else'})"
+    | none =>
+    match decideOf? decl k with
+    | some (op, a, b, decl2, k2) =>
+      let nm2 ← registerFVar decl2.fvarId decl2.binderName
+      let a' ← lookupFVar a
+      let b' ← lookupFVar b
+      let body ← lowerCode k2
+      return s!"(let {nm2} ({op} {a'} {b'}) {body})"
     | none =>
     match decl.value with
     | .erased =>
@@ -318,14 +385,14 @@ partial def lowerCode : Code .pure → LowerM String
 
 /-- Lower an LCNF type expression to the IR type grammar. -/
 partial def lowerType (e : Expr) : LowerM String := do
-  let ctx ← read
   match e with
   | .const ``Nat _ => return "Nat"
   | .const ``Bool _ => return "Bool"
   | .const ``Int _ => return "Int"
   | .const n _ =>
-    if n == ctx.instanceType then return "Instance"
-    opaqueType n
+    match (← getEnv).find? n with
+    | some (.inductInfo _) => return s!"(named \"{n}\")"
+    | _ => opaqueType n
   | .app (.app (.const ``Prod _) a) b =>
     return s!"(Tuple {← lowerType a} {← lowerType b})"
   | .app (.const ``List _) a =>
@@ -335,8 +402,9 @@ partial def lowerType (e : Expr) : LowerM String := do
   | _ =>
     match e.getAppFn with
     | .const n _ =>
-      if n == ctx.instanceType then return "Instance"
-      opaqueType n
+      match (← getEnv).find? n with
+      | some (.inductInfo _) => return s!"(named \"{n}\")"
+      | _ => opaqueType n
     | _ => opaqueNode "type-expr"
 
 /-- Strip exactly `n` leading `∀`-binders: the LCNF `Signature.type` is the
@@ -366,5 +434,101 @@ def lowerDecl (ctx : LowerCtx) (d : Decl .pure) : CoreM (String × LowerState) :
 def indent (n : Nat) (s : String) : String :=
   let pad := String.ofList (List.replicate n ' ')
   String.intercalate "\n" ((s.splitOn "\n").map (pad ++ ·))
+
+/-- Is this expression a `Prop`? Prop-valued structure fields are erased and
+    never reach the IR. Runs in `MetaM` because `isProp` needs the local
+    context machinery. -/
+def isPropType (e : Expr) : LowerM Bool :=
+  liftM (Lean.Meta.MetaM.run' (Lean.Meta.isProp e))
+
+/-- Render one inductive as an IR `(type ...)` declaration, erasing `Prop`
+    fields.
+
+    A type outside the supported fragment is still declared, carrying the
+    reason: codegen then rejects a reference to it by name ("needs
+    monomorphization") instead of reporting a generic unknown type. Returns
+    `none` only when the constant is not an inductive at all. -/
+def lowerTypeDecl (typeName : Name) : LowerM (Option String) := do
+  let env ← getEnv
+  let some (.inductInfo iv) := env.find? typeName | return none
+  let unsupported? : Option String :=
+    if iv.numParams != 0 then some "type parameters"
+    else if iv.numIndices != 0 then some "type indices"
+    else if iv.all.length != 1 then some "mutual inductive block"
+    else if iv.isRec then some "recursive"
+    else none
+  if let some reason := unsupported? then
+    return some s!"(type \"{typeName}\" (unsupported \"{reason}\"))"
+  let mut ctorSexps : Array String := #[]
+  for ctorName in iv.ctors do
+    let some (.ctorInfo cv) := env.find? ctorName | return none
+    -- Walk the constructor telescope past the (zero) type params to reach the
+    -- value fields, pairing each with its declared name.
+    let fieldNames := getStructureFields env typeName
+    let mut fields : Array String := #[]
+    let mut ty := cv.type
+    let mut i := 0
+    while i < cv.numFields do
+      match ty with
+      | .forallE _ fieldTy rest _ =>
+        if !(← isPropType fieldTy) then
+          let nm := match fieldNames[i]? with
+            | some n => sanitize n
+            | none => s!"field_{i}"
+          fields := fields.push s!"({nm} {← lowerType fieldTy})"
+        ty := rest
+        i := i + 1
+      | _ => i := cv.numFields
+    ctorSexps := ctorSexps.push s!"(ctor \"{ctorName}\"{spaced fields})"
+  return some s!"(type \"{typeName}\"{spaced ctorSexps})"
+
+/-- Type names a single LCNF `LetValue` mentions: a constructor application
+    names its inductive, a projection names the structure it projects from.
+    These are exactly the two places `lowerLetValue` emits a full Lean type or
+    constructor name into the IR, so they are exactly the places codegen needs
+    a matching `(type ...)` declaration for. -/
+def letValueTypeNames (env : Environment) (v : LetValue .pure) : Array Name :=
+  match v with
+  | .proj typeName _ _ => #[typeName]
+  | .const declName _ _ =>
+    match env.find? declName with
+    | some (.ctorInfo cv) => #[cv.induct]
+    | _ => #[]
+  | _ => #[]
+
+/-- Every type name constructed or projected anywhere in a definition's body. -/
+partial def codeTypeNames (env : Environment) : Code .pure → Array Name
+  | .let decl k => letValueTypeNames env decl.value ++ codeTypeNames env k
+  | .fun (.mk _ _ _ _ v) k => codeTypeNames env v ++ codeTypeNames env k
+  | .jp (.mk _ _ _ _ v) k => codeTypeNames env v ++ codeTypeNames env k
+  | .cases (.mk _ _ _ alts) =>
+    alts.foldl (init := #[]) fun acc a =>
+      match a with
+      | .alt _ _ c => acc ++ codeTypeNames env c
+      | .default c => acc ++ codeTypeNames env c
+  | _ => #[]
+
+/-- Every named type a declaration needs declared: the head constant of each
+    parameter and return type, **plus** every type its body constructs or
+    projects. Only the head constant matters — parameterised types are out of
+    scope.
+
+    The body half is not an optimization. A definition like
+    `def f (n : Nat) := (NoProp.mk n n).alpha` mentions `NoProp` nowhere in its
+    signature, so a signature-only walk never declares it; codegen then has no
+    declaration to resolve `(ctor "Conformance.NoProp.mk" ...)` against and
+    used to fall through to emitting the dotted Lean name as if it were a Rust
+    path. Declaring body-reachable types is what makes that definition
+    generate real Rust. (Codegen refuses the dotted path outright now too —
+    that is the backstop for IR this function did not produce.) -/
+def declTypeNames (env : Environment) (d : Decl .pure) : Array Name := Id.run do
+  let mut out : Array Name := #[]
+  for p in d.params do
+    if let .const n _ := p.type.getAppFn then out := out.push n
+  if let .const n _ := (stripForalls d.params.size d.type).getAppFn then
+    out := out.push n
+  match d.value with
+  | .code c => return out ++ codeTypeNames env c
+  | _ => return out
 
 end Prod

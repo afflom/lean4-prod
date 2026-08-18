@@ -172,6 +172,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "prod-alloc-counter"
+version = "0.1.0"
+
+[[package]]
 name = "prod-cli"
 version = "0.1.0"
 dependencies = [
@@ -193,6 +197,7 @@ dependencies = [
 name = "prod-core"
 version = "0.1.0"
 dependencies = [
+ "prod-alloc-counter",
  "prod-ir",
  "prod-macros",
 ]

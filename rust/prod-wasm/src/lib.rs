@@ -74,8 +74,11 @@ mod tests {
     #[test]
     fn generate_returns_rust() {
         let source = generate("(module M (def inc ((x Nat)) Nat (add x 1)))").unwrap();
-        assert!(source.contains("pub fn inc"));
-        assert!(source.contains("checked_add(1).expect(\"Lean Nat addition overflow\")"));
+        assert!(source.contains("pub fn inc(x: u64) -> Result<u64, crate::ComputeError>"));
+        assert!(source.contains("checked_add(1).ok_or(crate::ComputeError::AddOverflow)?"));
+        // Overflow is reported, never panicked: the wasm shell renders the
+        // same allocation-free, panic-free code as the proc macro.
+        assert!(!source.contains(".expect("));
     }
 
     #[test]
@@ -89,6 +92,13 @@ mod tests {
         // `d` matches `a` on size/depth and loses only on check time;
         // `b` is dominated by `a` on all three objectives.
         let output: RootFile = serde_json::from_str(&roots_pareto(json).unwrap()).unwrap();
-        assert_eq!(output.roots.iter().map(|root| root.id.as_str()).collect::<Vec<_>>(), ["a", "c"]);
+        assert_eq!(
+            output
+                .roots
+                .iter()
+                .map(|root| root.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c"]
+        );
     }
 }

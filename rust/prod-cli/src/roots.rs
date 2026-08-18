@@ -48,8 +48,8 @@ pub struct CheckReport {
 
 pub fn load(path: impl AsRef<Path>) -> Result<Vec<Root>, String> {
     let path = path.as_ref();
-    let contents = fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     serde_json::from_str::<RootFile>(&contents)
         .map(|file| file.roots)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))
@@ -188,7 +188,11 @@ pub fn bridges(roots: &[Root]) -> Vec<Bridge> {
                 .cloned()
                 .collect::<Vec<_>>();
             if !shared.is_empty() {
-                result.push(Bridge { left, right, shared });
+                result.push(Bridge {
+                    left,
+                    right,
+                    shared,
+                });
             }
         }
     }

@@ -1,8 +1,34 @@
 # Plan: align generated code with the Rust best-practices standard
 
-**Status: DOCUMENTED ONLY — implementation deferred at user request
-(2026-08-06). Pick up from here later. Do not implement without the user's
-go-ahead.**
+**Status: IMPLEMENTED 2026-08-08.** All steps below are done and gated
+(`lake build`, `lake exe prod-export`, `just prod` — which now includes
+`test-assertions` and `no-alloc` — `just wasm-check`, `just lint`,
+`cargo fmt --check`). Two design points changed during implementation; the
+sections below have been left as originally written, with the deviations
+recorded here:
+
+1. **Intermediate `let`-bound List values are supported, not an error.** The
+   plan assumed they were "not needed by current defs". They are: LCNF emits
+   lists in A-normal form, so the real `digits` in `kernel.ir` binds every
+   cons/nil to a `let`. Builder mode therefore carries a scoped environment
+   mapping those bindings to their expressions and resolves them instead of
+   materializing them. Genuinely unrenderable list positions (a list used as
+   an ordinary intermediate value, or nested inside another type) still fail
+   honestly as `Error::UnsupportedList`; `Type::Vec` fails as
+   `Error::HeapType`.
+2. **`OutputTooSmall` is a unit variant, not `{ required, provided }`.** A
+   recursive builder discovers exhaustion one element at a time while walking
+   into the tail of a caller slice, so at the failure point it knows only that
+   at least one more element was needed — not the total the whole call would
+   have required. Reporting fabricated numbers would be worse than reporting
+   none, and the caller already knows the length it supplied.
+
+Implementation notes beyond the plan: the counting allocator lives in a
+separate test-only crate (`rust/prod-alloc-counter`) so that `prod-core` can
+keep `unsafe_code = "forbid"` across *all* of its targets rather than relaxing
+it to `deny` for one test file; `prod-wasm` likewise opts out of the workspace
+`forbid` because `#[wasm_bindgen]` expands to unsafe code. The workspace also
+received its first `cargo fmt` pass, so unrelated files are reformatted.
 
 Source standard: https://gist.github.com/auser/c3161f55a8393faa8af5ddda68c6befa
 (normative MUST/SHOULD engineering guide: memory profiles, no panic on

@@ -106,7 +106,7 @@ caller-controlled input, and no heap allocation.** Concretely:
 
 ```sh
 nix develop              # lean4 + rust + just (or: install lean4 4.30.0 and rust manually)
-just prod                # lake exe prod-export && cargo test
+just prod                # compiles proof fixtures, exports, then runs cargo tests
 ```
 
 Lean side:
@@ -124,6 +124,36 @@ Rust side:
 ```rust
 prod_macros::prod_defs! { ir = "kernel.ir" }   // typed, zero-cost Rust fns
 ```
+
+### C headers and foreign-function calls
+
+The CLI can generate both sides of a small, explicit C ABI: a header for C
+callers and Rust `extern "C"` wrappers that invoke the generated definitions.
+The first ABI supports scalar `Nat` (`uint64_t`), `Int` (`int64_t`), and
+`Bool` (`uint8_t`, where zero is false). A checked Lean definition returns a
+`*_result_t` with a `status` code and `value`; status zero means success.
+
+```sh
+mkdir -p output
+cargo run -p prod-cli -- header rust/prod-core/kernel.ir \
+  --output output/kernel.h \
+  --rust-output output/kernel_ffi.rs
+```
+
+Include the generated wrapper after the proc-macro expansion in the crate
+that owns the generated definitions:
+
+```rust
+prod_macros::prod_defs! { ir = "kernel.ir" }
+include!("../../output/kernel_ffi.rs");
+```
+
+Definitions with lists, generated structs or enums, options, tuples, or other
+composite values are omitted and named in a comment in the header instead of
+getting an invented ABI. If an IR module has no scalar definitions, the
+command fails. Those composite values need an explicit buffer/ownership and
+layout contract before they can safely cross a C ABI. The header and wrapper
+are generated artifacts; do not hand-edit either file.
 
 ## Roots (proof-graph analysis)
 
@@ -158,6 +188,8 @@ those as warnings while using the dependency names to resolve graph edges.
 
 - `lean/Prod/` — the extractor: attribute, LCNF extraction, lowering, roots,
   coverage, emit. Generic; not tied to the example.
+- `lean/ProofFixtures.lean` — standalone kernel-checked theorem fixtures;
+  `just lean-fixtures` compiles them without adding them to production export.
 - `lean/Example/` — worked example: the UOR Atlas coordinate kernel with
   machine-checked proofs (no mathlib — `decide`/`omega`/`rfl` discipline).
 - `rust/prod-ir`, `rust/prod-codegen` — `no_std` + `alloc` portable core.

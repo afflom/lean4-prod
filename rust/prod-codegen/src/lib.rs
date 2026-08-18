@@ -103,12 +103,16 @@
 
 extern crate alloc;
 
+mod c_abi;
+
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, Type, TypeDecl};
+
+pub use c_abi::{generate_c_bindings, CAbiError, CBindings};
 
 /// Errors that can occur during code generation
 #[derive(Debug, Clone, PartialEq, Eq)]

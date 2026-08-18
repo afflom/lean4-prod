@@ -7,7 +7,7 @@
 
 mod roots;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
 use std::path::Path;
 
@@ -59,6 +59,23 @@ enum Commands {
         #[arg(long, default_value = "lean4_prod")]
         library_name: String,
     },
+    /// Generate SDK artifacts for one language only.
+    Sdk {
+        /// Path to the exported IR file
+        path: String,
+        /// Language artifact to generate
+        #[arg(value_enum, short, long)]
+        language: SdkLanguage,
+        /// Root directory for generated SDK artifacts
+        #[arg(short, long, default_value = "output")]
+        output: String,
+        /// Bundle name and generated artifact stem
+        #[arg(long, default_value = "lean4-prod")]
+        stem: String,
+        /// Native library name used by the Rust/Kotlin SDKs
+        #[arg(long, default_value = "lean4_prod")]
+        library_name: String,
+    },
     /// Validate an IR file (check for unsupported constructs)
     Validate {
         /// Path to the IR file
@@ -77,6 +94,15 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+}
+
+#[derive(Clone, ValueEnum)]
+enum SdkLanguage {
+    C,
+    Rust,
+    Python,
+    Typescript,
+    Kotlin,
 }
 
 /// The Lean half of the subset contract, written by `prod-export`
@@ -272,6 +298,81 @@ fn main() {
             fs::write(kotlin_dir.join("Lean4Prod.kt"), bindings.kotlin)
                 .unwrap_or_else(|e| panic!("Failed to write Kotlin SDK: {}", e));
             println!("Generated SDK bundle: {}", root.display());
+        }
+        Commands::Sdk {
+            path,
+            language,
+            output,
+            stem,
+            library_name,
+        } => {
+            let content = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {}", path, e));
+            let (_, module) = prod_ir::parser::parse_module(&content)
+                .unwrap_or_else(|e| panic!("Parse error: {:?}", e));
+            let bindings = prod_codegen::generate_sdks(&module, &library_name)
+                .unwrap_or_else(|e| panic!("SDK generation error: {}", e));
+            let root = Path::new(&output).join(&stem);
+
+            match language {
+                SdkLanguage::C => {
+                    let directory = root.join("c");
+                    fs::create_dir_all(&directory).unwrap_or_else(|e| {
+                        panic!("Failed to create {}: {}", directory.display(), e)
+                    });
+                    let header = directory.join(format!("{}.h", stem));
+                    let wrapper = directory.join(format!("{}_ffi.rs", stem));
+                    fs::write(&header, bindings.c_header)
+                        .unwrap_or_else(|e| panic!("Failed to write {}: {}", header.display(), e));
+                    fs::write(&wrapper, bindings.c_wrapper)
+                        .unwrap_or_else(|e| panic!("Failed to write {}: {}", wrapper.display(), e));
+                    println!(
+                        "Generated C SDK: {} and {}",
+                        header.display(),
+                        wrapper.display()
+                    );
+                }
+                SdkLanguage::Rust => {
+                    let directory = root.join("rust");
+                    fs::create_dir_all(&directory).unwrap_or_else(|e| {
+                        panic!("Failed to create {}: {}", directory.display(), e)
+                    });
+                    let path = directory.join("lib.rs");
+                    fs::write(&path, bindings.rust)
+                        .unwrap_or_else(|e| panic!("Failed to write {}: {}", path.display(), e));
+                    println!("Generated Rust SDK: {}", path.display());
+                }
+                SdkLanguage::Python => {
+                    let directory = root.join("python");
+                    fs::create_dir_all(&directory).unwrap_or_else(|e| {
+                        panic!("Failed to create {}: {}", directory.display(), e)
+                    });
+                    let path = directory.join(format!("{}.py", stem.replace('-', "_")));
+                    fs::write(&path, bindings.python)
+                        .unwrap_or_else(|e| panic!("Failed to write {}: {}", path.display(), e));
+                    println!("Generated Python SDK: {}", path.display());
+                }
+                SdkLanguage::Typescript => {
+                    let directory = root.join("typescript");
+                    fs::create_dir_all(&directory).unwrap_or_else(|e| {
+                        panic!("Failed to create {}: {}", directory.display(), e)
+                    });
+                    let path = directory.join("index.ts");
+                    fs::write(&path, bindings.typescript)
+                        .unwrap_or_else(|e| panic!("Failed to write {}: {}", path.display(), e));
+                    println!("Generated TypeScript SDK: {}", path.display());
+                }
+                SdkLanguage::Kotlin => {
+                    let directory = root.join("kotlin");
+                    fs::create_dir_all(&directory).unwrap_or_else(|e| {
+                        panic!("Failed to create {}: {}", directory.display(), e)
+                    });
+                    let path = directory.join("Lean4Prod.kt");
+                    fs::write(&path, bindings.kotlin)
+                        .unwrap_or_else(|e| panic!("Failed to write {}: {}", path.display(), e));
+                    println!("Generated Kotlin SDK: {}", path.display());
+                }
+            }
         }
         Commands::Validate { path } => {
             let content = fs::read_to_string(&path)

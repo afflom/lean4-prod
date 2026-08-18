@@ -21,6 +21,27 @@ sdks ir="rust/prod-core/goldens.ir" stem="lean4-prod" library_name="lean4_prod":
     mkdir -p output
     RUSTC_WRAPPER= cargo run --manifest-path rust/Cargo.toml -p prod-cli -- sdks {{ir}} --output output --stem {{stem}} --library-name {{library_name}}
 
+# Generate one SDK language under ./output/<stem>. The language-specific
+# aliases below are convenient entry points; use this recipe for scripts.
+sdk language="rust" ir="rust/prod-core/goldens.ir" stem="lean4-prod" library_name="lean4_prod":
+    mkdir -p output
+    RUSTC_WRAPPER= cargo run --manifest-path rust/Cargo.toml -p prod-cli -- sdk {{ir}} --language {{language}} --output output --stem {{stem}} --library-name {{library_name}}
+
+sdk-c ir="rust/prod-core/goldens.ir" stem="lean4-prod" library_name="lean4_prod":
+    just sdk c {{ir}} {{stem}} {{library_name}}
+
+sdk-rust ir="rust/prod-core/goldens.ir" stem="lean4-prod" library_name="lean4_prod":
+    just sdk rust {{ir}} {{stem}} {{library_name}}
+
+sdk-python ir="rust/prod-core/goldens.ir" stem="lean4-prod" library_name="lean4_prod":
+    just sdk python {{ir}} {{stem}} {{library_name}}
+
+sdk-typescript ir="rust/prod-core/goldens.ir" stem="lean4-prod" library_name="lean4_prod":
+    just sdk typescript {{ir}} {{stem}} {{library_name}}
+
+sdk-kotlin ir="rust/prod-core/goldens.ir" stem="lean4-prod" library_name="lean4_prod":
+    just sdk kotlin {{ir}} {{stem}} {{library_name}}
+
 # Export prod from lean
 prod-export:
     cd lean && lake exe prod-export

@@ -200,6 +200,7 @@ dependencies = [
  "prod-alloc-counter",
  "prod-ir",
  "prod-macros",
+ "prod-runtime",
 ]
 
 [[package]]
@@ -220,6 +221,10 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "prod-runtime"
+version = "0.1.0"
 
 [[package]]
 name = "prod-wasm"

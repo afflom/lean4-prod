@@ -192,6 +192,22 @@ current favourite over inferring map/fold shapes from LCNF), whether the
 threading primitive is generated or supplied by the caller, and how it composes
 with S5's monomorphisation.
 
+#### S8 execution slice
+
+The first execution slice is now implemented in the host-only `prod-runtime`
+crate. `parallel_map` accepts caller-owned input/output slices, clamps a
+non-zero worker count to the input length, assigns contiguous disjoint chunks,
+and joins workers in chunk order. Worker errors and panics are reported after
+all workers have joined. This makes independent generated functions runnable
+in parallel without adding threads, allocation, or an executor to the
+portable `no_std` generated core.
+
+This is deliberately not the proof-carrying automatic codegen described by
+the full S8 milestone: the caller must supply a pure independent generated
+function, and async callers must place the blocking driver on their runtime's
+blocking pool. Lean-side parallel intent and generated map/fold adapters remain
+the next S8 slice.
+
 ## S0 — The honest boundary
 
 Keep the existing layering: **Lean describes faithfully, Rust refuses to

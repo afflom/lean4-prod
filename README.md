@@ -96,11 +96,36 @@ caller-controlled input, and no heap allocation.** Concretely:
 - Lists only flow in the two supported directions described above. Building a
   list into an intermediate value, or nesting one inside another type, fails
   codegen rather than allocating.
-- Data-parallel codegen is not implemented. Generated functions are pure and
-  `Send`/`Sync` by construction, so they are safe to call from a parallel
-  driver, but nothing here spawns work.
+- Automatic data-parallel codegen is not implemented, but the optional
+  `prod-runtime` host crate provides a bounded deterministic driver for
+  independent generated calls. Generated functions remain synchronous, pure,
+  and allocation-free; async applications should invoke the driver from their
+  runtime's blocking pool.
 - The wasm package houses the portable half (parse + codegen + roots). The
   Lean extractor itself is native-only.
+
+### Bounded parallel execution
+
+Generated functions stay synchronous so the same code remains usable in
+`no_std`, wasm, and FFI targets. Host applications can run independent calls
+with the optional `prod-runtime` crate:
+
+```rust
+use prod_runtime::parallel_map;
+
+let inputs = [/* caller-owned inputs */];
+let mut outputs = [/* caller-owned output slots */];
+parallel_map(&inputs, &mut outputs, 4, |input, output| {
+    *output = generated_function(*input)?;
+    Ok(())
+})?;
+```
+
+The driver uses at most the requested number of workers, assigns disjoint
+contiguous chunks, and joins in input order. A failed worker is returned after
+all workers have joined. Async applications should call it from their
+executor's blocking pool rather than pretending the CPU-bound function is
+non-blocking.
 
 ## Quick start
 

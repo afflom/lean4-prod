@@ -30,3 +30,4 @@ prod-macros = { path = "../prod-macros" }
 # Test-only: quarantines the `unsafe impl GlobalAlloc` this crate's own
 # `forbid(unsafe_code)` would otherwise reject. See `tests/no_alloc.rs`.
 prod-alloc-counter = { path = "../prod-alloc-counter" }
+prod-runtime = { path = "../prod-runtime" }

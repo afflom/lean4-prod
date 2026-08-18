@@ -21,6 +21,16 @@ unused_must_use = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+# A slice index is a panic path even where an argument says it cannot be taken.
+# The generated list writers used to have two; the internal Rust printer now
+# spells both as `get_mut`.
+#
+# Note what this lint does and does not reach: clippy skips proc-macro
+# expansions, so it never saw `prod_defs!`'s output and would not have caught
+# those two. It holds THIS crate's hand-written half -- the runtime support the
+# generated code calls into -- to the same rule, which is the half a lint can
+# actually police.
+indexing_slicing = "deny"
 
 [dependencies]
 prod-ir = { path = "../prod-ir" }

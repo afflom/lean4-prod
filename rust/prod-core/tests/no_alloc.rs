@@ -20,7 +20,9 @@ use prod_core::{
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-const CANONICAL: Instance = Instance { q: 4, T: 3, O: 8 };
+// `Instance` carries an invariant, so its fields are `pub(crate)` and this is
+// an integration test — external to the crate. This was a `const`; a `const`
+// cannot call a fallible constructor, so it is built inside the test with `?`.
 
 /// Run `body`, and fail if it caused any heap activity.
 ///
@@ -55,51 +57,66 @@ fn generated_definitions_never_touch_the_heap() -> Result<(), ComputeError> {
         "the counting allocator is not installed; the no-alloc assertions prove nothing"
     );
 
-    // Scalar definitions.
-    assert_eq!(assert_no_allocation("stride", || stride(CANONICAL))?, 24);
+    // Built outside every `assert_no_allocation` region below, so the
+    // measurements cover the generated definitions and not the constructor.
+    let canonical = Instance::new(4, 3, 8)?;
+
+    // The checked constructor itself, on both paths: the invariant check is
+    // plain comparisons, and `InvariantViolated` carries a `&'static str`, so
+    // neither accepting nor rejecting can touch the heap.
+    assert_no_allocation("Instance::new (accepted)", || Instance::new(4, 3, 8))?;
     assert_eq!(
-        assert_no_allocation("class_count", || class_count(CANONICAL))?,
+        assert_no_allocation("Instance::new (rejected)", || Instance::new(0, 3, 8)),
+        Err(ComputeError::InvariantViolated("UorAtlas.Instance"))
+    );
+
+    // Scalar definitions.
+    assert_eq!(assert_no_allocation("stride", || stride(canonical))?, 24);
+    assert_eq!(
+        assert_no_allocation("class_count", || class_count(canonical))?,
         96
     );
-    assert_eq!(assert_no_allocation("belt", || belt(CANONICAL))?, 12_288);
+    assert_eq!(assert_no_allocation("belt", || belt(canonical))?, 12_288);
     assert_eq!(
-        assert_no_allocation("classIndex", || classIndex(1, 2, 3, CANONICAL))?,
+        assert_no_allocation("classIndex", || classIndex(1, 2, 3, canonical))?,
         43
     );
     assert_eq!(
-        assert_no_allocation("classDecode", || classDecode(43, CANONICAL))?,
+        assert_no_allocation("classDecode", || classDecode(43, canonical))?,
         (1, (2, 3))
     );
 
     // Recursion, guards, and `Option`.
     assert_eq!(
-        assert_no_allocation("digitCount", || digitCount(10, 43, CANONICAL))?,
+        assert_no_allocation("digitCount", || digitCount(10, 43, canonical))?,
         2
     );
     assert!(assert_no_allocation("sameClass", || sameClass(
-        43, 44, CANONICAL
+        43, 44, canonical
     ))?);
     assert!(assert_no_allocation("smallEnough", || smallEnough(
-        100, CANONICAL
+        100, canonical
     ))?);
     assert_eq!(
-        assert_no_allocation("tryClassDecode", || tryClassDecode(43, CANONICAL))?,
+        assert_no_allocation("tryClassDecode", || tryClassDecode(43, canonical))?,
         Some((1, (2, 3)))
     );
 
     // The list path: a caller-owned buffer in, a borrowed slice back out.
     // This is the case that used to allocate a `Box`-linked list per cons.
     let mut buffer = [0u64; 64];
-    let len = assert_no_allocation("digits", || digits(10, 43, CANONICAL, &mut buffer))?;
-    assert_eq!(&buffer[..len], &[3, 5]);
+    let len = assert_no_allocation("digits", || digits(10, 43, canonical, &mut buffer))?;
+    assert_eq!(written(&buffer, len), &[3, 5]);
     assert_eq!(
-        assert_no_allocation("digitSum", || digitSum(&buffer[..len]))?,
+        assert_no_allocation("digitSum", || digitSum(written(&buffer, len)))?,
         8
     );
 
     // Error construction and propagation must be allocation-free too — an
     // error path that allocates is still an allocation on hostile input.
-    let overflowing = Instance { q: 1, T: 1, O: 70 };
+    // `1, 1, 70` satisfies the invariant, so `new` accepts it; it is `belt`'s
+    // power that overflows.
+    let overflowing = Instance::new(1, 1, 70)?;
     assert_eq!(
         assert_no_allocation("belt overflow", || belt(overflowing)),
         Err(ComputeError::PowOverflow)
@@ -109,11 +126,22 @@ fn generated_definitions_never_touch_the_heap() -> Result<(), ComputeError> {
         assert_no_allocation("digits into an undersized buffer", || digits(
             10,
             43,
-            CANONICAL,
+            canonical,
             &mut too_small
         )),
         Err(ComputeError::OutputTooSmall)
     );
 
     Ok(())
+}
+
+/// The initialized prefix of a list builder's output buffer, taken without an
+/// index.
+///
+/// `prod-core` denies `clippy::indexing_slicing`: the rule that keeps a panic
+/// path out of the generated writer keeps one out of the test that exercises
+/// it too, so this returns the empty prefix rather than panicking on a `len`
+/// the buffer cannot cover.
+fn written<T>(buffer: &[T], len: usize) -> &[T] {
+    buffer.get(..len).unwrap_or(&[])
 }

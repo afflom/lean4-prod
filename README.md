@@ -117,6 +117,9 @@ Lean side:
 
 ```sh
 cd lean && lake exe prod-export   # → rust/prod-core/{kernel,goldens}.ir, roots.json, coverage.md
+
+cargo run --manifest-path rust/Cargo.toml -- gen rust/prod-core/kernel.ir
+# → output/rust/kernel.rs (use --stdout to print instead)
 ```
 
 Rust side:
@@ -124,6 +127,93 @@ Rust side:
 ```rust
 prod_macros::prod_defs! { ir = "kernel.ir" }   // typed, zero-cost Rust fns
 ```
+
+## Exporting a Lean project
+
+The export boundary is the generated sexp IR. A Lean project is compiled and
+exported on the native Lean side; language tooling then consumes the IR. The
+checked-in `prod-export` executable is wired to this repository's `Example`,
+`Conformance`, and `ConformanceRejected` modules. For another project, use the
+same `Prod` library and start from `lean/Prod/Emit.lean` as the project-local
+exporter template, changing its target module imports and output metadata.
+
+### 1. Tag the definitions to export
+
+Import the attribute and mark runtime definitions with `@[prod]`:
+
+```lean
+import Prod.Attribute
+
+namespace MyProject
+
+@[prod] def double (n : Nat) : Nat := n + n
+
+end MyProject
+```
+
+The exporter runs Lean's compiler frontend, so the definition must stay inside
+the published subset in [`specs/lean-for-production.md`](specs/lean-for-production.md).
+The same export also produces proof-root metadata and coverage information.
+
+### 2. Export the IR and metadata
+
+From this repository, the reference exporter can place all generated
+intermediate files under `output/ir`:
+
+```sh
+mkdir -p output/ir
+cd lean
+lake exe prod-export --out ../output/ir
+cd ..
+```
+
+This writes `kernel.ir`, `roots.json`, `coverage.md`, `goldens.ir`, and the
+conformance/subset artifacts. In a project-local exporter, keep the same
+portable `.ir` boundary but choose paths appropriate for that project.
+
+### 3. Consume the IR by target
+
+| Target | How to use it | Status |
+|---|---|---|
+| Rust source | `cargo run --manifest-path rust/Cargo.toml -- gen output/ir/kernel.ir` | Implemented |
+| Rust proc macro | `prod_macros::prod_defs! { ir = "output/ir/kernel.ir" }` | Implemented |
+| WebAssembly generator | call `prod_wasm::generate(ir)` from the wasm-bindgen shell | Implemented; returns Rust source |
+| Python, C, or TypeScript source | no emitter is included yet | Planned |
+
+The Rust CLI writes to `output/rust/<module>.rs` by default. Use an explicit
+path or stdout when needed:
+
+```sh
+cargo run --manifest-path rust/Cargo.toml -- gen output/ir/kernel.ir \
+  --output output/rust/my_project.rs
+cargo run --manifest-path rust/Cargo.toml -- gen output/ir/kernel.ir --stdout
+```
+
+For compile-time generation, the proc-macro path is relative to the invoking
+crate's `CARGO_MANIFEST_DIR`:
+
+```rust
+// Generated functions use crate::ComputeError for fallible definitions.
+pub use prod_core::ComputeError;
+
+prod_macros::prod_defs! {
+    ir = "output/ir/kernel.ir"
+}
+```
+
+The WebAssembly package is a browser-friendly shell around the portable IR
+parser and Rust emitter; it is not a separate source-language backend:
+
+```sh
+cd rust
+RUSTC="$(rustup which --toolchain stable rustc)" \
+  rustup run stable cargo build -p prod-wasm --target wasm32-unknown-unknown
+```
+
+Adding another language follows the same boundary: preserve the Lean exporter
+and `prod-lower` target-neutral IR, then add a printer for that language. Until
+such a printer exists, the library cannot export Python, C, or TypeScript
+source even though the IR is designed to support additional backends.
 
 ## Roots (proof-graph analysis)
 
@@ -160,10 +250,12 @@ those as warnings while using the dependency names to resolve graph edges.
   coverage, emit. Generic; not tied to the example.
 - `lean/Example/` — worked example: the UOR Atlas coordinate kernel with
   machine-checked proofs (no mathlib — `decide`/`omega`/`rfl` discipline).
-- `rust/prod-ir`, `rust/prod-codegen` — `no_std` + `alloc` portable core.
+- `rust/prod-ir`, `rust/prod-codegen` — `no_std` + `alloc` portable core;
+  `prod-codegen` contains the internal Rust emitter.
 - `rust/prod-macros`, `rust/prod-cli` — thin native shells.
 - `rust/prod-wasm` — wasm-bindgen API: `generate(ir)` and `roots_pareto(json)`.
 - `rust/prod-core` — runtime types + generated definitions + golden tests.
+- `output/rust/` — ignored source files written by `prod gen`.
 
 ## Roadmap
 

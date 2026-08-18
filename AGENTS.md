@@ -55,12 +55,82 @@ What that means in practice, and what you must not regress:
   drifted regeneration shows up as a reviewable diff instead of silently not
   existing: `lean/Conformance/golden.ir` (pinned by `just conformance`,
   rewritten and accepted with `just conformance-bless` — review the diff
-  first) and `specs/lean-for-production.md` (pinned by `just subset-check`,
+  first, then commit; the gate diffs against `HEAD`, not the index, so
+  staging alone will not make `just prod` pass) and
+  `specs/lean-for-production.md` (pinned by `just subset-check`,
   part of `just prod`; there is no bless step, just rerun `just subset` and
   review+commit the diff). Never hand-edit either.
+- Every golden in `goldens.ir` must be **consumed**. `goldenEntries`
+  (`lean/Prod/Emit.lean`) and the assertions in
+  `prod-codegen-compile-tests/tests/smoke.rs` /
+  `prod-core/tests/macro_generation.rs` are hand-maintained lists with no
+  mechanical relationship, and that is exactly how this milestone's only
+  defect shipped green: Lean computed `golden_u8_shl_1_8 = 1`, the assertion
+  beside it said `0`, and nothing compared them.
+  `prod-codegen-compile-tests/tests/goldens_consumed.rs` now fails the build
+  for any `golden_*` name that appears in neither consumer. Adding a golden
+  without an assertion is a build failure, not an oversight nobody notices.
 - The old repo at `~/work/rust/mine/lean-four-prod/` is READ-ONLY reference.
 - No `git add`/`git commit`/other git mutations without the user's explicit go-ahead.
 - Verify gates below must actually pass before claiming a milestone done.
+
+## Crate topology (multi-backend split, 2026-08-11)
+
+Code generation is three crates, not one. The split exists so a second target
+(Python, C) costs a printer and a profile rather than a fork of the generator.
+
+```
+prod-ir          sexp IR: Module / TypeDecl / Definition / Expr. Parsing only.
+  |
+prod-lower       LANGUAGE-NEUTRAL. IR -> Target IR (`target::Body`, `TypeDef`).
+  |              Owns: TargetProfile, the fallibility fixpoint (`shape`),
+  |              name mangling and injectivity (`names`), every REJECTION
+  |              (`error::LowerError`).
+  |
+prod-codegen     FACADE plus the internal Rust printer. Owns `Error` and
+                 `REJECTIONS` -- the published subset contract -- and the two
+                 entry points `generate_module` / `generate_def`. Its internal
+                 `emit_rust` module is total by construction: `emit_types` and
+                 `emit_body` return `String`, never `Result`. Its public API is
+                 consumed by prod-cli, prod-macros, prod-wasm and
+                 prod-codegen-compile-tests, and does not change.
+```
+
+Two rules keep this from collapsing back into one crate:
+
+- **Backend-specific knowledge belongs in a `TargetProfile`, never in a branch
+  inside `prod-lower`.** Whether `Nat.add` can fail is a property of the
+  target's `Nat`, declared once as `NatRepr`; whether division needs a
+  Euclidean correction is `DivisionSemantics`; whether a list needs a bounds
+  check is `ListStrategy`; whether a sized-integer result needs an explicit
+  `& (2^w - 1)` is `sized_mask_required`. A `if target == Rust` anywhere in
+  `prod-lower` is
+  the design failure this split exists to prevent. The check is
+  `grep -rni rust rust/prod-lower/src`: every hit must be a comment, a test,
+  or one of the three constants that merely NAME a target as data --
+  `TargetProfile::RUST`, `NamePolicy::RUST` and `RUST_KEYWORDS`. A hit in
+  non-test control flow is the failure. (Case-insensitive on purpose: the
+  earlier spelling here, `grep -rn "rust\|Rust"`, matched neither `RUST`
+  constant, so the one thing it claimed to find was the one thing it could
+  not.)
+- **`TExpr` is total by construction; anything that can fail is a `Stmt`.**
+  Rust and Python can propagate an error inside an expression; C cannot. A
+  printer returning a `String` per expression node can serve the first two and
+  never the third, so the fallibility decision is made once, in `prod-lower`,
+  and read off the statement list by every printer.
+
+A corollary: **a printer cannot refuse.** Every rejection has to be made in
+`prod-lower`, including ones that look like rendering questions -- a signature
+type with no rendering, a constructor name that is not a valid path in the
+target. The internal Rust emitter renders an unrenderable type as a placeholder
+identifier rather than an error, so a rejection missing from `prod-lower` does
+not surface as a `Result`; it surfaces as generated code that does not compile.
+
+`prod-codegen::Error` and `prod_lower::error::LowerError` are name-for-name and
+payload-for-payload, and `From<LowerError>` is the identity on names. That is
+deliberate: the conversion cannot invent a distinction the lowering did not
+make, so a rejection that must keep its published kind has to keep it in
+`LowerError`.
 
 ## Toolchain quirks (IMPORTANT)
 
@@ -146,11 +216,22 @@ What that means in practice, and what you must not regress:
     `let`-bound list values. That environment is NOT optional: LCNF emits
     lists in A-normal form, so `digits`'s cons cells arrive as chains of
     `let`s, and materializing them would need the heap.
-  - Buffer exhaustion uses `split_first_mut`, not indexing — the generated
-    code has no bounds-check panic path at all.
-  - `Ok::<usize, crate::ComputeError>(0)` for `List.nil` is turbofished on
-    purpose: it is the one builder leaf that constrains neither type parameter
-    and it can sit under a `?`.
+  - Buffer exhaustion is an explicit bounds check emitted by `prod-lower`
+    beside every append, whose else-branch returns `OutputTooSmall`. That is
+    what makes exhaustion an `Err`. Separately, the generated code contains no
+    slice index at all: the internal Rust printer spells the append as
+    `if let Some(__slot) = output.get_mut(__len)` and the recursive tail as
+    `output.get_mut(__len..).unwrap_or(&mut [])`, so the absence of a panic
+    path is a property of the emitted TEXT and does not rest on the bounds
+    check being adjacent. Both halves are needed: the printer cannot see the
+    check (`bounded` is lowering-local), and the check cannot make an index
+    safe by standing next to it. `prod-core` denies
+    `clippy::indexing_slicing` to hold its hand-written runtime to the same
+    rule — though note clippy does not lint proc-macro expansions, so that
+    deny never sees `prod_defs!`'s output. (Until the multi-backend cutover
+    this was a nest of `split_first_mut`, which computes the same function.
+    The check moved into the lowering so three printers cannot forget it
+    three times.)
   - `prod-ir`'s `parse_i64` parses the magnitude as `i128` before narrowing;
     the old `digits.parse::<i64>().unwrap()` panicked on `i64::MIN`.
 
@@ -194,20 +275,200 @@ What that means in practice, and what you must not regress:
     conformance golden (`lean/Conformance/golden.ir`) are the project's two
     committed generated artifacts — see the "Rules (hard)" section above for
     their bless/regenerate workflows. The operator whitelist
-    (`Prod.natOpNames`) and decider list (`Prod.deciderNames`) in `Lower.lean`
+    (`Prod.numOpNames`) and decider list (`Prod.deciderNames`) in `Lower.lean`
     are each a single association list consumed by both the lowerer
-    (`opWhitelist`/`deciderOp`) and the exporter (`subsetJson`), so the
-    contract cannot list an operator/decider the lowerer does not actually
-    accept, or omit one it does.
-  - One documented, deliberate gap: `Prop` fields (e.g. `Instance.valid : q
-    ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1`) are erased on export, so the generated Rust struct
-    does not enforce the invariant its Lean source states — see the "Erased
-    invariants" note in `specs/lean-for-production.md`.
+    (`opWhitelist`/`deciderOp`) and the exporter (`subsetJson`). What that
+    buys differs between the two, and the difference matters — the same
+    over-reading was already falsified once for conversions (see the
+    `## Conversions` note below):
+      - **Deciders: both directions hold.** `deciderOp` is the sole
+        acceptance route for a decidable guard, so the contract can neither
+        list a decider the lowerer rejects nor omit one it accepts.
+      - **Operators: only one direction holds.** The contract cannot list an
+        operator `opWhitelist` does not accept — but it *does* omit accepted
+        ones. `natDictOp`/`natHDictOp`, consulted by `knownOpOf` on the
+        dictionary path (below), accept thirteen further constants
+        (`instAddNat`, `instSubNat`, `instMulNat`, `instNatPowNat`,
+        `instDiv`, `instMod`, `instHAdd`, `instHSub`, `instHMul`, `instHDiv`,
+        `instHMod`, `instHPow`, `instPowNat`) that appear in no contract row.
+        So read `## Operators` as "every listed operator is really accepted",
+        not as "this is everything the lowerer accepts".
+  - The **dictionary path** is that second acceptance route, and it hard-codes
+    kind `"Nat"`. Lean's `a + b` can reach LCNF as an `instHAdd`/`instAddNat`
+    dictionary bound to a local, then applied; `knownOpOf` recognizes the
+    dictionary constant, records `(op, kind)` in `knownOps`, and
+    `lowerLetValue`'s `.fvar` arm emits the operator when the local is
+    applied to two arguments. Every row in both tables says `"Nat"`, because
+    every constant in them is a `Nat` dictionary — but the *wrapper* names
+    (`instHAdd`, `instHPow`, `instPowNat`, …) are not `Nat`-specific, so a
+    non-`Nat` operation that reached lowering through an unfolded wrapper
+    would be tagged `Nat` and mis-rendered. That is not a hypothetical worry:
+    `Int.pow` reaches `instHPow` → `instPowNat` → `instance : NatPow Int`.
+    It is settled empirically rather than by reasoning —
+    `Conformance.c_int_pow` pins the answer as `(pow Int a b)` in the golden,
+    because LCNF resolves the whole chain to the `Int.pow` constant and
+    `opWhitelist` matches first. **Any new non-`Nat` operator whose
+    typeclass wrapper is one of those thirteen names needs its own
+    conformance case before its contract row can be believed.**
+  - `Prop` fields (e.g. `Instance.valid : q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1`) are erased
+    on export, since they are proofs and have no runtime representation. As
+    of S2 Phase B1 the *proposition* is no longer erased with them when it
+    falls inside the lowerable fragment — see "S2 Phase B1" below and the
+    "Erased invariants" note in `specs/lean-for-production.md`.
 
-Known remaining limitations: typed Lean `Int` semantics is NOT implemented
-(generated Nat is u64 with the bounded policy: checked add/mul/shl/pow,
-saturating sub, total div/mod-by-zero). Arbitrary-precision Nat is ruled OUT by
-the no-heap directive, not merely unimplemented. Closures (`Code.fun`) still
+- S2 Phase A (`specs/designs/2026-08-09-s2-scalar-completeness-and-invariants.md`,
+  plan `specs/plans/2026-08-09-s2-phase-a-arithmetic.md`) DONE: `Int` and
+  sized-integer (`UInt8`…`UInt64`) arithmetic, plus conversions between
+  kinds. What this adds on top of S0/S1:
+  - **Arithmetic nodes carry an explicit `NumKind`**
+    (`Nat | Int | U8 | U16 | U32 | U64`) rather than codegen inferring the
+    kind — `(add Nat a b)`, `(add Int a b)`, `(add U8 a b)` are distinct IR
+    nodes. Lean emits the tag because it already sees `Nat.add` vs `Int.add`
+    vs `UInt8.add`; codegen guessing would recreate the derive-it-twice
+    pattern that has already swapped a struct field once in this project. An
+    unhandled `(op, kind)` combination is `Error::UnsupportedKind`, a compile
+    error, never a fallback rendering.
+  - **Three arithmetic policies, and they differ on purpose, not by
+    oversight:**
+    - `Nat` (→ `u64`): `add`/`mul`/`pow`/`shl` are `checked_*(..).ok_or(..)?`
+      (can genuinely overflow `u64` since Lean's `Nat` is unbounded); `sub`
+      saturates at 0 (Lean `Nat` subtraction); `div`/`mod` are total
+      (zero-divisor gives `0`/the dividend); `shr` (`shiftRight`) is total
+      via `checked_shr(..).unwrap_or(0)` — infallible because `a >>> b = 0`
+      for any `b ≥ 64` once `a` fits `u64`, unlike `shl`, which has no such
+      absorbing case.
+    - `Int` (→ `i64`): `add`/`sub`/`mul`/`pow`/unary `neg` are
+      `checked_*(..).ok_or(..)?`. **Division and modulo are Euclidean, not
+      truncating** — Lean's `/`/`%` on `Int` resolve to `Int.ediv`/`Int.emod`,
+      not the truncating `Int.div`/`Int.mod`
+      (`Init/Data/Int/DivMod/Basic.lean:108-118`: *"The `Div Int` and `Mod
+      Int` instances use `Int.ediv` and `Int.emod` for compatibility with
+      SMT-LIB"*; doctest `(-12) % 7 = 2`, where Rust's `%` gives `-5`).
+      Rendered as `checked_div_euclid`/`checked_rem_euclid` behind a
+      zero-guard (`checked_` covers `i64::MIN / -1`, which overflows where
+      Lean's unbounded `Int` does not); zero-divisor is total, same as `Nat`.
+      Shifts are not whitelisted for `Int` at all (`Error::UnsupportedKind`).
+    - `UIntN` (→ `u8`/`u16`/`u32`/`u64`): **entirely infallible.** `add`/
+      `sub`/`mul` are `wrapping_*` (BitVec arithmetic wraps by definition —
+      `Init/Data/UInt/Basic.lean:33`: `UInt8.add a b = ⟨a.toBitVec +
+      b.toBitVec⟩`); `div`/`mod` are total (zero ⇒ 0, `Init/Data/BitVec/
+      Basic.lean:271`); `shl`/`shr` are `wrapping_shl`/`wrapping_shr`, which
+      **mask** the shift amount mod the width (`1u8 <<< 8` masks to `1u8 <<<
+      0 == 1`) rather than truncating to 0 the way `Nat`'s unbounded `shr`
+      does — a `checked_shr(..).unwrap_or(0)` rendering here would be wrong
+      (it would give `0`, not `1`), which is why sized shifts get their own
+      `wrapping_shift` helper instead of reusing `Nat`'s `total_shift`. `pow`
+      is rejected outright (`Error::UnsupportedKind`), not rendered:
+      `wrapping_pow`'s `u32` exponent has no absorbing case the way shifts
+      do, so narrowing a `u64` exponent to it would silently compute a
+      different number, and Lean whitelists no sized `pow` so nothing real is
+      lost.
+    A definition using only `UIntN` therefore keeps its plain (non-`Result`)
+    return type through the existing `Shape` fixpoint, exactly like a `Nat`
+    definition with no checked op in it.
+  - **Conversions between kinds** (`Expr::Convert(NumKind, NumKind, Box<Expr>)`,
+    grammar `(convert Nat Int a)`): the lossless/total set only —
+    `Nat↔Int`, `UIntN→Nat`, `Nat→UIntN` — with cross-width sized conversions
+    (`UInt8↔UInt32`) rejected as `Error::UnsupportedKind`, a deliberate
+    non-goal. `Int.toNat` **clamps** negatives to 0
+    (`(-5).toNat = 0`); a bare `as u64` cast would wrap `-5` to
+    `18446744073709551611`, so it renders `(v).max(0) as u64`, not a cast.
+    `Nat→Int` renders a plain `as i64` cast (widening; a `u64` above
+    `i64::MAX` cannot arise from Lean's bounded-`u64` `Nat` policy without
+    already having overflowed). `Nat→UIntN` truncates and `UIntN→Nat` widens,
+    both plain casts.
+    - **`Int.ofNat` is owned by the constructor path, not by the conversion
+      table**, even though it converts `Nat → Int`. (Since the multi-backend
+      split: admitted by `prod_lower::lower`'s builtin-constructor list and
+      spelled by the internal Rust printer's constructor path.) `Int` is
+      `inductive Int | ofNat : Nat → Int | negSucc : Nat → Int`, so
+      `Int.ofNat` is a *constructor*, and `Lower.lean`'s `lowerLetValue`
+      checks `isCtorName` before consulting any operator/conversion
+      whitelist — every occurrence (an explicit call, or a `Nat`-typed
+      literal elaborating into an `Int` position) is intercepted there and
+      lowered as `(ctor "Int.ofNat" ...)`, never as `(convert Nat Int ...)`.
+      Confirmed by export, not assumed. A row for `Int.ofNat` in
+      `Lower.lean`'s `conversionNames` would be dead code; there is deliberately
+      only one handler.
+    - **`Nat.toUInt8`/`toUInt16`/`toUInt32`/`toUInt64` are NOT the constant
+      names that reach lowering**, despite existing as that spelling
+      (`Init/Data/UInt/BasicAux.lean`). Each is `abbrev Nat.toUIntN :=
+      UIntN.ofNat`, and Lean's compiler unfolds the abbrev before the
+      `.const` reaches LCNF — confirmed empirically by export, not
+      constructed and assumed: a conformance def using `a.toUInt8` (and the
+      other three widths) lowers to `extern "UInt8.ofNat"` (etc.), never
+      `extern "Nat.toUIntN"`. `conversionNames`'s `Nat → UIntN` row is
+      therefore `ty ++ \`ofNat`, not the source-level spelling. The `UIntN →
+      Nat` direction (`UInt8.toNat` etc.) IS a genuine `def`, so that half's
+      constructed spelling is exact.
+  - The published contract's S1-era `Int` qualifier ("renders as i64; no Int
+    operators are whitelisted") is gone: `specs/lean-for-production.md` now
+    has a `## Conversions` section alongside `## Operators`, generated from
+    `Prod.conversionNames` the same way `## Operators` is generated from
+    `Prod.numOpNames`. That single-source-of-truth mechanism guarantees only
+    that the *conversion-table* rows cannot drift from what `conversionWhitelist`
+    accepts — it is narrower than "the contract omits no accepted conversion":
+    `Nat → Int` is accepted too, via the `Int.ofNat`/`Int.negSucc`
+    constructors (see above), which never populate `conversionNames` and so
+    never appear under `## Conversions`. That case is documented instead in
+    the `Int` type blurb in `subsetJson` (`lean/Prod/Emit.lean`), which is the
+    one place in the generated contract a reader can confirm `Nat → Int`
+    works at all.
+
+- S2 Phase B1 (`specs/designs/2026-08-09-s2-scalar-completeness-and-invariants.md`,
+  "Phase B") DONE: **invariant-carrying types**. A structure's `Prop` fields
+  are still erased, but the proposition they state is lowered to a boolean
+  expression over the structure's own fields and re-checked in Rust.
+  - **Two published shapes, and the difference is visible in the struct.**
+    Lowerable → `pub(crate)` fields, a checked `pub fn new(..) -> Result<Self,
+    ComputeError>` returning `ComputeError::InvariantViolated(<full Lean type
+    name>)`, and one accessor per field. Not lowerable → `pub` fields, no
+    `impl` block, invariant not enforced (the pre-B1 behaviour). Never a
+    partial check.
+  - **Generated code bypasses the check on purpose.** In-crate, generated code
+    still builds these types by struct literal, because Lean already supplied
+    the proof; calling `new` there would turn proved-total functions fallible
+    and put a `Result` on every construction. That is why the fields are
+    `pub(crate)` and not private — the enforcement boundary is the crate
+    boundary, which is exactly where the proof was erased. `prod-core`'s
+    `spectral.rs` unit tests deliberately exercise the in-crate bypass with
+    `Instance { q: 0, T: 0, O: 0 }`, which is why the saturating arithmetic
+    there is still load-bearing.
+  - **The lowerable fragment** (`lowerProp`, `lean/Prod/Lower.lean`):
+    conjunction, disjunction, negation, and the comparisons `=`/`≤`/`<`/`≥`/`>`
+    (`≥`/`>` lower to `le`/`lt` with operands swapped; `≠` is `Ne` and is NOT
+    handled — spell it `¬ (a = b)`).
+  - **The numeric-kind restriction is real and applied, not just documented.**
+    `propCmpKinds = [Nat, Int] ++ sizedKinds` — comparisons lower ONLY on
+    those kinds. `Bool` is deliberately absent, so `flagA = flagB` does not
+    lower and a structure whose only `Prop` field is that gets no constructor
+    at all. The corpus case pinning this is
+    `Conformance.NonNumericCompare` in `lean/Conformance/golden.ir`, which
+    must keep appearing there with NO `(invariant ...)`. This restriction was
+    at one point documented in the docstring but not enforced by the code —
+    `Eq` matched on any type as long as both operands were field references —
+    which is why the check now exists and the corpus case pins it.
+  - **An invariant on a multi-constructor type is rejected**
+    (`Error::UnsupportedFieldType`), since a `Prop` field belongs to exactly
+    one constructor. A field named `new` on an invariant-carrying type is
+    rejected too (`Error::ReservedFieldName`): its accessor would collide with
+    the generated constructor.
+  - **The inversion test is the point of the whole feature.** A comparison
+    lowered with reversed operands compiles, returns a `bool`, and rejects
+    exactly the inputs it should accept. `macro_generation.rs`'s
+    `checked_constructor_accepts_valid_and_rejects_each_violation` runs the
+    real `kernel.ir` `Instance::new`; `smoke.rs`'s
+    `mixed_compare_constructor_rejects_each_violated_conjunct` runs
+    `Conformance.MixedCompare`, whose invariant (`lo ≥ 2 ∧ hi ≤ 7 ∧ lo < hi`)
+    is the only one in the corpus whose conjuncts do not all point the same
+    direction. `Instance` alone cannot separate a blanket operand swap from a
+    correct per-operator lowering; verified by inverting `Expr::Le` for
+    literal-right operands only, which left every `prod-core` test green and
+    failed `MixedCompare`. Keep both, and keep their values INTERIOR: at a
+    boundary (`lo = 2`, `a = 1`) a non-strict comparison reads the same in
+    either direction and the test stops discriminating.
+
+Known remaining limitations: Closures (`Code.fun`) still
 lower to opaque. User-defined inductives now generate real Rust structs/enums,
 and `ctor`/`proj` on them resolve against the module's own `(type ...)`
 declarations — a CONSTRUCTION whose constructor has no declaration in the
@@ -217,7 +478,11 @@ PATTERNS: an alt naming an undeclared constructor still renders
 `Foo.Bar.left(v) => v`, which rustc rejects as "expected a pattern, found an
 expression". Same defect class, same fix shape; not done. Monomorphization is still absent, so a
 parameterised inductive is rejected (`PolymorphicType`) rather than lowered.
-No data-parallel codegen.
+No data-parallel codegen. Invariant-carrying types (a structure's erased
+`Prop` fields re-checked at the crate boundary) shipped as S2 Phase B1, above;
+`Fin` with a literal bound is Phase B2 and is not implemented — it is unblocked
+now and should be planned against the B1 machinery as it shipped, not as the
+design predicted it.
 
 ## M3 spec — the LCNF extractor (the defensible core)
 
@@ -257,6 +522,26 @@ Verified Lean 4.30.0 API facts (from leanprover/lean4 v4.30.0 sources — trust 
   `Conformance.MidProp.mk` has `numParams=0 numFields=4` for 4 declared fields.
   Getting this wrong swaps struct fields SILENTLY, so any change here must
   re-run that conformance case.
+- Structure `Prop` field propositions, as seen in the constructor telescope:
+  conjunction is `And` with `2` args; `a ≥ b` appears as `GE.ge α inst a b`
+  (still `GE.ge`, not unfolded to `LE.le`/`Nat.le`/`Nat.ble`; `inst` is an
+  `LE α` instance — e.g. `instLENat` — because `GE.ge`'s own signature takes
+  `[LE α]` directly, there is no separate synthesized `GE Nat` instance;
+  4 args total: type, instance, lhs, rhs); earlier fields are referenced as
+  `Expr.bvar` with index `(i - 1) - j`, where `i` is the 0-indexed position
+  of the `Prop` field itself in the telescope and `j` is the 0-indexed
+  position of the referenced field (both counted over ALL fields, not just
+  computational ones) — e.g. in `UorAtlas.Instance` (fields `q`=0,`T`=1,`O`=2,
+  `valid`=3), `valid`'s type is `And (GE.ge Nat instLENat #2 1) (And (GE.ge
+  Nat instLENat #1 1) (GE.ge Nat instLENat #0 1))`, i.e. `q`→`#2`, `T`→`#1`,
+  `O`→`#0`; in `Conformance.MidProp` (fields `first`=0,`ok`=1,`second`=2,
+  `third`=3), `ok`'s type is `GE.ge Nat instLENat #0 0`, i.e. `first`→`#0`;
+  numeric literals appear as `OfNat.ofNat Nat n (instOfNatNat n)`, never a
+  raw `Expr.lit`. Verified by dumping `UorAtlas.Instance.mk` and
+  `Conformance.MidProp.mk`. The invariant lowering (`lowerProp`) is written
+  against exactly this shape, so a toolchain bump that changes it will show
+  up as propositions no longer lowering — which degrades to "no checked
+  constructor", never to a wrong check.
 
 Lowerer requirements:
 - Emit sexp matching `rust/prod-ir` grammar EXACTLY — read

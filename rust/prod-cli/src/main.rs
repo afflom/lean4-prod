@@ -2,13 +2,13 @@
 //!
 //! Usage:
 //!   prod parse module.ir
-//!   prod gen module.ir [--output generated.rs]
+//!   prod gen module.ir [--output generated.rs | --stdout]
 //!   prod validate module.ir
 
 mod roots;
 
 use clap::{Parser, Subcommand};
-use std::fs;
+use std::{fs, path::Path};
 
 #[derive(Parser)]
 #[command(name = "prod")]
@@ -25,13 +25,16 @@ enum Commands {
         /// Path to the IR file
         path: String,
     },
-    /// Generate Rust code from an IR file (prints to stdout unless --output is given)
+    /// Generate Rust code into output/rust/<module>.rs by default
     Gen {
         /// Path to the IR file
         path: String,
         /// Output path for generated Rust code
         #[arg(short, long)]
         output: Option<String>,
+        /// Print generated Rust to stdout instead of writing a file
+        #[arg(long, conflicts_with = "output")]
+        stdout: bool,
     },
     /// Validate an IR file (check for unsupported constructs)
     Validate {
@@ -53,11 +56,23 @@ enum Commands {
     },
 }
 
+fn default_generated_path(module: &prod_ir::Module) -> String {
+    let stem = module
+        .name
+        .rsplit('.')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("generated")
+        .to_ascii_lowercase();
+    format!("output/rust/{stem}.rs")
+}
+
 /// The Lean half of the subset contract, written by `prod-export`
 /// (`Prod.subsetJson`, `lean/Prod/Emit.lean`).
 #[derive(Debug, serde::Deserialize)]
 struct SubsetFile {
     operators: Vec<String>,
+    conversions: Vec<String>,
     deciders: Vec<String>,
     types: Vec<String>,
 }
@@ -80,19 +95,64 @@ fn render_subset(subset: &SubsetFile) -> String {
         out.push_str(&format!("- `{}`\n", t));
     }
     out.push_str(
-        "\n**Erased invariants.** A Lean structure may carry `Prop` fields\n\
-         expressing invariants over the computational fields — for example\n\
-         `UorAtlas.Instance.valid : q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1`. `Prop` fields are\n\
-         erased on export, correctly: they are proofs, not data, and carry no\n\
-         runtime representation. The consequence is that the generated Rust\n\
-         struct does **not** enforce the invariant — `Instance { q: 0, T: 0,\n\
-         O: 0 }` is constructible in Rust where the Lean type forbids it.\n\
-         Callers that need the invariant must re-check it in Rust; the\n\
-         generated struct is a plain data carrier, not a refinement type.\n",
+        "\n**Erased invariants, and where they are re-checked.** A Lean\n\
+         structure may carry `Prop` fields expressing invariants over its\n\
+         computational fields — for example `UorAtlas.Instance.valid : q ≥ 1 ∧\n\
+         T ≥ 1 ∧ O ≥ 1`. `Prop` fields are still erased on export, correctly:\n\
+         they are proofs, not data, and carry no runtime representation. What\n\
+         happens to the *proposition* depends on whether it falls inside the\n\
+         lowerable fragment below. Both outcomes are published, so the first\n\
+         thing a reader needs is how to tell which one a given type got.\n\
+         \n\
+         **Which shape did I get?** Read the generated struct.\n\
+         \n\
+         - `pub(crate)` fields, plus an `impl` block holding `new` and one\n\
+           accessor per field → the invariant **is** enforced.\n\
+         - `pub` fields and no `impl` block → the invariant is **not**\n\
+           enforced.\n\
+         \n\
+         There is no third shape and no partially-enforced one: a type\n\
+         re-checks its whole proposition or none of it.\n\
+         \n\
+         **Enforced (the proposition lowered).** The exporter turned it into a\n\
+         boolean expression over the structure's own fields, and codegen emits\n\
+         a checked constructor — `Instance::new(q, T, O) -> Result<Instance,\n\
+         ComputeError>` — that re-checks exactly that proposition and returns\n\
+         `ComputeError::InvariantViolated(\"UorAtlas.Instance\")` when it does\n\
+         not hold. Outside the crate, `new` is the only way to build the type,\n\
+         so the invariant cannot be broken from there. Generated code inside\n\
+         the crate does **not** call `new`, by design: Lean already supplied\n\
+         the proof, and re-checking would turn proved-total functions\n\
+         fallible. That is why the fields are `pub(crate)` rather than\n\
+         private.\n\
+         \n\
+         **Not enforced (the proposition did not lower).** It is dropped. The\n\
+         type keeps `pub` fields and gets no constructor and no accessors, and\n\
+         the invariant genuinely is not enforced: the struct is a plain data\n\
+         carrier, not a refinement type, and a caller that needs the invariant\n\
+         must re-check it in Rust by hand.\n\
+         \n\
+         **The lowerable fragment.** Conjunction (`∧`), disjunction (`∨`),\n\
+         negation (`¬`), and the comparisons `=`, `≤`, `<`, `≥`, `>` between a\n\
+         field and a literal or between two fields. `≥` and `>` lower to `≤`\n\
+         and `<` with their operands swapped, not to nodes of their own.\n\
+         Comparisons lower **only on `Nat`, `Int` and the sized kinds**\n\
+         (`UInt8`…`UInt64`); `Bool` is deliberately excluded, so a structure\n\
+         whose only `Prop` field compares `Bool`s (`flagA = flagB`) gets no\n\
+         constructor and takes the unenforced shape. So does anything else\n\
+         outside the fragment: quantifiers, arbitrary predicates, `≠` (which\n\
+         is `Ne`, not a comparison — spell it `¬ (a = b)` to stay inside), and\n\
+         any proposition naming something that is not one of this structure's\n\
+         own fields. Falling outside always costs the check, never corrupts\n\
+         it.\n",
     );
     out.push_str("\n## Operators\n\n");
     for op in &subset.operators {
         out.push_str(&format!("- `{}`\n", op));
+    }
+    out.push_str("\n## Conversions\n\n");
+    for c in &subset.conversions {
+        out.push_str(&format!("- `{}`\n", c));
     }
     out.push_str("\n## Decidable guards\n\n");
     for d in &subset.deciders {
@@ -165,7 +225,11 @@ fn main() {
                 println!("    Body: {:?}", def.body);
             }
         }
-        Commands::Gen { path, output } => {
+        Commands::Gen {
+            path,
+            output,
+            stdout,
+        } => {
             let content = fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("Failed to read {}: {}", path, e));
             let (_, module) = prod_ir::parser::parse_module(&content)
@@ -181,8 +245,16 @@ fn main() {
             ));
             out.push_str(&body);
 
+            let output = output.or_else(|| (!stdout).then(|| default_generated_path(&module)));
             match output {
                 Some(output) => {
+                    if let Some(parent) = Path::new(&output).parent() {
+                        if !parent.as_os_str().is_empty() {
+                            fs::create_dir_all(parent).unwrap_or_else(|e| {
+                                panic!("Failed to create {}: {}", parent.display(), e)
+                            });
+                        }
+                    }
                     fs::write(&output, out)
                         .unwrap_or_else(|e| panic!("Failed to write {}: {}", output, e));
                     println!("Generated: {}", output);
@@ -328,5 +400,20 @@ fn main() {
                 None => print!("{}", rendered),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_generated_path;
+
+    #[test]
+    fn generated_rust_defaults_under_output_rust() {
+        let module = prod_ir::Module {
+            name: String::from("UorAtlas.Kernel"),
+            types: Vec::new(),
+            definitions: Vec::new(),
+        };
+        assert_eq!(default_generated_path(&module), "output/rust/kernel.rs");
     }
 }

@@ -191,6 +191,17 @@ name = "prod-codegen"
 version = "0.1.0"
 dependencies = [
  "prod-ir",
+ "prod-lower",
+]
+
+[[package]]
+name = "prod-codegen-compile-tests"
+version = "0.1.0"
+dependencies = [
+ "prod-codegen",
+ "prod-core",
+ "prod-ir",
+ "prod-macros",
 ]
 
 [[package]]
@@ -208,6 +219,13 @@ version = "0.1.0"
 dependencies = [
  "nom",
  "serde",
+]
+
+[[package]]
+name = "prod-lower"
+version = "0.1.0"
+dependencies = [
+ "prod-ir",
 ]
 
 [[package]]

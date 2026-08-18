@@ -11,14 +11,21 @@ prod-export:
 
 # The conformance golden pins Lean-side lowering. `prod-export` rewrites it; this
 # fails if the rewrite changed anything, so lowering changes surface as a diff.
+#
+# `git diff HEAD`, not `git diff`: the latter compares the worktree against the
+# INDEX, so any `git add -A` before this recipe made it pass unconditionally --
+# a gate you can switch off by staging. `HEAD` compares against the commit,
+# which is what "the committed golden matches the generator" actually means.
 conformance:
     cd lean && lake exe prod-export
-    git diff --exit-code lean/Conformance/golden.ir
+    git diff HEAD --exit-code lean/Conformance/golden.ir lean/Conformance/golden-rejected.ir
 
 # Accept the current lowering as the new golden. Review the diff before running.
+# Staging is no longer enough to satisfy `conformance` above (that was the bug):
+# commit the blessed golden, then the gate passes.
 conformance-bless:
     cd lean && lake exe prod-export
-    git add lean/Conformance/golden.ir
+    git add lean/Conformance/golden.ir lean/Conformance/golden-rejected.ir
 
 # Build rust debug
 build:
@@ -52,8 +59,10 @@ roots-check:
 subset:
     cd rust && cargo run -p prod-cli -- subset ../subset.json --output ../specs/lean-for-production.md
 
+# `git diff HEAD`, not `git diff` — same reason as `conformance` above: staging
+# the regenerated contract must not be what makes its own gate pass.
 subset-check: subset
-    git diff --exit-code specs/lean-for-production.md
+    git diff HEAD --exit-code specs/lean-for-production.md
 
 # Link rust code
 lint:

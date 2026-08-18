@@ -42,6 +42,9 @@ pub enum Type {
     /// `prod_codegen` for the lowering.
     List(Box<Type>),
     Tuple(Vec<Type>),
+    /// A Lean sized integer (`UInt8`…`UInt64`), rendered as the corresponding
+    /// Rust unsigned type. Arithmetic on these wraps and is infallible.
+    UInt(NumKind),
     /// Unmapped or complex type requiring manual handling
     Opaque(String),
 }
@@ -54,6 +57,26 @@ pub struct Alt {
     pub body: Expr,
 }
 
+/// The numeric type an arithmetic node operates on.
+///
+/// Carried explicitly rather than inferred. The Lean side sees `Nat.add` vs
+/// `Int.add` vs `UInt8.add` and knows exactly; codegen would have to guess,
+/// and guessing is how this project previously shipped a type declaration and
+/// a projection that disagreed about a field name. The three kinds have
+/// genuinely different arithmetic contracts — `Nat` and `Int` are checked,
+/// sized integers wrap — so a wrong guess is a wrong answer, not a style slip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NumKind {
+    /// Lean `Nat`, unbounded. Bounded to `u64` by policy.
+    Nat,
+    /// Lean `Int`, unbounded. Bounded to `i64` by policy.
+    Int,
+    U8,
+    U16,
+    U32,
+    U64,
+}
+
 /// Expression AST — a simplified lambda calculus with constants,
 /// extended with LCNF-flavored nodes (cases/ctor/proj/jp/jmp/unreachable)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,16 +86,24 @@ pub enum Expr {
     Bool(bool),
     Var(String),
     Param(usize), // De Bruijn-style parameter index
-    Add(Box<Expr>, Box<Expr>),
-    Sub(Box<Expr>, Box<Expr>),
-    Mul(Box<Expr>, Box<Expr>),
-    Div(Box<Expr>, Box<Expr>),
-    Mod(Box<Expr>, Box<Expr>),
-    Shl(Box<Expr>, Box<Expr>),
+    Add(NumKind, Box<Expr>, Box<Expr>),
+    Sub(NumKind, Box<Expr>, Box<Expr>),
+    Mul(NumKind, Box<Expr>, Box<Expr>),
+    Div(NumKind, Box<Expr>, Box<Expr>),
+    Mod(NumKind, Box<Expr>, Box<Expr>),
+    Shl(NumKind, Box<Expr>, Box<Expr>),
     /// `Nat.shiftRight`: total and infallible (`a >>> b = 0` for `b >= 64`
     /// when `a` fits `u64`), unlike `Shl`/`Pow` which can overflow.
-    Shr(Box<Expr>, Box<Expr>),
-    Pow(Box<Expr>, Box<Expr>),
+    Shr(NumKind, Box<Expr>, Box<Expr>),
+    Pow(NumKind, Box<Expr>, Box<Expr>),
+    /// Unary negation. `Int` only; every other kind is `Error::UnsupportedKind`.
+    Neg(NumKind, Box<Expr>),
+    /// Conversion between numeric kinds: from-kind, to-kind, value. Grammar
+    /// `(convert Nat Int a)`. The lossless/total set only — `Nat<->Int`,
+    /// `UIntN->Nat`, `Nat->UIntN` — with cross-width sized conversions
+    /// (`UInt8<->UInt32`) rejected as `Error::UnsupportedKind` rather than
+    /// rendered, a deliberate non-goal.
+    Convert(NumKind, NumKind, Box<Expr>),
     Eq(Box<Expr>, Box<Expr>),
     Lt(Box<Expr>, Box<Expr>),
     Le(Box<Expr>, Box<Expr>),
@@ -112,6 +143,14 @@ pub enum Expr {
     /// from `Call` so codegen rejects it instead of emitting a Rust call to a
     /// function that does not exist.
     Extern(String, Vec<Expr>),
+    /// Boolean conjunction. Produced only by the invariant lowering — Lean's
+    /// computational `&&` reaches LCNF as `cases` on `Bool.true`/`Bool.false`
+    /// and needs no node (verified in S2 Phase A). These exist because a
+    /// `Prop` field's proposition is lowered to a boolean expression, and a
+    /// conjunction of comparisons has no `cases` form to reuse.
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    Not(Box<Expr>),
 }
 
 impl Expr {
@@ -136,18 +175,23 @@ impl Expr {
         let mut out: Vec<&Expr> = Vec::new();
         match self {
             Expr::Proj(_, _, e) => out.push(e),
-            Expr::Add(a, b)
-            | Expr::Sub(a, b)
-            | Expr::Mul(a, b)
-            | Expr::Div(a, b)
-            | Expr::Mod(a, b)
-            | Expr::Shl(a, b)
-            | Expr::Shr(a, b)
-            | Expr::Pow(a, b)
+            Expr::Neg(_, e) => out.push(e),
+            Expr::Convert(_, _, e) => out.push(e),
+            Expr::Not(e) => out.push(e),
+            Expr::Add(_, a, b)
+            | Expr::Sub(_, a, b)
+            | Expr::Mul(_, a, b)
+            | Expr::Div(_, a, b)
+            | Expr::Mod(_, a, b)
+            | Expr::Shl(_, a, b)
+            | Expr::Shr(_, a, b)
+            | Expr::Pow(_, a, b)
             | Expr::Eq(a, b)
             | Expr::Lt(a, b)
             | Expr::Le(a, b)
-            | Expr::Gt(a, b) => {
+            | Expr::Gt(a, b)
+            | Expr::And(a, b)
+            | Expr::Or(a, b) => {
                 out.push(a);
                 out.push(b);
             }
@@ -211,6 +255,12 @@ pub struct TypeDecl {
     /// reference to it *precisely* rather than reporting a generic unknown
     /// name. `ctors` is empty when this is set.
     pub unsupported: Option<String>,
+    /// The structure's erased `Prop` invariant, lowered to a boolean
+    /// expression over its own fields (referenced by name as `Expr::Var`).
+    /// `None` when the structure has no `Prop` field, or has one whose
+    /// proposition the exporter cannot lower — in which case the type keeps
+    /// public fields and no checked constructor, exactly as before.
+    pub invariant: Option<Expr>,
 }
 
 /// A module is a collection of definitions
@@ -238,8 +288,10 @@ mod tests {
     /// there; the assertions then force it into the `children()` table too.
     const ALL_VARIANTS: &[&str] = &[
         "Add",
+        "And",
         "Bool",
         "Call",
+        "Convert",
         "Ctor",
         "Div",
         "Eq",
@@ -256,7 +308,10 @@ mod tests {
         "Mod",
         "Mul",
         "Nat",
+        "Neg",
+        "Not",
         "Opaque",
+        "Or",
         "Param",
         "Pow",
         "Proj",
@@ -282,6 +337,8 @@ mod tests {
             Expr::Shl(..) => "Shl",
             Expr::Shr(..) => "Shr",
             Expr::Pow(..) => "Pow",
+            Expr::Neg(..) => "Neg",
+            Expr::Convert(..) => "Convert",
             Expr::Eq(..) => "Eq",
             Expr::Lt(..) => "Lt",
             Expr::Le(..) => "Le",
@@ -297,6 +354,9 @@ mod tests {
             Expr::Unreachable => "Unreachable",
             Expr::Opaque(_) => "Opaque",
             Expr::Extern(..) => "Extern",
+            Expr::And(..) => "And",
+            Expr::Or(..) => "Or",
+            Expr::Not(..) => "Not",
         }
     }
 
@@ -328,19 +388,30 @@ mod tests {
                 Expr::Proj(String::from("T"), String::from("f"), bx("a")),
                 vec!["a"],
             ),
+            // Unary.
+            (Expr::Neg(NumKind::Int, bx("a")), vec!["a"]),
+            // Unary.
+            (
+                Expr::Convert(NumKind::Nat, NumKind::Int, bx("a")),
+                vec!["a"],
+            ),
             // Binary.
-            (Expr::Add(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Sub(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Mul(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Div(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Mod(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Shl(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Shr(bx("a"), bx("b")), vec!["a", "b"]),
-            (Expr::Pow(bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Add(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Sub(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Mul(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Div(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Mod(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Shl(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Shr(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Pow(NumKind::Nat, bx("a"), bx("b")), vec!["a", "b"]),
             (Expr::Eq(bx("a"), bx("b")), vec!["a", "b"]),
             (Expr::Lt(bx("a"), bx("b")), vec!["a", "b"]),
             (Expr::Le(bx("a"), bx("b")), vec!["a", "b"]),
             (Expr::Gt(bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::And(bx("a"), bx("b")), vec!["a", "b"]),
+            (Expr::Or(bx("a"), bx("b")), vec!["a", "b"]),
+            // Unary.
+            (Expr::Not(bx("a")), vec!["a"]),
             // Control flow and binders.
             (Expr::If(bx("c"), bx("t"), bx("f")), vec!["c", "t", "f"]),
             (

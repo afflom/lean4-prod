@@ -1,4 +1,5 @@
 use super::*;
+use alloc::string::ToString;
 use prod_ir::parser::parse_module;
 
 fn generate(ir: &str) -> String {
@@ -19,12 +20,12 @@ fn test_generate_class_index() {
     (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
 
   (def classIndex ((h2 Nat) (d Nat) (l Nat) (inst (named "UorAtlas.Instance"))) Nat
-    (add (mul (call stride inst) h2)
-         (add (mul (proj "UorAtlas.Instance" "O" inst) d) l)))
+    (add Nat (mul Nat (call stride inst) h2)
+         (add Nat (mul Nat (proj "UorAtlas.Instance" "O" inst) d) l)))
 
   (def belt ((inst (named "UorAtlas.Instance"))) Nat
-    (mul (call class_count inst)
-         (shl 1 (sub (proj "UorAtlas.Instance" "O" inst) 1))))
+    (mul Nat (call class_count inst)
+         (shl Nat 1 (sub Nat (proj "UorAtlas.Instance" "O" inst) 1))))
 )
 "#;
     let out = generate(ir);
@@ -47,7 +48,7 @@ fn test_generate_match() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn f(x: u64) -> u64 {\n    match x {\n        Some(v) => v,\n        _ => 0,\n    }\n}\n\n"
+        "pub fn f(x: u64) -> u64 {\n    match x {\n        Some(v) => {\n            return v;\n        }\n        _ => {\n            return 0;\n        }\n    }\n}\n\n"
     );
 }
 
@@ -60,17 +61,43 @@ fn test_generate_list_param_is_a_slice_and_return_is_a_buffer() {
   (def digitSum ((xs (List Nat))) Nat
     (cases xs
       (alt "List.nil" () 0)
-      (alt "List.cons" (h t) (add h (call digitSum t)))))
+      (alt "List.cons" (h t) (add Nat h (call digitSum t)))))
   (def digits ((n Nat)) (List Nat)
     (if (lt n 8)
         (ctor "List.cons" n (ctor "List.nil"))
-        (ctor "List.cons" (mod n 8) (call digits (div n 8)))))
+        (ctor "List.cons" (mod Nat n 8) (call digits (div Nat n 8)))))
 )
 "#;
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn digitSum(xs: &[u64]) -> Result<u64, crate::ComputeError> {\n    Ok(match xs {\n        [] => 0,\n        [h, t @ ..] => { let h = *h; ((h) as u64).checked_add(digitSum(t)?).ok_or(crate::ComputeError::AddOverflow)? },\n    })\n}\n\npub fn digits(n: u64, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    if (n < 8) { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = n; let __len0 = Ok::<usize, crate::ComputeError>(0)?; Ok(__len0 + 1) } } } else { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = if (8) == 0 { 0 } else { (n) % (8) }; let __len0 = digits(if (8) == 0 { 0 } else { (n) / (8) }, __rest0)?; Ok(__len0 + 1) } } }\n}\n\n"
+        "pub fn digitSum(xs: &[u64]) -> Result<u64, crate::ComputeError> {\n    match xs {\n        [] => {\n            return Ok(0);\n        }\n        [h, t @ ..] => {\n            let h = *h;\n            let t0 = digitSum(t)?;\n            let t1 = ((h) as u64).checked_add(t0).ok_or(crate::ComputeError::AddOverflow)?;\n            return Ok(t1);\n        }\n    }\n}\n\npub fn digits(n: u64, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    let mut __len: usize = 0;\n    if (n < 8) {\n        if (__len < output.len()) {\n        } else {\n            return Err(crate::ComputeError::OutputTooSmall);\n        }\n        if let Some(__slot) = output.get_mut(__len) {\n            *__slot = n;\n            __len += 1;\n        }\n        return Ok(__len);\n    } else {\n        if (__len < output.len()) {\n        } else {\n            return Err(crate::ComputeError::OutputTooSmall);\n        }\n        if let Some(__slot) = output.get_mut(__len) {\n            *__slot = if (8) == 0 { n } else { (n) % (8) };\n            __len += 1;\n        }\n        let t0 = digits(if (8) == 0 { 0 } else { (n) / (8) }, output.get_mut(__len..).unwrap_or(&mut []))?;\n        __len += t0;\n        return Ok(__len);\n    }\n}\n\n"
+    );
+}
+
+#[test]
+fn generated_list_writes_do_not_use_indexing_syntax() {
+    // `clippy::indexing_slicing` does not inspect proc-macro expansions, and
+    // the scratch experiment for this task also showed it does not inspect
+    // `include!`d source. Keep the safety property executable at the source
+    // generator boundary instead: a caller-controlled output buffer may only
+    // be written through the checked `get_mut` path.
+    let ir = r#"
+(module M
+  (def digits ((n Nat)) (List Nat)
+    (ctor "List.cons" n (ctor "List.nil"))))
+"#;
+    let out = generate(ir);
+    assert!(out.contains("output.get_mut(__len)"), "got: {}", out);
+    assert!(
+        !out.contains("output["),
+        "generated output indexes the buffer: {}",
+        out
+    );
+    assert!(
+        !out.lines().any(|line| line.contains("] =")),
+        "generated output contains an indexed assignment: {}",
+        out
     );
 }
 
@@ -92,8 +119,8 @@ fn test_generate_list_builder_resolves_anf_let_bindings() {
         (let _x_47 (proj "UorAtlas.Instance" "O" i)
           (if (lt n _x_47)
             (let _x_55 (ctor "List.nil") (let _x_56 (ctor "List.cons" n _x_55) _x_56))
-            (let _x_50 (mod n _x_47)
-              (let _x_51 (div n _x_47)
+            (let _x_50 (mod Nat n _x_47)
+              (let _x_51 (div Nat n _x_47)
                 (let _x_52 (call digits n_25 _x_51 i)
                   (let _x_53 (ctor "List.cons" _x_50 _x_52) _x_53)))))))))
 )
@@ -101,7 +128,7 @@ fn test_generate_list_builder_resolves_anf_let_bindings() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn digits(fuel: u64, n: u64, i: crate::Instance, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    match fuel {\n        0 => Ok::<usize, crate::ComputeError>(0),\n        _ => { let n_25 = (fuel).saturating_sub(1); { let _x_47 = (i).O; if (n < _x_47) { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = n; let __len0 = Ok::<usize, crate::ComputeError>(0)?; Ok(__len0 + 1) } } } else { { let _x_50 = if (_x_47) == 0 { 0 } else { (n) % (_x_47) }; { let _x_51 = if (_x_47) == 0 { 0 } else { (n) / (_x_47) }; match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = _x_50; let __len0 = digits(n_25, _x_51, i, __rest0)?; Ok(__len0 + 1) } } } } } } },\n    }\n}\n\n"
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn digits(fuel: u64, n: u64, i: crate::Instance, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    let mut __len: usize = 0;\n    match fuel {\n        0 => {\n            return Ok(__len);\n        }\n        _ => {\n            let n_25 = (fuel).saturating_sub(1);\n            let _x_47 = (i).O;\n            if (n < _x_47) {\n                if (__len < output.len()) {\n                } else {\n                    return Err(crate::ComputeError::OutputTooSmall);\n                }\n                if let Some(__slot) = output.get_mut(__len) {\n                    *__slot = n;\n                    __len += 1;\n                }\n                return Ok(__len);\n            } else {\n                let _x_50 = if (_x_47) == 0 { n } else { (n) % (_x_47) };\n                let _x_51 = if (_x_47) == 0 { 0 } else { (n) / (_x_47) };\n                if (__len < output.len()) {\n                } else {\n                    return Err(crate::ComputeError::OutputTooSmall);\n                }\n                if let Some(__slot) = output.get_mut(__len) {\n                    *__slot = _x_50;\n                    __len += 1;\n                }\n                let t0 = digits(n_25, _x_51, i, output.get_mut(__len..).unwrap_or(&mut []))?;\n                __len += t0;\n                return Ok(__len);\n            }\n        }\n    }\n}\n\n"
     );
 }
 
@@ -126,14 +153,14 @@ fn test_fallibility_is_precise_not_uniform() {
     // property propagates through the call graph — including recursion.
     let ir = r#"
 (module M
-  (def pure ((x Nat) (y Nat)) Nat (sub x y))
-  (def viaDiv ((x Nat)) Nat (call pure (div x 2) 1))
-  (def risky ((x Nat)) Nat (add x 1))
+  (def pure ((x Nat) (y Nat)) Nat (sub Nat x y))
+  (def viaDiv ((x Nat)) Nat (call pure (div Nat x 2) 1))
+  (def risky ((x Nat)) Nat (add Nat x 1))
   (def caller ((x Nat)) Nat (call risky x))
   (def loops ((fuel Nat) (x Nat)) Nat
     (cases fuel
       (alt "Nat.zero" () x)
-      (alt "Nat.succ" (k) (call loops k (add x 1)))))
+      (alt "Nat.succ" (k) (call loops k (add Nat x 1)))))
 )
 "#;
     let out = generate(ir);
@@ -144,7 +171,11 @@ fn test_fallibility_is_precise_not_uniform() {
     assert!(out.contains("Ok(risky(x)?)"));
     // A recursive definition reaches its own fixpoint.
     assert!(out.contains("pub fn loops(fuel: u64, x: u64) -> Result<u64, crate::ComputeError> {"));
-    assert!(out.contains("loops(k, ((x) as u64).checked_add(1)"));
+    // The argument is computed into a branch-local temporary and passed by
+    // name: a `TryLet` inside a match arm is never folded into its use, so
+    // the checked add cannot be evaluated on the arm that does not run.
+    assert!(out.contains("checked_add(1).ok_or(crate::ComputeError::AddOverflow)?;"));
+    assert!(out.contains("loops(k, "));
 }
 
 #[test]
@@ -187,7 +218,10 @@ fn test_vec_type_is_rejected_as_heap_allocating() {
   (def f ((xs (Vec Nat))) Nat 0)
 )
 "#;
-    assert_eq!(generate_err(ir), Error::HeapType("(Vec u64)".to_string()));
+    // The payload names the offending type in the IR's own spelling: the
+    // rejection is made in `prod-lower`, which has no business knowing Rust's
+    // type names.
+    assert_eq!(generate_err(ir), Error::HeapType("(Vec Nat)".to_string()));
 }
 
 #[test]
@@ -195,7 +229,7 @@ fn test_computed_zero_arg_list_is_a_codegen_error() {
     // A golden whose elements are computed cannot be a promoted static slice.
     let ir = r#"
 (module M
-  (def g () (List Nat) (ctor "List.cons" (add 1 2) (ctor "List.nil")))
+  (def g () (List Nat) (ctor "List.cons" (add Nat 1 2) (ctor "List.nil")))
 )
 "#;
     assert!(matches!(generate_err(ir), Error::UnsupportedList(_)));
@@ -217,7 +251,7 @@ fn test_generate_option_and_bool() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn tryDecode(idx: u64) -> Option<u64> {\n    if (idx <= 96) { Some(idx) } else { None }\n}\n\npub fn fromOpt(x: Option<u64>) -> bool {\n    match x {\n        Some(v) => true,\n        None => false,\n    }\n}\n\n"
+        "pub fn tryDecode(idx: u64) -> Option<u64> {\n    if (idx <= 96) {\n        return Some(idx);\n    } else {\n        return None;\n    }\n}\n\npub fn fromOpt(x: Option<u64>) -> bool {\n    match x {\n        Some(v) => {\n            return true;\n        }\n        None => {\n            return false;\n        }\n    }\n}\n\n"
     );
 }
 
@@ -230,13 +264,13 @@ fn test_generate_nat_cases_recursion() {
   (def digitCount ((fuel Nat) (n Nat)) Nat
     (cases fuel
       (alt "Nat.zero" () 0)
-      (alt "Nat.succ" (k) (if (lt n 8) 1 (add 1 (call digitCount k (div n 8)))))))
+      (alt "Nat.succ" (k) (if (lt n 8) 1 (add Nat 1 (call digitCount k (div Nat n 8)))))))
 )
 "#;
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn digitCount(fuel: u64, n: u64) -> Result<u64, crate::ComputeError> {\n    Ok(match fuel {\n        0 => 0,\n        _ => { let k = (fuel).saturating_sub(1); if (n < 8) { 1 } else { ((1) as u64).checked_add(digitCount(k, if (8) == 0 { 0 } else { (n) / (8) })?).ok_or(crate::ComputeError::AddOverflow)? } },\n    })\n}\n\n"
+        "pub fn digitCount(fuel: u64, n: u64) -> Result<u64, crate::ComputeError> {\n    match fuel {\n        0 => {\n            return Ok(0);\n        }\n        _ => {\n            let k = (fuel).saturating_sub(1);\n            if (n < 8) {\n                return Ok(1);\n            } else {\n                let t0 = digitCount(k, if (8) == 0 { 0 } else { (n) / (8) })?;\n                let t1 = ((1) as u64).checked_add(t0).ok_or(crate::ComputeError::AddOverflow)?;\n                return Ok(t1);\n            }\n        }\n    }\n}\n\n"
     );
 }
 
@@ -291,16 +325,16 @@ fn test_generate_kernel_ir_shapes() {
     (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat)))
 
   (def stride ((i (named "UorAtlas.Instance"))) Nat
-    (let _x_4 (proj "UorAtlas.Instance" "T" i) (let _x_5 (proj "UorAtlas.Instance" "O" i) (let _x_13 (mul _x_4 _x_5) _x_13))))
+    (let _x_4 (proj "UorAtlas.Instance" "T" i) (let _x_5 (proj "UorAtlas.Instance" "O" i) (let _x_13 (mul Nat _x_4 _x_5) _x_13))))
 
   (def classDecode ((idx Nat) (i (named "UorAtlas.Instance"))) (Tuple Nat (Tuple Nat Nat))
-    (let _x_4 (call stride i) (let h2 (div idx _x_4) (let rem (mod idx _x_4) (let _x_10 (proj "UorAtlas.Instance" "O" i) (let d (div rem _x_10) (let l (mod rem _x_10) (let _x_13 (ctor "Prod.mk" d l) (let _x_14 (ctor "Prod.mk" h2 _x_13) _x_14)))))))))
+    (let _x_4 (call stride i) (let h2 (div Nat idx _x_4) (let rem (mod Nat idx _x_4) (let _x_10 (proj "UorAtlas.Instance" "O" i) (let d (div Nat rem _x_10) (let l (mod Nat rem _x_10) (let _x_13 (ctor "Prod.mk" d l) (let _x_14 (ctor "Prod.mk" h2 _x_13) _x_14)))))))))
 )
 "#;
     let out = generate(ir);
     assert_eq!(
         out,
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn stride(i: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok({ let _x_4 = (i).T; { let _x_5 = (i).O; { let _x_13 = ((_x_4) as u64).checked_mul(_x_5).ok_or(crate::ComputeError::MulOverflow)?; _x_13 } } })\n}\n\npub fn classDecode(idx: u64, i: crate::Instance) -> Result<(u64, (u64, u64)), crate::ComputeError> {\n    Ok({ let _x_4 = stride(i)?; { let h2 = if (_x_4) == 0 { 0 } else { (idx) / (_x_4) }; { let rem = if (_x_4) == 0 { 0 } else { (idx) % (_x_4) }; { let _x_10 = (i).O; { let d = if (_x_10) == 0 { 0 } else { (rem) / (_x_10) }; { let l = if (_x_10) == 0 { 0 } else { (rem) % (_x_10) }; { let _x_13 = (d, l); { let _x_14 = (h2, _x_13); _x_14 } } } } } } } })\n}\n\n"
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn stride(i: crate::Instance) -> Result<u64, crate::ComputeError> {\n    let _x_4 = (i).T;\n    let _x_5 = (i).O;\n    let _x_13 = ((_x_4) as u64).checked_mul(_x_5).ok_or(crate::ComputeError::MulOverflow)?;\n    Ok(_x_13)\n}\n\npub fn classDecode(idx: u64, i: crate::Instance) -> Result<(u64, (u64, u64)), crate::ComputeError> {\n    let _x_4 = stride(i)?;\n    let h2 = if (_x_4) == 0 { 0 } else { (idx) / (_x_4) };\n    let rem = if (_x_4) == 0 { idx } else { (idx) % (_x_4) };\n    let _x_10 = (i).O;\n    let d = if (_x_10) == 0 { 0 } else { (rem) / (_x_10) };\n    let l = if (_x_10) == 0 { rem } else { (rem) % (_x_10) };\n    let _x_13 = (d, l);\n    let _x_14 = (h2, _x_13);\n    Ok(_x_14)\n}\n\n"
     );
 }
 
@@ -398,6 +432,8 @@ fn test_every_error_variant_is_published_in_rejections() {
         Error::UnresolvedCall(s()),
         Error::UnknownField(s(), s()),
         Error::UnsupportedJoinPoint(s()),
+        Error::UnsupportedKind(s()),
+        Error::ReservedFieldName(s(), s()),
     ];
 
     for error in &all {
@@ -414,6 +450,8 @@ fn test_every_error_variant_is_published_in_rejections() {
             Error::UnresolvedCall(_) => "UnresolvedCall",
             Error::UnknownField(..) => "UnknownField",
             Error::UnsupportedJoinPoint(_) => "UnsupportedJoinPoint",
+            Error::UnsupportedKind(_) => "UnsupportedKind",
+            Error::ReservedFieldName(..) => "ReservedFieldName",
         };
         assert!(
             REJECTIONS.iter().any(|(variant, _)| *variant == name),
@@ -482,13 +520,16 @@ fn test_generate_jp_jmp_inlined() {
     let ir = r#"
 (module M
   (def f ((x Nat)) Nat
-    (let g (jp g (a) (add a 1)) (jmp g x)))
+    (let g (jp g (a) (add Nat a 1)) (jmp g x)))
 )
 "#;
     let out = generate(ir);
+    // The `let` LCNF wraps the declaration in disappears entirely rather than
+    // binding a unit nobody reads: the join point has one jump site, and its
+    // body belongs there.
     assert_eq!(
         out,
-        "pub fn f(x: u64) -> Result<u64, crate::ComputeError> {\n    Ok({ let g = /* jp \"g\" inlined at its jump site */ (); { let a = x; ((a) as u64).checked_add(1).ok_or(crate::ComputeError::AddOverflow)? } })\n}\n\n"
+        "pub fn f(x: u64) -> Result<u64, crate::ComputeError> {\n    let a = x;\n    Ok(((a) as u64).checked_add(1).ok_or(crate::ComputeError::AddOverflow)?)\n}\n\n"
     );
 }
 
@@ -501,7 +542,7 @@ fn test_cyclic_join_point_is_rejected() {
     let ir = r#"
 (module M
   (def f ((x Nat)) Nat
-    (jp loop (i) (if (lt i 10) (jmp loop (add i 1)) i)))
+    (jp loop (i) (if (lt i 10) (jmp loop (add Nat i 1)) i)))
 )
 "#;
     assert_eq!(
@@ -518,7 +559,7 @@ fn test_multi_caller_join_point_is_rejected() {
     let ir = r#"
 (module M
   (def f ((c Nat) (x Nat)) Nat
-    (let g (jp g (a) (add a 1))
+    (let g (jp g (a) (add Nat a 1))
       (if (lt c 1) (jmp g x) (jmp g c))))
 )
 "#;
@@ -538,7 +579,9 @@ fn test_join_point_with_no_callers_still_renders() {
     (jp g (a) x))
 )
 "#;
-    assert!(generate(ir).contains("no jump sites"));
+    // Nothing jumps to `g`, so its body IS the definition's body and renders
+    // in place -- no binding, no placeholder.
+    assert_eq!(generate(ir), "pub fn f(x: u64) -> u64 {\n    x\n}\n\n");
 }
 
 #[test]
@@ -546,7 +589,7 @@ fn test_generate_pow() {
     let ir = r#"
 (module M
   (def belt ((i Nat)) Nat
-    (pow 2 (sub i 1)))
+    (pow Nat 2 (sub Nat i 1)))
 )
 "#;
     let out = generate(ir);
@@ -564,7 +607,7 @@ fn test_generate_shr() {
     let ir = r#"
 (module M
   (def half ((n Nat) (k Nat)) Nat
-    (shr n k))
+    (shr Nat n k))
 )
 "#;
     let out = generate(ir);
@@ -589,7 +632,7 @@ fn test_generate_decide_unwrapped_comparison_is_a_plain_bool() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn c_bool(a: u64, b: u64) -> bool {\n    { let x = (a < b); x }\n}\n\n"
+        "pub fn c_bool(a: u64, b: u64) -> bool {\n    let x = (a < b);\n    x\n}\n\n"
     );
 }
 
@@ -597,19 +640,19 @@ fn test_generate_decide_unwrapped_comparison_is_a_plain_bool() {
 fn test_generate_nat_arithmetic_policy_never_panics() {
     let ir = r#"
 (module M
-  (def add ((x Nat) (y Nat)) Nat (add x y))
-  (def sub ((x Nat) (y Nat)) Nat (sub x y))
-  (def div ((x Nat) (y Nat)) Nat (div x y))
-  (def modu ((x Nat) (y Nat)) Nat (mod x y))
-  (def shl ((x Nat) (y Nat)) Nat (shl x y))
-  (def pow ((x Nat) (y Nat)) Nat (pow x y))
+  (def add ((x Nat) (y Nat)) Nat (add Nat x y))
+  (def sub ((x Nat) (y Nat)) Nat (sub Nat x y))
+  (def div ((x Nat) (y Nat)) Nat (div Nat x y))
+  (def modu ((x Nat) (y Nat)) Nat (mod Nat x y))
+  (def shl ((x Nat) (y Nat)) Nat (shl Nat x y))
+  (def pow ((x Nat) (y Nat)) Nat (pow Nat x y))
 )
 "#;
     let out = generate(ir);
     assert!(out.contains("checked_add(y).ok_or(crate::ComputeError::AddOverflow)?"));
     assert!(out.contains("saturating_sub(y)"));
     assert!(out.contains("if (y) == 0 { 0 } else { (x) / (y) }"));
-    assert!(out.contains("if (y) == 0 { 0 } else { (x) % (y) }"));
+    assert!(out.contains("if (y) == 0 { x } else { (x) % (y) }"));
     assert!(out.contains("checked_shl(u32::try_from(y).map_err(|_| crate::ComputeError::ShiftExponentTooLarge)?).ok_or(crate::ComputeError::ShiftOverflow)?"));
     assert!(out.contains("checked_pow(u32::try_from(y).map_err(|_| crate::ComputeError::PowExponentTooLarge)?).ok_or(crate::ComputeError::PowOverflow)?"));
     // The whole point: no panicking exit remains in the arithmetic lowering.
@@ -622,7 +665,8 @@ fn test_generate_nat_arithmetic_policy_never_panics() {
 fn test_generate_unreachable() {
     let ir = "(module M (def f ((x Nat)) Nat (unreachable)))";
     let out = generate(ir);
-    assert_eq!(out, "pub fn f(x: u64) -> u64 {\n    unreachable!()\n}\n\n");
+    // A `Fail` is a terminator, so it prints as one.
+    assert_eq!(out, "pub fn f(x: u64) -> u64 {\n    unreachable!();\n}\n\n");
 }
 
 #[test]
@@ -767,11 +811,11 @@ fn test_generate_enum_construction_and_patterns() {
   (def area ((s (named "M.Shape"))) Nat
     (cases s
       (alt "M.Shape.circle" (r) r)
-      (alt "M.Shape.rect" (w h) (mul w h))))
+      (alt "M.Shape.rect" (w h) (mul Nat w h))))
   (def unit ((r Nat)) (named "M.Shape") (ctor "M.Shape.circle" r)))
 "#;
     let out = generate(ir);
-    assert!(out.contains("crate::Shape::circle { radius: r } => r,"));
+    assert!(out.contains("crate::Shape::circle { radius: r } => {"));
     assert!(out.contains("crate::Shape::rect { w: w, h: h } =>"));
     assert!(out.contains("crate::Shape::circle { radius: r }"));
 }
@@ -812,7 +856,7 @@ fn test_cases_alt_on_an_undeclared_ctor_still_falls_through() {
 (module M
   (def f ((x Nat)) Nat
     (cases x
-      (alt "Foo.Bar" (a b) (add a b))
+      (alt "Foo.Bar" (a b) (add Nat a b))
       (default 0))))
 "#;
     let out = generate(ir);
@@ -852,4 +896,414 @@ fn test_projection_of_a_declared_field_still_renders() {
   (def f ((r (named "M.Rec"))) Nat (proj "M.Rec" "alpha" r)))
 "#;
     assert!(generate(ir).contains("(r).alpha"));
+}
+
+#[test]
+fn test_int_division_is_euclidean_not_truncating() {
+    // Lean's Div Int / Mod Int instances use Int.ediv / Int.emod — its own
+    // docs say so, "for compatibility with SMT-LIB". Rust's / and % truncate.
+    // They differ for every negative operand: Lean gives (-12) % 7 = 2, Rust
+    // gives -5. Rendering / and % here would be silently wrong, and every test
+    // with non-negative inputs would still pass.
+    let ir = r#"(module M (def f ((a Int) (b Int)) Int (div Int a b)))"#;
+    let out = generate(ir);
+    assert!(out.contains("checked_div_euclid"), "got: {}", out);
+    assert!(
+        !out.contains("(a) / (b)"),
+        "must not render truncating division"
+    );
+    // Int.ediv is total on a zero divisor (Init/Data/Int/DivMod/Basic.lean:76
+    // is explicit: `| -[_+1], 0 => 0`), so the zero-guard stays.
+    assert!(out.contains("if (b) == 0 { 0 }"), "got: {}", out);
+}
+
+#[test]
+fn test_int_modulo_is_euclidean() {
+    let ir = r#"(module M (def f ((a Int) (b Int)) Int (mod Int a b)))"#;
+    assert!(generate(ir).contains("checked_rem_euclid"));
+}
+
+#[test]
+fn test_modulo_by_zero_is_the_dividend_not_zero() {
+    // Lean `Nat.mod`'s own doc comment: "When the divisor is `0`, the result
+    // is the dividend rather than an error" (doctest `5 % 0 = 5`); `Int`'s
+    // `emod_zero : a % 0 = a` (doctest `(7 : Int) % (0 : Int) = 7`). Division
+    // by zero really is `0` for both kinds — only modulo's zero branch must
+    // be the dividend, not a copy-pasted `0`.
+    let nat = generate(r#"(module M (def f ((a Nat) (b Nat)) Nat (mod Nat a b)))"#);
+    assert!(
+        nat.contains("if (b) == 0 { a } else"),
+        "Nat mod-by-zero must be the dividend: got {}",
+        nat
+    );
+
+    let int = generate(r#"(module M (def f ((a Int) (b Int)) Int (mod Int a b)))"#);
+    assert!(
+        int.contains("if (b) == 0 { a } else"),
+        "Int mod-by-zero must be the dividend: got {}",
+        int
+    );
+
+    // Division by zero is unaffected: still `0` for both kinds.
+    let nat_div = generate(r#"(module M (def f ((a Nat) (b Nat)) Nat (div Nat a b)))"#);
+    assert!(nat_div.contains("if (b) == 0 { 0 } else"));
+    let int_div = generate(r#"(module M (def f ((a Int) (b Int)) Int (div Int a b)))"#);
+    assert!(int_div.contains("if (b) == 0 { 0 } else"));
+}
+
+#[test]
+fn test_int_sub_is_checked_unlike_nat() {
+    // Nat subtraction truncates at zero and cannot fail; Int subtraction can
+    // overflow i64, because Lean's Int is unbounded and i64 is not.
+    let nat = generate(r#"(module M (def f ((a Nat) (b Nat)) Nat (sub Nat a b)))"#);
+    assert!(nat.contains("saturating_sub"));
+    assert!(nat.contains("-> u64 {"), "Nat sub is infallible");
+
+    let int = generate(r#"(module M (def f ((a Int) (b Int)) Int (sub Int a b)))"#);
+    assert!(int.contains("checked_sub(b).ok_or(crate::ComputeError::SubOverflow)?"));
+    assert!(int.contains("-> Result<i64, crate::ComputeError>"));
+}
+
+#[test]
+fn test_int_neg_is_checked() {
+    let ir = r#"(module M (def f ((a Int)) Int (neg Int a)))"#;
+    let out = generate(ir);
+    assert!(out.contains("checked_neg().ok_or(crate::ComputeError::NegOverflow)?"));
+}
+
+#[test]
+fn test_neg_on_a_non_int_kind_is_rejected() {
+    let ir = r#"(module M (def f ((a Nat)) Nat (neg Nat a)))"#;
+    assert!(matches!(generate_err(ir), Error::UnsupportedKind(_)));
+}
+
+#[test]
+fn test_int_shifts_are_rejected() {
+    // Deliberate non-goal; rejected precisely rather than rendered.
+    let ir = r#"(module M (def f ((a Int) (b Int)) Int (shl Int a b)))"#;
+    assert!(matches!(generate_err(ir), Error::UnsupportedKind(_)));
+}
+
+#[test]
+fn test_int_literal_ctors_render_not_unresolved() {
+    // `(1 : Int)`/`(0 : Int)` elaborate through Int's own constructors
+    // (`Int.ofNat`/`Int.negSucc`), not a bare numeral, so LCNF hands codegen a
+    // `(ctor "Int.ofNat" ...)`/`(ctor "Int.negSucc" ...)` node. Discovered via
+    // `c_int_guard_lt`/`c_int_guard_eq` (`if a < b then 1 else 0 : Int`),
+    // which previously failed the whole compile-tests build with
+    // `UnresolvedCall("Int.ofNat")`.
+    let ir = r#"(module M (def f ((n Nat)) Int (ctor "Int.ofNat" n)))"#;
+    assert_eq!(
+        generate(ir),
+        "pub fn f(n: u64) -> i64 {\n    ((n) as i64)\n}\n\n"
+    );
+
+    let ir = r#"(module M (def f ((n Nat)) Int (ctor "Int.negSucc" n)))"#;
+    assert_eq!(
+        generate(ir),
+        "pub fn f(n: u64) -> i64 {\n    (-((n) as i64) - 1)\n}\n\n"
+    );
+}
+
+#[test]
+fn test_sized_arithmetic_wraps_and_is_infallible() {
+    // Lean's UInt8.add is BitVec addition — wrapping IS the semantics, not a
+    // failure. So sized definitions keep a plain return type.
+    let ir = r#"(module M (def f ((a U8) (b U8)) U8 (add U8 a b)))"#;
+    let out = generate(ir);
+    assert!(out.contains("(a) as u8).wrapping_add(b)"), "got: {}", out);
+    assert!(
+        out.contains("-> u8 {"),
+        "sized arithmetic must be infallible"
+    );
+    assert!(!out.contains("ComputeError"));
+}
+
+#[test]
+fn test_sized_shift_masks_the_amount_mod_width() {
+    // `UInt8.shiftLeft a b = ⟨a.toBitVec <<< (UInt8.mod b 8).toBitVec⟩`
+    // (`Init/Data/UInt/Basic.lean:126`) masks the amount mod the width — it
+    // does NOT truncate to 0 past the width (that's `Nat.shiftRight`, whose
+    // unbounded `Nat` genuinely has no width to mask by). So `1u8 << 8`
+    // masks to `1u8 << 0 == 1`, and `checked_shl(..).unwrap_or(0)` — which
+    // would give `0` here — is the WRONG rendering for sized shifts.
+    let ir = r#"(module M (def f ((a U8) (b U8)) U8 (shl U8 a b)))"#;
+    let out = generate(ir);
+    assert!(out.contains("wrapping_shl"), "got: {}", out);
+    assert!(!out.contains("checked_shl"), "checked_shl truncates to 0");
+    assert!(!out.contains("unwrap_or(0)"));
+}
+
+#[test]
+fn test_sized_division_is_total() {
+    let ir = r#"(module M (def f ((a U8) (b U8)) U8 (div U8 a b)))"#;
+    let out = generate(ir);
+    assert!(out.contains("if (b) == 0 { 0 }"));
+    assert!(!out.contains("ComputeError"));
+}
+
+#[test]
+fn test_sized_pow_is_rejected_not_unsoundly_rendered() {
+    // No sized `pow` row is whitelisted from Lean (`sizedOpSuffixes` has no
+    // `pow`), but hand-written IR can still ask for one. `wrapping_pow`'s
+    // exponent has no absorbing case the way shifts do, so the
+    // `u32::try_from(..).unwrap_or(u32::MAX)` narrowing every other exponent
+    // helper here uses would silently compute the wrong number for a `U64`
+    // exponent that overflows `u32`. Rejected outright instead.
+    let ir = r#"(module M (def f ((a U8) (b U8)) U8 (pow U8 a b)))"#;
+    assert!(matches!(generate_err(ir), Error::UnsupportedKind(_)));
+}
+
+#[test]
+fn test_nat_to_int_widens() {
+    let ir = r#"(module M (def f ((a Nat)) Int (convert Nat Int a)))"#;
+    assert!(generate(ir).contains("((a) as i64)"));
+}
+
+#[test]
+fn test_int_to_nat_clamps_negatives_to_zero() {
+    // Lean's Int.toNat clamps: (-5).toNat = 0. `as u64` would wrap to a huge
+    // number, which is the whole reason this needs a rendering rather than a
+    // cast.
+    let ir = r#"(module M (def f ((a Int)) Nat (convert Int Nat a)))"#;
+    let out = generate(ir);
+    assert!(out.contains("max(0)"), "got: {}", out);
+    assert!(
+        !out.contains("(a) as u64)."),
+        "a bare cast would wrap negatives"
+    );
+}
+
+#[test]
+fn test_nat_to_sized_wraps() {
+    let ir = r#"(module M (def f ((a Nat)) U8 (convert Nat U8 a)))"#;
+    assert!(generate(ir).contains("as u8"));
+}
+
+#[test]
+fn test_sized_to_nat_widens() {
+    let ir = r#"(module M (def f ((a U8)) Nat (convert U8 Nat a)))"#;
+    assert!(generate(ir).contains("as u64"));
+}
+
+#[test]
+fn test_unsupported_conversion_is_rejected() {
+    // Cross-width sized conversions are a deliberate non-goal.
+    let ir = r#"(module M (def f ((a U8)) U32 (convert U8 U32 a)))"#;
+    assert!(matches!(generate_err(ir), Error::UnsupportedKind(_)));
+}
+
+#[test]
+fn test_invariant_type_gets_private_fields_and_a_checked_constructor() {
+    let ir = r#"
+(module M
+  (type "UorAtlas.Instance"
+    (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat))
+    (invariant (and (le 1 q) (and (le 1 T) (le 1 O)))))
+)
+"#;
+    let out = generate(ir);
+    // Fields are pub(crate): generated code in this crate still constructs by
+    // struct literal, because Lean already supplied the proof. Only external
+    // callers are routed through the check.
+    assert!(out.contains("pub(crate) q: u64"), "got: {}", out);
+    assert!(!out.contains("pub q: u64"));
+    assert!(out.contains("pub fn new(q: u64, T: u64, O: u64) -> Result<Self, crate::ComputeError>"));
+    assert!(out.contains("if ((1 <= q) && ((1 <= T) && (1 <= O)))"));
+    assert!(out.contains("crate::ComputeError::InvariantViolated(\"UorAtlas.Instance\")"));
+    // One accessor per field, so external callers can still read.
+    assert!(out.contains("pub fn q(&self) -> u64 { self.q }"));
+    assert!(out.contains("pub fn T(&self) -> u64 { self.T }"));
+}
+
+#[test]
+fn test_type_without_invariant_is_unchanged() {
+    // The common case must not regress: public fields, no constructor, no
+    // accessors.
+    let ir = r#"(module M (type "M.Pair" (ctor "M.Pair.mk" (a Nat) (b Nat))))"#;
+    let out = generate(ir);
+    assert!(out.contains("pub a: u64"));
+    assert!(!out.contains("pub(crate)"));
+    assert!(!out.contains("fn new("));
+}
+
+#[test]
+fn test_connectives_render() {
+    let ir = r#"
+(module M
+  (def f ((a Nat) (b Nat)) Bool (and (lt a b) (not (eq a b)))))
+"#;
+    assert!(generate(ir).contains("((a < b) && (!(a == b)))"));
+}
+
+#[test]
+fn test_or_renders() {
+    let ir = r#"(module M (def f ((a Nat) (b Nat)) Bool (or (lt a b) (eq a b))))"#;
+    assert!(generate(ir).contains("((a < b) || (a == b))"));
+}
+
+#[test]
+fn test_multi_constructor_type_with_an_invariant_is_rejected() {
+    // A `Prop` field belongs to one constructor, so an invariant on a
+    // multi-constructor type has no honest rendering: `new` would not know
+    // which variant to build. Reject rather than render half of it.
+    let ir = r#"
+(module M
+  (type "M.Shape"
+    (ctor "M.Shape.circle" (radius Nat))
+    (ctor "M.Shape.rect" (w Nat) (h Nat))
+    (invariant (le 1 radius))))
+"#;
+    match generate_err(ir) {
+        Error::UnsupportedFieldType(msg) => {
+            assert!(msg.contains("M.Shape"), "got: {}", msg);
+            assert!(msg.contains("2 constructors"), "got: {}", msg);
+        }
+        other => panic!("expected UnsupportedFieldType, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_field_named_new_on_an_invariant_type_is_rejected() {
+    // The accessors share an `impl` block with the generated `new`, so a field
+    // named `new` would emit two inherent methods of that name (E0592).
+    // `new` is not a Rust keyword, so nothing downstream escapes or renames it
+    // — without this rejection the output simply would not compile.
+    let ir = r#"
+(module M
+  (type "M.Collide"
+    (ctor "M.Collide.mk" (new Nat) (other Nat))
+    (invariant (le 1 new))))
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::ReservedFieldName(String::from("M.Collide"), String::from("new"))
+    );
+}
+
+#[test]
+fn test_field_named_new_without_an_invariant_is_fine() {
+    // The name is only reserved where the constructor exists. A type with no
+    // invariant gets neither `new` nor accessors, so nothing collides.
+    let ir = r#"(module M (type "M.Plain" (ctor "M.Plain.mk" (new Nat))))"#;
+    assert!(generate(ir).contains("pub new: u64"));
+}
+
+#[test]
+fn test_keyword_field_name_is_raw_escaped_inside_the_checked_constructor() {
+    // `new`'s parameters, the struct's fields and the accessors all go through
+    // `rust_ident`, so the invariant's references to those fields must too --
+    // otherwise a field named `type` renders `pub fn new(r#type: u64)` whose
+    // body reads `if (1 <= type)`, which is a syntax error.
+    let ir = r#"
+(module M
+  (type "M.Kw"
+    (ctor "M.Kw.mk" (type Nat) (fn Nat))
+    (invariant (and (le 1 type) (le 1 fn)))))
+"#;
+    let out = generate(ir);
+    assert!(
+        out.contains("pub fn new(r#type: u64, r#fn: u64) -> Result<Self, crate::ComputeError>"),
+        "got: {}",
+        out
+    );
+    assert!(
+        out.contains("if ((1 <= r#type) && (1 <= r#fn))"),
+        "the invariant must escape the same names the parameters do; got: {}",
+        out
+    );
+    assert!(out.contains("Ok(Kw { r#type, r#fn })"), "got: {}", out);
+    assert!(out.contains("pub fn r#type(&self) -> u64 { self.r#type }"));
+}
+
+/// The rejections that changed their INTERNAL home at the cutover must arrive
+/// here under the published name they had before it.
+///
+/// `test_every_error_variant_is_published_in_rejections` checks that every
+/// variant *appears* in `REJECTIONS`; it cannot see a given input starting to
+/// produce a different one. That is the property at risk when a rejection
+/// moves from `prod-codegen`'s renderer into `prod-lower`, because
+/// `From<LowerError>` is name-for-name and cannot recover a distinction the
+/// lowering did not make.
+#[test]
+fn test_the_rehomed_rejections_keep_their_published_kind() {
+    // Five list rejections. In `prod-lower` these are `UnsupportedList`, a
+    // variant added for exactly this reason: they would otherwise have
+    // arrived as `UnsupportedKind`, which is separately published.
+    for ir in [
+        r#"(module M (def g ((a Nat)) Nat a) (def m ((a Nat)) (List Nat) (call g a)))"#,
+        r#"(module M (def m ((a Nat)) (List Nat) (add Nat a 1)))"#,
+        r#"(module M (def m ((a Nat)) (List Nat) a))"#,
+        r#"(module M (def m () (List Nat) (ctor "List.cons" (add Nat 1 2) (ctor "List.nil"))))"#,
+        r#"(module M (def m ((a Nat)) Nat (ctor "List.cons" a (ctor "List.nil"))))"#,
+    ] {
+        assert!(
+            matches!(generate_err(ir), Error::UnsupportedList(_)),
+            "for {}: got {:?}",
+            ir,
+            generate_err(ir)
+        );
+    }
+
+    // An unresolved callee and an opaque expression, in a body and inside an
+    // invariant. Both used to be `prod-codegen`'s own named rejections and
+    // both degraded when the lowering took them over.
+    assert_eq!(
+        generate_err(r#"(module M (def m ((a Nat)) Nat (extern "Foo.helper" a)))"#),
+        Error::UnresolvedCall("Foo.helper".to_string())
+    );
+    assert_eq!(
+        generate_err(r#"(module M (def m ((a Nat)) Nat (opaque "why")))"#),
+        Error::OpaqueExpr("why".to_string())
+    );
+    assert_eq!(
+        generate_err(
+            r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat)) (invariant (extern "Foo.helper" q))))"#
+        ),
+        Error::UnresolvedCall("Foo.helper".to_string())
+    );
+
+    // A join point the lowering will not place, including the two shapes that
+    // reach it only inside an invariant.
+    assert!(matches!(
+        generate_err(r#"(module M (type "M.S" (ctor "M.S.mk" (q Nat)) (invariant (jmp g q))))"#),
+        Error::UnsupportedJoinPoint(_)
+    ));
+
+    // A lazy connective whose right operand needs statements.
+    assert!(matches!(
+        generate_err(
+            "(module M (def m ((a Nat) (b Nat)) Bool (and (lt a b) (lt (add Nat a b) b))))"
+        ),
+        Error::OpaqueExpr(_)
+    ));
+}
+
+/// `generate_module` must call `lower_def_in`, not `lower_def`.
+///
+/// The table-free form cannot see the module's declarations, so it can check
+/// neither a constructor's arity nor a projected field's existence -- two
+/// rejections `REJECTIONS` still advertises. Both are pinned separately above;
+/// this asserts the reason they still fire, by checking that the SAME IR is
+/// accepted by the single-definition entry point, which documents having no
+/// module to resolve against.
+#[test]
+fn test_generate_module_resolves_against_the_module_but_generate_def_cannot() {
+    let ir = r#"
+(module M
+  (type "M.Rec" (ctor "M.Rec.mk" (alpha Nat)))
+  (def f ((r (named "M.Rec"))) Nat (proj "M.Rec" "beta" r)))
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::UnknownField("M.Rec".to_string(), "beta".to_string())
+    );
+
+    let (_, module) = parse_module(ir).unwrap();
+    // No module, so no declaration to disagree with -- and no `(named ...)`
+    // to resolve either, which is the documented cost of the entry point.
+    assert_eq!(
+        generate_def(&module.definitions[0]),
+        Err(Error::OpaqueType("M.Rec".to_string()))
+    );
 }

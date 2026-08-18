@@ -19,11 +19,13 @@ corresponding IR nodes. Design decisions:
   `let` bindings with `LetValue.erased` values (proofs) register their binder
   name but emit no binding and no opaque marker — proofs are erased by design.
 - **Operator whitelist**: `Nat.add/sub/mul/div/mod/shiftLeft/shiftRight/pow`
-  map to the IR binary ops (`pow` was added to prod-ir in M3 for `belt`;
-  `shiftRight` maps to `shr`, a total/infallible IR node distinct from `shl`
-  — `a >>> b = 0` for `b ≥ 64` since `Nat` is unbounded, so there is no
-  overflow case to report). `Nat.shiftRight` reaches lowering both from `>>>`
-  written directly and from LCNF's `n / 2` peephole (division by a
+  map to the IR binary ops, each tagged with its numeric kind — `(add Nat a
+  b)`, not bare `(add a b)` — since the IR grammar carries the kind
+  explicitly rather than inferring it (`pow` was added to prod-ir in M3 for
+  `belt`; `shiftRight` maps to `shr`, a total/infallible IR node distinct
+  from `shl` — `a >>> b = 0` for `b ≥ 64` since `Nat` is unbounded, so there
+  is no overflow case to report). `Nat.shiftRight` reaches lowering both from
+  `>>>` written directly and from LCNF's `n / 2` peephole (division by a
   power-of-two literal); either way it is just another whitelisted name by
   the time lowering sees it. Any other constant becomes an *unresolved
   call*: if the callee is `@[prod]`-tagged it is `(call <last-component>
@@ -65,8 +67,9 @@ structure LowerCtx where
 structure LowerState where
   names   : Std.HashMap Name String := {}  -- keyed on `FVarId.name`
   used    : Std.HashSet String := {}
-  /-- Compiler-generated Nat dictionaries which are semantically operators. -/
-  knownOps : Std.HashMap String String := {}
+  /-- Compiler-generated Nat dictionaries which are semantically operators,
+      as (IR op, IR kind). -/
+  knownOps : Std.HashMap String (String × String) := {}
   counter : Nat := 0
   opaques : Array String := #[]            -- opaque markers emitted
   externs : Array String := #[]            -- non-tagged, non-whitelisted calls
@@ -110,35 +113,38 @@ def registerFVar (fvarId : FVarId) (binderName : Name) : LowerM String := do
 def lookupFVar (fvarId : FVarId) : LowerM String :=
   registerFVar fvarId fvarId.name
 
-/-- Names used by Lean's Nat typeclass dictionaries in pure LCNF output. -/
-def natDictOp : Name → Option String
-  | `instAddNat => some "add"
-  | `instSubNat => some "sub"
-  | `instMulNat => some "mul"
-  | `instDiv => some "div"
-  | `instMod => some "mod"
-  | `instNatPowNat => some "pow"
-  | `Nat.add => some "add"
-  | `Nat.sub => some "sub"
-  | `Nat.mul => some "mul"
-  | `Nat.div => some "div"
-  | `Nat.mod => some "mod"
-  | `Nat.pow => some "pow"
+/-- Names used by Lean's Nat typeclass dictionaries in pure LCNF output.
+    Every one of these is a `Nat` dictionary, so the kind is always `"Nat"`. -/
+def natDictOp : Name → Option (String × String)
+  | `instAddNat => some ("add", "Nat")
+  | `instSubNat => some ("sub", "Nat")
+  | `instMulNat => some ("mul", "Nat")
+  | `instDiv => some ("div", "Nat")
+  | `instMod => some ("mod", "Nat")
+  | `instNatPowNat => some ("pow", "Nat")
+  | `Nat.add => some ("add", "Nat")
+  | `Nat.sub => some ("sub", "Nat")
+  | `Nat.mul => some ("mul", "Nat")
+  | `Nat.div => some ("div", "Nat")
+  | `Nat.mod => some ("mod", "Nat")
+  | `Nat.pow => some ("pow", "Nat")
   | _ => none
 
-/-- Lift a Nat dictionary through its overloaded-operation wrapper. -/
-def natHDictOp : Name → Option String
-  | `instHAdd => some "add"
-  | `instHSub => some "sub"
-  | `instHMul => some "mul"
-  | `instHDiv => some "div"
-  | `instHMod => some "mod"
-  | `instHPow => some "pow"
-  | `instPowNat => some "pow"
+/-- Lift a Nat dictionary through its overloaded-operation wrapper. Every one
+    of these is a `Nat` dictionary too, so the kind is always `"Nat"`. -/
+def natHDictOp : Name → Option (String × String)
+  | `instHAdd => some ("add", "Nat")
+  | `instHSub => some ("sub", "Nat")
+  | `instHMul => some ("mul", "Nat")
+  | `instHDiv => some ("div", "Nat")
+  | `instHMod => some ("mod", "Nat")
+  | `instHPow => some ("pow", "Nat")
+  | `instPowNat => some ("pow", "Nat")
   | _ => none
 
-/-- The operation represented by an already-lowered local value. -/
-def knownOpOf (v : LetValue .pure) : LowerM (Option String) := do
+/-- The operation (IR op, IR kind) represented by an already-lowered local
+    value. -/
+def knownOpOf (v : LetValue .pure) : LowerM (Option (String × String)) := do
   let st ← get
   match v with
   | .const n _ args =>
@@ -183,21 +189,121 @@ def lowerArgs (args : Array (Arg .pure)) : LowerM (Array String) := do
 private def spaced (xs : Array String) : String :=
   if xs.isEmpty then "" else " " ++ String.intercalate " " xs.toList
 
-/-- `.const` operator whitelist as an (LCNF constant name, IR binary op)
-    association list. Single source of truth for both `opWhitelist` (what the
-    lowerer accepts) and `subsetJson` (the published contract, `Prod.Emit`) —
-    extracted so the two cannot drift apart. `pow` was added to prod-ir in M3
-    for `belt`; `shiftRight` maps to `shr`, a total/infallible IR node
-    distinct from `shl` — `a >>> b = 0` for `b ≥ 64` since `Nat` is unbounded,
-    so there is no overflow case to report. -/
-def natOpNames : List (Name × String) :=
-  [ (`Nat.add, "add"), (`Nat.sub, "sub"), (`Nat.mul, "mul"), (`Nat.div, "div"),
-    (`Nat.mod, "mod"), (`Nat.shiftLeft, "shl"), (`Nat.shiftRight, "shr"),
-    (`Nat.pow, "pow") ]
+/-- `.const` operator whitelist as an (LCNF constant name, IR operator, IR
+    numeric kind) association list. Single source of truth for both
+    `opWhitelist` (what the lowerer accepts) and `subsetJson` (the published
+    contract, `Prod.Emit`) — extracted so the two cannot drift apart. `pow`
+    was added to prod-ir in M3 for `belt`; `shiftRight` maps to `shr`, a
+    total/infallible IR node distinct from `shl` — `a >>> b = 0` for `b ≥ 64`
+    since `Nat` is unbounded, so there is no overflow case to report.
 
-/-- `.const` operator whitelist: Lean kernel Nat ops → IR binary ops. -/
-def opWhitelist (n : Name) : Option String :=
-  (natOpNames.find? (fun p => p.1 == n)).map (·.2)
+    Sized-integer rows are generated rather than typed out: every `UIntN`
+    shares the same operation names (`sizedOpRows` below), so listing them by
+    hand would be four near-identical blocks that can drift. -/
+def natOpRows : List (Name × String × String) :=
+  [ (`Nat.add, "add", "Nat"), (`Nat.sub, "sub", "Nat"), (`Nat.mul, "mul", "Nat"),
+    (`Nat.div, "div", "Nat"), (`Nat.mod, "mod", "Nat"),
+    (`Nat.shiftLeft, "shl", "Nat"), (`Nat.shiftRight, "shr", "Nat"),
+    (`Nat.pow, "pow", "Nat") ]
+
+/-- Operation suffixes shared by every sized integer type: `UInt8.add`,
+    `UInt16.add`, … all exist under the same suffix, so this is the shared
+    half of `sizedOpRows`'s generation rather than typed out four times. -/
+def sizedOpSuffixes : List (Name × String) :=
+  [ (`add, "add"), (`sub, "sub"), (`mul, "mul"), (`div, "div"), (`mod, "mod"),
+    (`shiftLeft, "shl"), (`shiftRight, "shr") ]
+
+/-- Lean sized-integer types and their IR kind tags. Also used by `lowerType`
+    (mapping `UInt8`…`UInt64` to `U8`…`U64`) and `deciderNames` below, so a
+    fifth sized kind would only need adding here. -/
+def sizedKinds : List (Name × String) :=
+  [ (`UInt8, "U8"), (`UInt16, "U16"), (`UInt32, "U32"), (`UInt64, "U64") ]
+
+/-- Types the IR handles natively, paired with their contract annotation.
+    Single source of truth for three consumers that previously each carried
+    their own copy: `collectTypeDecls`' exclusion test (a builtin must not be
+    collected as a user inductive — `UInt8` is a structure over
+    `toBitVec : BitVec 8`, and trying to describe that field aborts the
+    export), and `subsetJson`'s published Types list.
+
+    `lowerType` deliberately does NOT consume this: it maps each builtin to a
+    *different* IR tag, which is a mapping rather than a membership test, and
+    collapsing the two would make the list carry two unrelated jobs. -/
+def builtinTypes : List (Name × String) :=
+  [ (`Nat, "Nat"),
+    (`Bool, "Bool"),
+    (`Int, "Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int; Nat -> Int is supported, via the constructors Int.ofNat (n renders as (n as i64)) and Int.negSucc (n renders as -(n as i64) - 1) -- these are constructor applications, not conversion calls, so they never appear in the Conversions list below)"),
+    (`Prod, "Prod (renders as a Rust tuple)"),
+    (`List, "List (parameter: &[a]; return: a caller-owned output buffer)"),
+    (`Option, "Option") ]
+  ++ sizedKinds.map (fun p =>
+       (p.1, s!"{p.1} (renders as {p.2.toLower}; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) -- none of this can fail; pow is not whitelisted for sized kinds)"))
+
+/-- Is this constant a type the IR handles natively? -/
+def isBuiltinType (n : Name) : Bool := builtinTypes.any (fun p => p.1 == n)
+
+/-- The cross product of `sizedKinds` and `sizedOpSuffixes`: every
+    sized-integer operator row, e.g. `UInt8.add` ↦ `("add", "U8")`. This is
+    what makes the "generated rather than typed out" claim above true. -/
+def sizedOpRows : List (Name × String × String) :=
+  sizedKinds.flatMap fun (ty, kind) =>
+    sizedOpSuffixes.map fun (suffix, ir) => (ty ++ suffix, ir, kind)
+
+/-- `Int` operator whitelist. `Int.ediv`/`Int.emod` are the actual `Div
+    Int`/`Mod Int` instance implementations (Euclidean, not truncating —
+    `Init/Data/Int/DivMod/Basic.lean`, "for compatibility with SMT-LIB"), so
+    they are the names that reach LCNF for `a / b`/`a % b` on `Int`, not
+    `Int.div`/`Int.mod` (which are the truncating operations and are never
+    invoked by the `/`/`%` notation). Shifts are deliberately absent: `Int`
+    shifts are not lowered (see `prod-codegen`'s `Expr::Shl`/`Expr::Shr`). -/
+def intOpRows : List (Name × String × String) :=
+  [ (`Int.add, "add", "Int"), (`Int.sub, "sub", "Int"), (`Int.mul, "mul", "Int"),
+    (`Int.ediv, "div", "Int"), (`Int.emod, "mod", "Int"),
+    (`Int.neg, "neg", "Int"), (`Int.pow, "pow", "Int") ]
+
+def numOpNames : List (Name × String × String) := natOpRows ++ intOpRows ++ sizedOpRows
+
+/-- `.const` operator whitelist: Lean constant → (IR operator, IR kind). -/
+def opWhitelist (n : Name) : Option (String × String) :=
+  (numOpNames.find? (fun p => p.1 == n)).map (fun p => (p.2.1, p.2.2))
+
+/-- (Lean constant, from-kind, to-kind). Unary; emitted as `(convert F T x)`.
+    A conversion carries two kinds, not one, so this is a separate table from
+    `numOpNames` rather than another row shape squeezed into it.
+
+    `Int.ofNat` is deliberately **absent** here even though it converts
+    `Nat → Int`: `Int` is `inductive Int | ofNat : Nat → Int | negSucc : Nat →
+    Int`, so `Int.ofNat` is a constructor, and `lowerLetValue` below checks
+    `isCtorName` *before* consulting this table. Every occurrence — an
+    explicit call, or a `Nat`-typed literal elaborating into an `Int`
+    position — is intercepted there and lowered as `(ctor "Int.ofNat" ...)`,
+    never reaching this table; a row for it here would be dead. Confirmed by
+    export: `Int.ofNat a` lowers to `(ctor "Int.ofNat" a)` even when this
+    table is consulted first for every other `.const`. `prod-codegen`'s
+    `Expr::Ctor` arm already renders that ctor as `((n) as i64)` — identical
+    to what `Expr::Convert`'s `(Nat, Int)` arm renders — so the two would be
+    indistinguishable in output even if both existed; only one does.
+
+    `Int.toNat` and the `UIntN.toNat` half below are genuine `def`s, so the
+    constructed spelling (`ty ++ \`toNat`) is exactly the constant that
+    reaches lowering. The `Nat → UIntN` half is NOT `Nat.toUIntN`, despite
+    that spelling existing (`Nat.toUInt8`, `Init/Data/UInt/BasicAux.lean`):
+    every one of `Nat.toUInt8`/16/32/64 is declared as
+    `abbrev Nat.toUIntN := UIntN.ofNat`, and Lean's compiler unfolds the
+    abbrev before the constant reaches LCNF — confirmed by export: a
+    conformance def using `a.toUInt8`/`a.toUInt16`/`a.toUInt32`/`a.toUInt64`
+    lowers to `extern "UInt8.ofNat"`/`"UInt16.ofNat"`/`"UInt32.ofNat"`/
+    `"UInt64.ofNat"`, never `extern "Nat.toUIntN"`. So the row is `ty ++
+    \`ofNat`, not the constructed `Nat.toUIntN` name the source-level spelling
+    would suggest. -/
+def conversionNames : List (Name × String × String) :=
+  [ (`Int.toNat, "Int", "Nat") ]
+  ++ sizedKinds.flatMap fun (ty, kind) =>
+       [ (ty ++ `toNat, kind, "Nat"), (ty ++ `ofNat, "Nat", kind) ]
+
+/-- `.const` conversion whitelist: Lean constant → (from-kind, to-kind). -/
+def conversionWhitelist (n : Name) : Option (String × String) :=
+  (conversionNames.find? (fun p => p.1 == n)).map (fun p => (p.2.1, p.2.2))
 
 private def isCtorName (env : Environment) (n : Name) : Bool :=
   match env.find? n with
@@ -207,6 +313,21 @@ private def isCtorName (env : Environment) (n : Name) : Bool :=
 def lowerLetValue (v : LetValue .pure) : LowerM String := do
   match v with
   | .lit (.nat n) => return toString n
+  -- Sized-integer literals are a *distinct* `LitValue` constructor from
+  -- `.nat` (`Lean/Compiler/LCNF/Basic.lean`: `LitValue` has `nat`, `str`,
+  -- `uint8`, `uint16`, `uint32`, `uint64`, `usize`), not a `Nat` literal
+  -- wrapped in a `UIntN` — discovered because `c_u8_guard_lt`'s `then 1 else
+  -- 0` branches (the first sized literals in the conformance suite) fell
+  -- through to the opaque catch-all below and would have made codegen
+  -- reject the whole definition (`Expr::Opaque` → `Error::OpaqueExpr`). The
+  -- IR grammar's numeric literals are untagged decimal tokens either way
+  -- (`prod-ir`'s `parse_u64`/`Expr::Nat`), so the same rendering as `.nat`
+  -- is exact: the sized-integer receiver already pins the Rust type via the
+  -- surrounding `(add U8 ...)`/return-type context, same as `Nat`'s.
+  | .lit (.uint8 n) => return toString n
+  | .lit (.uint16 n) => return toString n
+  | .lit (.uint32 n) => return toString n
+  | .lit (.uint64 n) => return toString n
   | .lit _ => opaqueNode "literal"
   | .erased => opaqueNode "erased"
   | .proj typeName idx struct => do
@@ -233,12 +354,23 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     if isCtorName env declName then
       return s!"(ctor \"{declName}\"{spaced args'})"
     match opWhitelist declName with
-    | some op =>
+    | some (op, kind) =>
+      -- `Int.neg` is unary, unlike every other whitelisted operator.
+      if op == "neg" && args'.size == 1 then
+        return s!"(neg {kind} {args'[0]!})"
       if args'.size == 2 then
-        return s!"({op} {args'[0]!} {args'[1]!})"
+        return s!"({op} {kind} {args'[0]!} {args'[1]!})"
       -- partial/unusual application of a whitelisted op: not a 2-arg operator
       -- use, and not necessarily `@[prod]`-tagged either, so it is the same
       -- kind of unresolved callee as the `none` case below.
+      modify fun st => { st with externs := st.externs.push s!"{declName} (unusual application)" }
+      return s!"(extern \"{declName}\"{spaced args'})"
+    | none =>
+    match conversionWhitelist declName with
+    | some (from_, to) =>
+      -- Conversions are unary, unlike the (mostly) binary `numOpNames`.
+      if args'.size == 1 then
+        return s!"(convert {from_} {to} {args'[0]!})"
       modify fun st => { st with externs := st.externs.push s!"{declName} (unusual application)" }
       return s!"(extern \"{declName}\"{spaced args'})"
     | none =>
@@ -253,8 +385,8 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     let nm ← lookupFVar f
     let args' ← lowerArgs args
     match (← get).knownOps[nm]? with
-    | some op =>
-      if args'.size == 2 then return s!"({op} {args'[0]!} {args'[1]!})"
+    | some (op, kind) =>
+      if args'.size == 2 then return s!"({op} {kind} {args'[0]!} {args'[1]!})"
       return s!"(call {nm}{spaced args'})"
     | none => return s!"(call {nm}{spaced args'})"
   | _ => opaqueNode "letvalue"  -- impure-phase-only constructors
@@ -263,11 +395,40 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
     with their IR comparison operator. Single source of truth for both
     `deciderOp` and `subsetJson` (`Prod.Emit`), so the published contract
     cannot list a decider the lowerer does not actually accept, or omit one
-    it does. `instDecidableEqNat` appears in LCNF when the instance wrapper
-    is not unfolded (unlike the arithmetic dictionaries). -/
+    it does. `instDecidableEqNat`/`Int.instDecidableEq` appear in LCNF when
+    the `DecidableEq` instance wrapper is not unfolded (unlike the arithmetic
+    dictionaries) — `Int` has the structurally identical anonymous instance
+    (`Init/Data/Int/Basic.lean`: `instance : DecidableEq Int := Int.decEq`,
+    declared inside `namespace Int`) as `Nat`, so it needs the same second
+    row. The auto-generated name is `Int.instDecidableEq`, not
+    `instDecidableEqInt`: Lean drops the redundant `Int` argument suffix
+    because the instance already sits inside `namespace Int` (confirmed by
+    enumerating the environment's constants — `instDecidableEqInt` does not
+    exist and fails the build with `unknown constant`).
+
+    The sized-integer types are the opposite case from `Int`: their
+    `instance : DecidableEq UIntN := UIntN.decEq` declarations sit at the top
+    level of `Init/Prelude.lean`, with no enclosing `namespace UIntN` block
+    (confirmed by grepping for `^namespace` in that file — none precedes any
+    of the `UInt8`…`UInt64` declarations). So, like `Nat`, the auto-generated
+    name keeps the full `UIntN` suffix: `instDecidableEqUInt8`, not
+    `UInt8.instDecidableEq`. Confirmed by `#check`ing all sixteen sized names
+    directly against the toolchain (`UInt8.decLt`/`decLe`/`decEq` … `UInt64.…`
+    plus `instDecidableEqUInt8` … `instDecidableEqUInt64`) — every one
+    resolves, unlike `instDecidableEqInt`. -/
 def deciderNames : List (Name × String) :=
   [ (``Nat.decLt, "lt"), (``Nat.decLe, "le"), (``Nat.decEq, "eq"),
-    (``instDecidableEqNat, "eq") ]
+    (``instDecidableEqNat, "eq"),
+    (``Int.decLt, "lt"), (``Int.decLe, "le"), (``Int.decEq, "eq"),
+    (``Int.instDecidableEq, "eq"),
+    (``UInt8.decLt, "lt"), (``UInt8.decLe, "le"), (``UInt8.decEq, "eq"),
+    (``instDecidableEqUInt8, "eq"),
+    (``UInt16.decLt, "lt"), (``UInt16.decLe, "le"), (``UInt16.decEq, "eq"),
+    (``instDecidableEqUInt16, "eq"),
+    (``UInt32.decLt, "lt"), (``UInt32.decLe, "le"), (``UInt32.decEq, "eq"),
+    (``instDecidableEqUInt32, "eq"),
+    (``UInt64.decLt, "lt"), (``UInt64.decLe, "le"), (``UInt64.decEq, "eq"),
+    (``instDecidableEqUInt64, "eq") ]
 
 /-- The decider constants recognized by `decidableIf?`, mapped to their IR
     comparison operator. -/
@@ -390,6 +551,11 @@ partial def lowerType (e : Expr) : LowerM String := do
   | .const ``Bool _ => return "Bool"
   | .const ``Int _ => return "Int"
   | .const n _ =>
+    -- `sizedKinds` doubles as the `UInt8`…`UInt64` → `U8`…`U64` type map, so
+    -- a fifth sized kind would only need adding there.
+    match sizedKinds.find? (fun p => p.1 == n) with
+    | some (_, tag) => return tag
+    | none =>
     match (← getEnv).find? n with
     | some (.inductInfo _) => return s!"(named \"{n}\")"
     | _ => opaqueType n
@@ -441,6 +607,130 @@ def indent (n : Nat) (s : String) : String :=
 def isPropType (e : Expr) : LowerM Bool :=
   liftM (Lean.Meta.MetaM.run' (Lean.Meta.isProp e))
 
+/-- An operand inside a proposition: either a reference to one of the
+    structure's own fields, or a numeric literal. Anything else makes the
+    whole proposition unlowerable.
+
+    Defined before `lowerProp`, which calls it: Lean has no forward references
+    outside a `mutual` block, and this function never calls back, so ordering
+    is enough. -/
+partial def lowerPropOperand (e : Expr) (fields : Array String) (depth : Nat)
+    : LowerM (Option String) := do
+  match e with
+  | .bvar i =>
+    -- Decline an index at or beyond the binder depth BEFORE computing `idx`.
+    -- `Nat` subtraction truncates, so `depth - 1 - i` silently yields `0` for
+    -- every such index and resolves to `fields[0]` instead of declining —
+    -- a comparison that compiles, returns a `bool`, and is wrong.
+    --
+    -- Unreachable today: `lowerTypeDecl` rejects `numParams != 0` before the
+    -- telescope walk, so every `bvar` in a field type is an earlier field.
+    -- It stops being unreachable the moment a proposition may mention a type
+    -- parameter, which is exactly Phase B2: `Fin n`'s `isLt : val < n`
+    -- references `n`, a binder outside the field telescope. For `Fin`,
+    -- `fields[0]` is `val`, so the truncated read would lower `val < n` to
+    -- `(lt val val)` — always false, and green everywhere.
+    if i ≥ depth then return none
+    let idx := depth - 1 - i
+    match fields[idx]? with
+    | some name => return some name
+    | none => return none
+  | .lit (.natVal n) => return some (toString n)
+  | _ =>
+    -- `OfNat.ofNat`-wrapped literals: take the raw literal argument if there
+    -- is one, otherwise decline. This is the shape numeric literals actually
+    -- take in a constructor telescope (`OfNat.ofNat Nat n (instOfNatNat n)`);
+    -- the raw `.lit` arm above is a harmless belt-and-braces case.
+    match e.getAppFn with
+    | .const ``OfNat.ofNat _ =>
+      let raw? : Option Expr := e.getAppArgs[1]?
+      match raw? with
+      | some (.lit (.natVal n)) => return some (toString n)
+      | _ => return none
+    | _ => return none
+
+/-- The types a lowered comparison may range over: the numeric kinds the IR
+    compares natively. Built from `sizedKinds` so a fifth sized kind is picked
+    up automatically, the same way `lowerType` and `deciderNames` consume it.
+
+    This exists because `lowerProp`'s docstring scopes the fragment to
+    "comparisons on supported numeric kinds" and nothing used to enforce it: a
+    polymorphic `LE.le`/`Eq` over any type at all lowered to an IR comparison
+    as long as both operands happened to be field references. Equality between
+    two `Bool` fields is the reachable case — it produced `(eq a b)`, a scalar
+    comparison node, for a type the fragment never claimed. A documented
+    restriction the code does not apply is the defect shape this project keeps
+    shipping, so the claim is now checked rather than reworded. -/
+def propCmpKinds : List Name := [``Nat, ``Int] ++ sizedKinds.map (·.1)
+
+/-- Lower a `Prop` to a boolean IR expression over a structure's own fields,
+    or `none` if it is outside the lowerable fragment.
+
+    `fields` holds the field names in binder order — **including** `Prop`
+    fields, since de Bruijn indices count every binder. A proposition refers
+    to an earlier field by de Bruijn index, so `bvar i` at binder depth `d`
+    (the `Prop` field's own 0-indexed telescope position) names
+    `fields[d - 1 - i]`. See AGENTS.md for the verified shape.
+
+    Lowerable: conjunction, disjunction, negation, and comparisons on
+    supported numeric kinds. Everything else — quantifiers, arbitrary
+    predicates, anything mentioning a name that is not one of this
+    structure's fields — returns `none`, and the structure then keeps public
+    fields and no checked constructor. That is a strictly weaker outcome, not
+    a wrong one. -/
+partial def lowerProp (e : Expr) (fields : Array String) (depth : Nat)
+    : LowerM (Option String) := do
+  let arg? (i : Nat) : Option Expr := e.getAppArgs[i]?
+  match e.getAppFn with
+  | .const ``And _ => do
+    let some a := arg? 0 | return none
+    let some b := arg? 1 | return none
+    let some a' ← lowerProp a fields depth | return none
+    let some b' ← lowerProp b fields depth | return none
+    return some s!"(and {a'} {b'})"
+  | .const ``Or _ => do
+    let some a := arg? 0 | return none
+    let some b := arg? 1 | return none
+    let some a' ← lowerProp a fields depth | return none
+    let some b' ← lowerProp b fields depth | return none
+    return some s!"(or {a'} {b'})"
+  | .const ``Not _ => do
+    let some a := arg? 0 | return none
+    let some a' ← lowerProp a fields depth | return none
+    return some s!"(not {a'})"
+  | .const cmp _ =>
+    -- Comparisons. `a ≥ b` is `b ≤ a` and `a > b` is `b < a`, so the two
+    -- reversed forms map onto the IR's `le`/`lt` with their operands swapped
+    -- rather than needing their own nodes.
+    let swap? : Option (String × Bool) :=
+      if cmp == ``LE.le || cmp == ``Nat.le then some ("le", false)
+      else if cmp == ``GE.ge then some ("le", true)
+      else if cmp == ``LT.lt || cmp == ``Nat.lt then some ("lt", false)
+      else if cmp == ``GT.gt then some ("lt", true)
+      else if cmp == ``Eq then some ("eq", false)
+      else none
+    let some (op, reversed) := swap? | return none
+    -- Comparisons carry instance/type arguments ahead of the operands; take
+    -- the LAST two arguments, which are the operands under every spelling.
+    let args := e.getAppArgs
+    if args.size < 2 then return none
+    -- Enforce the "supported numeric kinds" scope the docstring claims. A
+    -- polymorphic comparison (`LE.le α inst a b`, `Eq α a b`) carries its type
+    -- as the first argument and must name a kind the IR compares natively; the
+    -- monomorphic spellings (`Nat.le a b`) carry only the two operands, and
+    -- are already pinned to `Nat` by their own name.
+    let kindOk : Bool :=
+      if args.size ≥ 3 then
+        match args[0]! with
+        | .const ty _ => propCmpKinds.contains ty
+        | _ => false   -- e.g. `Eq (Nat × Nat) p q`: an applied type, not a kind
+      else true
+    if !kindOk then return none
+    let some a ← lowerPropOperand args[args.size - 2]! fields depth | return none
+    let some b ← lowerPropOperand args[args.size - 1]! fields depth | return none
+    return some (if reversed then s!"({op} {b} {a})" else s!"({op} {a} {b})")
+  | _ => return none
+
 /-- Render one inductive as an IR `(type ...)` declaration, erasing `Prop`
     fields.
 
@@ -460,27 +750,64 @@ def lowerTypeDecl (typeName : Name) : LowerM (Option String) := do
   if let some reason := unsupported? then
     return some s!"(type \"{typeName}\" (unsupported \"{reason}\"))"
   let mut ctorSexps : Array String := #[]
+  -- Propositions collected from `Prop` fields, and whether every one lowered.
+  -- A single unlowerable `Prop` field suppresses the whole `(invariant ...)`
+  -- clause: emitting a partial invariant would claim the generated
+  -- constructor checks everything Lean proved when it does not.
+  let mut invProps : Array String := #[]
+  let mut invOk := true
   for ctorName in iv.ctors do
     let some (.ctorInfo cv) := env.find? ctorName | return none
     -- Walk the constructor telescope past the (zero) type params to reach the
     -- value fields, pairing each with its declared name.
     let fieldNames := getStructureFields env typeName
+    -- Two different lists, deliberately kept apart. `fields` is the OUTPUT
+    -- field list and excludes `Prop` fields (they are erased). `binderNames`
+    -- is every telescope binder in order, `Prop` fields included, because de
+    -- Bruijn indices inside a proposition count every binder — conflating the
+    -- two shifts every index and silently references the wrong field.
     let mut fields : Array String := #[]
+    let mut binderNames : Array String := #[]
     let mut ty := cv.type
     let mut i := 0
     while i < cv.numFields do
       match ty with
       | .forallE _ fieldTy rest _ =>
-        if !(← isPropType fieldTy) then
-          let nm := match fieldNames[i]? with
-            | some n => sanitize n
-            | none => s!"field_{i}"
+        let nm := match fieldNames[i]? with
+          | some n => sanitize n
+          | none => s!"field_{i}"
+        if ← isPropType fieldTy then
+          -- `i` is this `Prop` field's own 0-indexed telescope position,
+          -- which is exactly the binder depth its bvars are relative to.
+          match ← lowerProp fieldTy binderNames i with
+          | some p => invProps := invProps.push p
+          | none => invOk := false
+        else
           fields := fields.push s!"({nm} {← lowerType fieldTy})"
+        binderNames := binderNames.push nm
         ty := rest
         i := i + 1
-      | _ => i := cv.numFields
+      | _ =>
+        -- The telescope ran out before `numFields` binders were consumed.
+        -- Defensive: unreachable for a well-formed constructor. Any `Prop`
+        -- field already collected would otherwise stay in `invProps` while
+        -- the unvisited ones were silently dropped, emitting an invariant
+        -- that omits conjuncts Lean proved — a partial check presented as a
+        -- complete one, which is exactly the outcome the fragment must never
+        -- produce. Decline the whole invariant instead.
+        invOk := false
+        i := cv.numFields
     ctorSexps := ctorSexps.push s!"(ctor \"{ctorName}\"{spaced fields})"
-  return some s!"(type \"{typeName}\"{spaced ctorSexps})"
+  -- Only a single-constructor type gets an invariant: with several
+  -- constructors the field references would belong to different telescopes.
+  let invariant : String :=
+    if iv.ctors.length == 1 && invOk && !invProps.isEmpty then
+      -- Left-associated: `p0`, `(and p0 p1)`, `(and (and p0 p1) p2)`, …
+      let conj := (invProps.extract 1 invProps.size).foldl
+        (init := invProps[0]!) fun acc p => s!"(and {acc} {p})"
+      s!" (invariant {conj})"
+    else ""
+  return some s!"(type \"{typeName}\"{spaced ctorSexps}{invariant})"
 
 /-- Type names a single LCNF `LetValue` mentions: a constructor application
     names its inductive, a projection names the structure it projects from.

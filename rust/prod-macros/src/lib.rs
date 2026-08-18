@@ -43,7 +43,36 @@ pub fn prod_defs(input: TokenStream) -> TokenStream {
     let tokens = syn::parse_str::<proc_macro2::TokenStream>(&src)
         .unwrap_or_else(|e| panic!("Generated code did not parse as Rust: {}\n{}", e, src));
 
-    quote! { #tokens }.into()
+    // Make cargo rebuild the invoking crate when the IR file changes.
+    //
+    // Without this, cargo's only inputs are the invoking crate's own sources,
+    // so `lake exe prod-export` rewriting a golden does NOT trigger
+    // re-expansion: the crate keeps compiling against the IR text captured by
+    // the last build. That silently voids the guarantee
+    // `prod-codegen-compile-tests` exists to provide — "every future golden
+    // bless is checked by rustc, not only by eye" — because a bless whose
+    // consumer crate is otherwise unchanged is never recompiled at all. It is
+    // the same failure shape as the shift defect: a green build reporting on
+    // an input it did not read. Observed live — new conformance structures
+    // appeared in `golden.ir` while the crate still compiled the previous
+    // expansion, and `cargo test` passed until the crate was touched by hand.
+    //
+    // `include_str!` is the stable way to register a file dependency
+    // (`proc_macro::tracked_path` is still unstable). It must be an ABSOLUTE
+    // path: `include_str!` resolves relative to the source file holding the
+    // invocation, whereas `ir = "..."` is relative to `CARGO_MANIFEST_DIR`,
+    // and the two differ by however deep the invoking module sits. Emitted
+    // only when the resolved path is absolute, which it is whenever cargo set
+    // `CARGO_MANIFEST_DIR`; the bare-path fallback silently skips tracking
+    // rather than emitting an `include_str!` that would resolve elsewhere.
+    let tracking = if resolved.is_absolute() {
+        let tracked: &str = &resolved.to_string_lossy();
+        quote! { const _: &str = include_str!(#tracked); }
+    } else {
+        quote! {}
+    };
+
+    quote! { #tracking #tokens }.into()
 }
 
 fn resolve_ir_path(path: &str) -> PathBuf {

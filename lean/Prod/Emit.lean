@@ -39,12 +39,21 @@ def conformanceModule : Name := `Conformance
 /-- IR module name for the conformance export. -/
 def conformanceIrModule : String := "Conformance"
 
+/-- Module whose lowering is pinned but whose codegen is a deliberate
+    rejection. Separate from `conformanceModule` so that corpus can promise
+    that everything in it also generates Rust which compiles — enforced by
+    `rust/prod-codegen-compile-tests`. -/
+def conformanceRejectedModule : Name := `ConformanceRejected
+
+/-- IR module name for the rejected-conformance export. -/
+def conformanceRejectedIrModule : String := "ConformanceRejected"
+
 /-! ## Published subset contract
 
 Machine-readable description of the Lean-side lowering surface, consumed by
 `prod subset` to render `specs/lean-for-production.md`. Hand-rolled JSON, no
 dependencies, matching how `rootsJson` is built. The operator and decider
-lists are derived from `natOpNames`/`deciderNames` (`Prod.Lower`) — the same
+lists are derived from `numOpNames`/`deciderNames` (`Prod.Lower`) — the same
 association lists `opWhitelist`/`deciderOp` consume to decide what actually
 lowers — so the published contract cannot describe more, or less, than the
 lowerer accepts. -/
@@ -54,21 +63,21 @@ lowerer accepts. -/
     subset` (`prod-cli`), which merges it with codegen's rejection list to
     render the published contract. -/
 def subsetJson : String :=
-  let ops := natOpNames.map fun p => toString p.1
+  let ops := numOpNames.map fun r => toString r.1
+  let conversions := conversionNames.map fun r => toString r.1
   let deciders := deciderNames.map fun p => toString p.1
-  -- `Nat`/`Bool`/`Int`/`Prod`/`List`/`Option` are built into the IR type
-  -- grammar (`lowerType`); anything else is a user inductive, and
-  -- `lowerTypeDecl` supports exactly parameterless, non-recursive,
-  -- single-block inductives with a single constructor (`Prop` fields
-  -- erased) — the only shape the conformance suite exercises
-  -- (`Conformance.MidProp`, `Conformance.NoProp`, `UorAtlas.Instance`).
-  let types := ["Nat", "Bool", "Int (renders as i64; no Int operators are whitelisted, so Int arithmetic is rejected as UnresolvedCall)",
-                "Prod", "List", "Option",
-                "parameterless, non-recursive, single-constructor structures (Prop fields erased)"]
+  -- `builtinTypes` (`Prod.Lower`) is built into the IR type grammar
+  -- (`lowerType`); anything else is a user inductive, and `lowerTypeDecl`
+  -- supports exactly parameterless, non-recursive, single-block inductives
+  -- with a single constructor (`Prop` fields erased) — the only shape the
+  -- conformance suite exercises (`Conformance.MidProp`, `Conformance.NoProp`,
+  -- `UorAtlas.Instance`).
+  let types := builtinTypes.map (·.2) ++
+    ["parameterless, non-recursive, single-constructor structures (Prop fields erased)"]
   let quoted (xs : List String) : String :=
     String.intercalate ", " (xs.map fun s => "\"" ++ jsonEscape s ++ "\"")
-  "{\n  \"operators\": [" ++ quoted ops ++ "],\n  \"deciders\": [" ++ quoted deciders ++
-    "],\n  \"types\": [" ++ quoted types ++ "]\n}\n"
+  "{\n  \"operators\": [" ++ quoted ops ++ "],\n  \"conversions\": [" ++ quoted conversions ++
+    "],\n  \"deciders\": [" ++ quoted deciders ++ "],\n  \"types\": [" ++ quoted types ++ "]\n}\n"
 
 /-- Rendered `(type ...)` declarations for every inductive reachable from the
     extracted definitions — from their signatures *and* from the constructor
@@ -81,10 +90,14 @@ def collectTypeDecls (ctx : LowerCtx) (extracted : Array ExtractedDef)
   for ed in extracted do
     if let some decl := ed.decl? then
       for n in declTypeNames env decl do
-        -- Builtins already have IR types; only user inductives need declaring.
-        if n != ``Nat && n != ``Bool && n != ``Int && n != ``Prod
-            && n != ``List && n != ``Option && !wanted.contains n then
-          if (env.find? n).isSome && !wanted.contains n then
+        -- Builtins already have IR types; only user inductives need
+        -- declaring. Sized integers are structures wrapping `BitVec` (per
+        -- `UInt8.ofBitVec`), so without this exclusion they would be
+        -- collected as ordinary user inductives and `lowerTypeDecl` would
+        -- try (and fail) to describe their `toBitVec : BitVec 8` field —
+        -- `isBuiltinType` is the single source of truth for this exclusion.
+        if !isBuiltinType n && !wanted.contains n then
+          if (env.find? n).isSome then
             wanted := wanted.push n
   let sorted := wanted.qsort fun a b => Name.quickCmp a b == .lt
   let mut out : Array String := #[]
@@ -114,7 +127,7 @@ def emitKernelIr (ctx : LowerCtx) (irModule : String) (extracted : Array Extract
   return (ir ++ ")\n", reports)
 
 /-- The whole export, as a CoreM computation over the imported environment. -/
-def runExport : CoreM (String × String × String × String) := do
+def runExport : CoreM (String × String × String × String × String) := do
   let env ← getEnv
   let ctx : LowerCtx := { tagged := (taggedNames env targetModule).toArray }
   let extracted ← extractTagged targetModule
@@ -125,11 +138,14 @@ def runExport : CoreM (String × String × String × String) := do
   let confCtx : LowerCtx := { tagged := (taggedNames env conformanceModule).toArray }
   let confExtracted ← extractTagged conformanceModule
   let (confIr, _) ← emitKernelIr confCtx conformanceIrModule confExtracted
-  return (ir, roots, coverage, confIr)
+  let rejCtx : LowerCtx := { tagged := (taggedNames env conformanceRejectedModule).toArray }
+  let rejExtracted ← extractTagged conformanceRejectedModule
+  let (rejIr, _) ← emitKernelIr rejCtx conformanceRejectedIrModule rejExtracted
+  return (ir, roots, coverage, confIr, rejIr)
 
 /-- `runExport` with exceptions rendered to strings (while CoreM context for
     pretty-printing is still available). -/
-def runExportSafe : CoreM (Except String (String × String × String × String)) := do
+def runExportSafe : CoreM (Except String (String × String × String × String × String)) := do
   try
     pure (.ok (← runExport))
   catch e =>
@@ -194,6 +210,41 @@ def goldenEntries : Array GoldenEntry := Id.run do
   out := out.push { name := "golden_smallEnough_20000_canonical", ret := "Bool", value := toString (UorAtlas.smallEnough 20000 c) }
   out := out.push { name := "golden_tryClassDecode_43_canonical", ret := "(Option (Tuple Nat (Tuple Nat Nat)))", value := optTripleSexp (UorAtlas.tryClassDecode 43 c) }
   out := out.push { name := "golden_tryClassDecode_100_canonical", ret := "(Option (Tuple Nat (Tuple Nat Nat)))", value := optTripleSexp (UorAtlas.tryClassDecode 100 c) }
+  -- Euclidean, not truncating: computed by calling the compiled `Int` `/`/`%`
+  -- instances (`Int.ediv`/`Int.emod`) themselves, so the golden comes from
+  -- Lean, not from anyone's expectation of what Euclidean division gives.
+  out := out.push { name := "golden_int_ediv_neg_12_7", ret := "Int",
+                    value := toString (Conformance.c_int_ediv (-12) 7) }
+  out := out.push { name := "golden_int_emod_neg_12_7", ret := "Int",
+                    value := toString (Conformance.c_int_emod (-12) 7) }
+  -- Sized integers wrap: both goldens are boundary cases computed by calling
+  -- the compiled `UInt8` `+`/`<<<` instances themselves. `c_u8_add 255 1`'s
+  -- Lean answer is `0` (wraps; a checked rendering would instead report an
+  -- overflow error, disagreeing with Lean's total answer). `c_u8_shl 1 8`'s
+  -- Lean answer is `1`: `UInt8.shiftLeft` masks the amount mod the width
+  -- (`8 % 8 = 0`, so `1 <<< 0 = 1`), which is what `wrapping_shl` renders; a
+  -- rendering that truncates to `0` past the width instead (`Nat.shiftRight`'s
+  -- `checked_shr(..).unwrap_or(0)` shape) would disagree with Lean's actual
+  -- answer of `1`.
+  out := out.push { name := "golden_u8_add_255_1", ret := "U8",
+                    value := toString (Conformance.c_u8_add 255 1) }
+  out := out.push { name := "golden_u8_shl_1_8", ret := "U8",
+                    value := toString (Conformance.c_u8_shl 1 8) }
+  -- `Int.pow` is the one contract row whose *kind* was in doubt: it is reached
+  -- through `instance : NatPow Int` → `instPowNat` → `instHPow`, and all three
+  -- of those wrapper names are matched by `natHDictOp` (`Prod.Lower`) and
+  -- hard-mapped to kind `"Nat"`. The conformance golden settles the lowering
+  -- (`(pow Int a b)`); this golden settles the *value*, with a negative base so
+  -- a `pow Nat` rendering — `((a) as u64).checked_pow(..)` — could not agree by
+  -- accident: `(-2)^3 = -8`, where the unsigned reading gives 2^192-ish and
+  -- overflows instead.
+  out := out.push { name := "golden_int_pow_neg_2_3", ret := "Int",
+                    value := toString (Conformance.c_int_pow (-2) 3) }
+  -- Int.toNat clamps negatives to 0 (`Init/Data/Int/Basic.lean`); computed by
+  -- calling the compiled `c_int_to_nat` itself, so a bare-cast rendering
+  -- (which would wrap -5 to 18446744073709551611) would visibly disagree
+  -- with Lean's own answer rather than only with a hand-typed expectation.
+  out := out.push { name := "golden_int_to_nat_neg_5", value := toString (Conformance.c_int_to_nat (-5)) }
   return out
 
 /-- Assemble the `goldens.ir` text: one zero-arg def per golden. -/
@@ -220,26 +271,30 @@ private def parseOutDir : List String → Option System.FilePath
 unsafe def main (args : List String) : IO Unit := do
   Lean.initSearchPath (← Lean.findSysroot)
   Lean.enableInitializersExecution
-  let env ← Lean.importModules #[{ module := Prod.targetModule }, { module := Prod.conformanceModule }]
+  let env ← Lean.importModules #[{ module := Prod.targetModule }, { module := Prod.conformanceModule },
+      { module := Prod.conformanceRejectedModule }]
     {} (leakEnv := true) (loadExts := true)
   let coreCtx : Core.Context := { fileName := "prod-export", fileMap := default }
   let eio := (ReaderT.run Prod.runExportSafe coreCtx).run { env := env }
   let result ← EIO.toIO' eio
-  let (ir, roots, coverage, confIr) ← match result with
+  let (ir, roots, coverage, confIr, rejIr) ← match result with
     | Except.ok (Except.ok outputs, _st) => pure outputs
     | Except.ok (Except.error msg, _st) => throw (IO.userError s!"prod-export failed: {msg}")
     | Except.error _ => throw (IO.userError "prod-export failed: uncaught exception")
-  let (irPath, rootsPath, covPath, goldensPath, confPath, subsetPath) := match parseOutDir args with
+  let (irPath, rootsPath, covPath, goldensPath, confPath, rejPath, subsetPath) := match parseOutDir args with
     | some dir =>
       (dir / "kernel.ir", dir / "roots.json", dir / "coverage.md", dir / "goldens.ir",
-       dir / "conformance-golden.ir", dir / "subset.json")
+       dir / "conformance-golden.ir", dir / "conformance-golden-rejected.ir",
+       dir / "subset.json")
     | none =>
       ("../rust/prod-core/kernel.ir", "../roots.json", "../coverage.md",
-       "../rust/prod-core/goldens.ir", "Conformance/golden.ir", "../subset.json")
+       "../rust/prod-core/goldens.ir", "Conformance/golden.ir",
+       "Conformance/golden-rejected.ir", "../subset.json")
   IO.FS.writeFile irPath ir
   IO.FS.writeFile rootsPath roots
   IO.FS.writeFile covPath coverage
   IO.FS.writeFile goldensPath Prod.emitGoldensIr
   IO.FS.writeFile confPath confIr
+  IO.FS.writeFile rejPath rejIr
   IO.FS.writeFile subsetPath Prod.subsetJson
-  IO.println s!"prod-export: wrote {irPath}, {rootsPath}, {covPath}, {goldensPath}, {confPath}, {subsetPath}"
+  IO.println s!"prod-export: wrote {irPath}, {rootsPath}, {covPath}, {goldensPath}, {confPath}, {rejPath}, {subsetPath}"

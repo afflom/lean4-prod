@@ -2,12 +2,14 @@
 resolver = "2"
 members = [
     "prod-ir",
+    "prod-lower",
     "prod-codegen",
     "prod-macros",
     "prod-core",
     "prod-cli",
     "prod-wasm",
     "prod-alloc-counter",
+    "prod-codegen-compile-tests",
 ]
 
 # Baseline guardrails for every crate that opts in with `[lints] workspace =

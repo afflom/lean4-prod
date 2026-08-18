@@ -10,3 +10,8 @@ goldens.txt
 .direnv/
 rust/prod-core/goldens.ir
 /subset.json
+output/
+
+# Local skills-marketplace lockfile. Machine-specific paths and auth tokens;
+# never belongs in the repo. Swept in once by a `git add -A`.
+skills.lock

@@ -1,5 +1,5 @@
 [package]
-name = "prod-codegen"
+name = "prod-lower"
 version = "0.1.0"
 edition = "2021"
 authors = ["UOR Foundation"]
@@ -10,4 +10,3 @@ workspace = true
 
 [dependencies]
 prod-ir = { path = "../prod-ir" }
-prod-lower = { path = "../prod-lower" }

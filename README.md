@@ -142,7 +142,7 @@ That uses `rust/prod-core/goldens.ir` and writes
 of your own:
 
 ```sh
-just c-headers ir=path/to/kernel.ir stem=kernel
+just c-headers path/to/kernel.ir kernel
 ```
 
 The command is a convenience wrapper around `prod header`; it always keeps
@@ -165,11 +165,26 @@ output/lean4-prod/
 └── kotlin/      # JNA interface and helpers
 ```
 
-Use another exported module with `just sdks ir=path/to/kernel.ir stem=kernel`.
+Use another exported module with `just sdks path/to/kernel.ir kernel`.
 All SDKs target the same scalar C ABI (`Nat`/`Int`/`Bool`) and the same status
 codes, so the compiled Rust library remains the single implementation. The
 TypeScript binding accepts a native function loader (for example `koffi` or
 `ffi-napi`), Python uses `ctypes`, and Kotlin uses JNA.
+
+To generate only one language, use a language-specific recipe:
+
+```sh
+just sdk-c
+just sdk-rust
+just sdk-python
+just sdk-typescript
+just sdk-kotlin
+```
+
+These write only the selected language's files under `output/<stem>/`. The
+generic form is `just sdk python path/to/kernel.ir kernel lean4_prod` (the
+language, IR path, stem, and native library name are positional).
+Use `just sdks` when you want the complete bundle.
 
 Include the generated wrapper after the proc-macro expansion in the crate
 that owns the generated definitions:

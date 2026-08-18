@@ -1,0 +1,20 @@
+[package]
+name = "prod-codegen-compile-tests"
+version = "0.1.0"
+edition = "2021"
+authors = ["UOR Foundation"]
+license = "MIT"
+publish = false
+description = "Makes rustc read the generator's output. Every defect this crate exists to catch was invisible because prod-codegen compares generated code as strings and never compiles it."
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[dependencies]
+prod-core = { path = "../prod-core" }
+prod-macros = { path = "../prod-macros" }
+
+[dev-dependencies]
+prod-ir = { path = "../prod-ir" }
+prod-codegen = { path = "../prod-codegen" }

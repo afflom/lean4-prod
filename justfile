@@ -13,12 +13,12 @@ prod-export:
 # fails if the rewrite changed anything, so lowering changes surface as a diff.
 conformance:
     cd lean && lake exe prod-export
-    git diff --exit-code lean/Conformance/golden.ir
+    git diff --exit-code lean/Conformance/golden.ir lean/Conformance/golden-rejected.ir
 
 # Accept the current lowering as the new golden. Review the diff before running.
 conformance-bless:
     cd lean && lake exe prod-export
-    git add lean/Conformance/golden.ir
+    git add lean/Conformance/golden.ir lean/Conformance/golden-rejected.ir
 
 # Build rust debug
 build:

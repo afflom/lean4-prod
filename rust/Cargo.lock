@@ -194,6 +194,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prod-codegen-compile-tests"
+version = "0.1.0"
+dependencies = [
+ "prod-codegen",
+ "prod-core",
+ "prod-ir",
+ "prod-macros",
+]
+
+[[package]]
 name = "prod-core"
 version = "0.1.0"
 dependencies = [

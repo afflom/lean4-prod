@@ -1,0 +1,50 @@
+;; Hand-written IR for constructs the Lean corpus cannot currently produce, so
+;; that rustc still compiles the code the generator emits for them.
+;;
+;; This file is hand-written ON PURPOSE and is not downstream of Lean — it is
+;; the one place in the repo where that is true, and it is why the header says
+;; so. Everything here is a construct `prod-codegen` implements and unit-tests
+;; against string fixtures, but which the real pipeline never reaches.
+(module Representative
+
+  ;; MULTI-CONSTRUCTOR ENUM. The important one. `prod-codegen` renders enum
+  ;; declarations, named-field construction and enum patterns, and unit-tests
+  ;; all three — but every inductive in `lean/Example` and `lean/Conformance`
+  ;; is a single-constructor `structure`, so nothing has ever compiled an enum
+  ;; the generator produced. The published subset contract deliberately does
+  ;; not claim enum support for exactly this reason.
+  (type "Representative.Shape"
+    (ctor "Representative.Shape.circle" (radius Nat))
+    (ctor "Representative.Shape.rect" (w Nat) (h Nat)))
+
+  ;; Field names that are Rust keywords. Legal Lean, illegal Rust without
+  ;; raw-identifier escaping, and escaping has to agree between the struct
+  ;; declaration and every projection of it.
+  (type "Representative.Keyword"
+    (ctor "Representative.Keyword.mk" (type Nat) (fn Nat)))
+
+  (def r_make_circle ((r Nat)) (named "Representative.Shape")
+    (ctor "Representative.Shape.circle" r))
+
+  (def r_make_rect ((a Nat) (b Nat)) (named "Representative.Shape")
+    (ctor "Representative.Shape.rect" a b))
+
+  (def r_area ((s (named "Representative.Shape"))) Nat
+    (cases s
+      (alt "Representative.Shape.circle" (rad) (mul rad rad))
+      (alt "Representative.Shape.rect" (ww hh) (mul ww hh))))
+
+  (def r_keyword_fields ((k (named "Representative.Keyword"))) Nat
+    (add (proj "Representative.Keyword" "type" k)
+         (proj "Representative.Keyword" "fn" k)))
+
+  ;; Single-caller join point: inlined at its jump site. The multi-caller and
+  ;; cyclic forms are rejected (`UnsupportedJoinPoint`), so this is the only
+  ;; join-point shape that should ever reach rustc.
+  (def r_jp_inlined ((x Nat)) Nat
+    (let g (jp g (a) (add a 1)) (jmp g x)))
+
+  ;; Right-nested Prod.mk becomes a nested Rust tuple, not a generated struct.
+  (def r_nested_tuple ((a Nat) (b Nat) (c Nat)) (Tuple Nat (Tuple Nat Nat))
+    (ctor "Prod.mk" a (ctor "Prod.mk" b c)))
+)

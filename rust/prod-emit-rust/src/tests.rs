@@ -563,7 +563,7 @@ fn an_invariant_carrying_type_still_gets_private_fields_and_a_checked_new() {
 )
 "#;
     let module = prod_ir::parser::parse_module(ir).expect("parses").1;
-    let types = lower_types(&module, &NamePolicy::RUST).expect("lowers");
+    let types = lower_types(&module, &NamePolicy::RUST, &TargetProfile::RUST).expect("lowers");
     let out = emit_types(&types);
     assert!(out.contains("pub(crate) q: u64"), "got: {}", out);
     assert!(!out.contains("pub q: u64"));
@@ -588,7 +588,8 @@ fn an_invariant_carrying_type_still_gets_private_fields_and_a_checked_new() {
 fn a_type_with_no_lowerable_invariant_keeps_public_fields() {
     let ir = r#"(module M (type "M.Pair" (ctor "M.Pair.mk" (a Nat) (b Nat))))"#;
     let module = prod_ir::parser::parse_module(ir).expect("parses").1;
-    let out = emit_types(&lower_types(&module, &NamePolicy::RUST).expect("lowers"));
+    let out =
+        emit_types(&lower_types(&module, &NamePolicy::RUST, &TargetProfile::RUST).expect("lowers"));
     assert!(out.contains("pub a: u64"), "got: {}", out);
     assert!(!out.contains("pub(crate)"));
     assert!(!out.contains("fn new("));
@@ -607,7 +608,8 @@ fn the_invariant_is_not_lowered_inverted() {
 )
 "#;
     let module = prod_ir::parser::parse_module(ir).expect("parses").1;
-    let out = emit_types(&lower_types(&module, &NamePolicy::RUST).expect("lowers"));
+    let out =
+        emit_types(&lower_types(&module, &NamePolicy::RUST, &TargetProfile::RUST).expect("lowers"));
     assert!(out.contains("(2 <= lo)"), "got: {}", out);
     assert!(out.contains("(hi <= 7)"), "got: {}", out);
 }
@@ -656,7 +658,8 @@ fn an_invariant_may_contain_total_arithmetic_and_renders_it_inline() {
 )
 "#;
     let module = prod_ir::parser::parse_module(ir).expect("parses").1;
-    let out = emit_types(&lower_types(&module, &NamePolicy::RUST).expect("lowers"));
+    let out =
+        emit_types(&lower_types(&module, &NamePolicy::RUST, &TargetProfile::RUST).expect("lowers"));
     assert!(
         out.contains(
             "if ((1 <= ((q) as u64).saturating_sub(T)) && (((a) as u8).wrapping_add(b) <= 200))"
@@ -675,7 +678,7 @@ fn an_invariant_may_contain_total_arithmetic_and_renders_it_inline() {
 /// Every definition in an IR module, rendered.
 fn render_module(ir: &str) -> alloc::collections::BTreeMap<String, String> {
     let module = prod_ir::parser::parse_module(ir).expect("parses").1;
-    let types = lower_types(&module, &NamePolicy::RUST).expect("types lower");
+    let types = lower_types(&module, &NamePolicy::RUST, &TargetProfile::RUST).expect("types lower");
     let shapes = signatures(&module.definitions, &TargetProfile::RUST);
     module
         .definitions

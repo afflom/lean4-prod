@@ -347,7 +347,7 @@ impl From<NameError> for Error {
 pub fn generate_module(module: &Module) -> Result<String, Error> {
     let profile = TargetProfile::RUST;
     NameTable::build(module, &NamePolicy::RUST)?;
-    let types = lower_types(module, &NamePolicy::RUST)?;
+    let types = lower_types(module, &NamePolicy::RUST, &profile)?;
     let shapes = signatures(&module.definitions, &profile);
 
     let mut out = prod_emit_rust::emit_types(&types);

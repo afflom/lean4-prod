@@ -93,9 +93,11 @@ impl TargetProfile {
     ///
     /// Read where a construct has to be total for every backend at once rather
     /// than for one chosen backend. A structure's invariant is the case:
-    /// [`crate::lower::lower_types`] takes no profile, so the single lowered
-    /// predicate it produces is printed by all of them, and an operation only
-    /// *some* profile can hoist into a statement has no place in it.
+    /// [`crate::lower::lower_types`] produces one predicate printed by all
+    /// backends, and an operation only *some* profile can hoist into a
+    /// statement has no place in it. The selected profile may still affect
+    /// how an admitted total operation is spelled, such as masking sized
+    /// arithmetic on an unbounded host.
     ///
     /// [`TargetProfile::op_is_fallible`] reads exactly one field, `nat_repr`,
     /// and `Bounded64` is the stricter of its two answers, so the union over

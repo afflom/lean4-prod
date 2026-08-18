@@ -260,6 +260,10 @@ pub fn emit_body(body: &Body, types: &[TypeDef]) -> String {
 /// used for its own buffer temporaries.
 const CURSOR: &str = "__len";
 
+/// The binder a [`Stmt::Push`] writes through. Same `__`-prefixed generated
+/// family as [`CURSOR`], so it cannot collide with a name the source wrote.
+const SLOT: &str = "__slot";
+
 /// The output buffer's parameter name, chosen by the lowering so that it
 /// cannot collide with a binder the source wrote.
 fn output_name(body: &Body) -> String {
@@ -365,8 +369,14 @@ impl Printer<'_> {
                 // own BLOCK. That is what keeps a branch's `TryLet` -- and the
                 // `?` it carries -- from running when the branch does not.
                 //
-                // Both arms end in a terminator, so the `if` has type `!` and
-                // coerces wherever the body needs a value.
+                // Both arms print as `{ .. }` and neither yields a value, so
+                // the `if` is a unit STATEMENT. That is what the bounds-check
+                // `If` needs -- its `then` is deliberately empty and execution
+                // continues past it into the `Push` -- and it is equally
+                // right for the branching `If`s whose arms both end in a
+                // `Return` or a `Fail`. (An earlier version of this comment
+                // claimed both arms always end in a terminator, which the
+                // bounds check is the standing counterexample to.)
                 Stmt::If { cond, then, else_ } => {
                     let cond = self.expr(cond);
                     let then = self.block(then, depth + 1);
@@ -382,22 +392,38 @@ impl Printer<'_> {
                     default,
                 } => out.push_str(&self.switch(scrut, arms, default.as_deref(), depth)),
                 Stmt::Fail(code) => out.push_str(&format!("{}{}\n", pad, fail(*code))),
-                // The index cannot be out of range: the lowering emits an
-                // explicit `If` against the buffer's length immediately
-                // before every `Push`, and its else-branch returns
-                // `OutputTooSmall`. That check being in the statement list,
-                // rather than re-derived by each printer, is the point of
-                // this task -- so this does not repeat it.
+                // The write goes through `get_mut`, not an index.
+                //
+                // The lowering emits an explicit `If` against the buffer's
+                // length immediately before every `Push`, whose else-branch
+                // returns `OutputTooSmall`, so the slot is always there --
+                // but that is an argument about a NEIGHBOURING statement, and
+                // this printer cannot see it. `output[__len] = v` would make
+                // the generated code's no-panic property rest on that
+                // argument holding forever; `get_mut` makes it hold
+                // structurally, the way the `split_first_mut` this replaced
+                // did. `prod-core` denies `clippy::indexing_slicing` so the
+                // hand-written half is held to the same rule.
+                //
+                // The cursor advances INSIDE the `if let`. Reachable
+                // behaviour is identical -- the guard has already proved the
+                // slot exists -- and if a future lowering ever dropped the
+                // guard, a buffer that ran out would report a short length
+                // rather than a length covering a slot nothing wrote.
                 Stmt::Push { seq, value } => {
                     let value = self.expr(value);
                     out.push_str(&format!(
-                        "{}{}[{}] = {};\n{}{} += 1;\n",
+                        "{}if let Some({}) = {}.get_mut({}) {{\n{}    *{} = {};\n{}    {} += 1;\n{}}}\n",
                         pad,
+                        SLOT,
                         ident(seq),
                         CURSOR,
+                        pad,
+                        SLOT,
                         value,
                         pad,
-                        CURSOR
+                        CURSOR,
+                        pad
                     ));
                 }
                 Stmt::Advance { count, .. } => {
@@ -474,8 +500,15 @@ impl Printer<'_> {
             TExpr::Seq(SeqQuery::Cap, seq) => format!("{}.len()", ident(seq)),
             // The unwritten remainder. `CURSOR` never passes the length --
             // every `Push` is guarded and every `Advance` reports what the
-            // callee actually wrote -- so the slice cannot be out of range.
-            TExpr::Seq(SeqQuery::Rest, seq) => format!("&mut {}[{}..]", ident(seq), CURSOR),
+            // callee actually wrote -- so the range is always in bounds; the
+            // `get_mut` is what makes that a fact about the TEXT rather than
+            // an argument about statements this printer cannot see. The
+            // unreachable fallback is the empty remainder, on which a
+            // list-shaped callee reports `OutputTooSmall` rather than
+            // overwriting anything.
+            TExpr::Seq(SeqQuery::Rest, seq) => {
+                format!("{}.get_mut({}..).unwrap_or(&mut [])", ident(seq), CURSOR)
+            }
             // A projection needs nothing but the field name, which the
             // lowering already checked against the declaration -- so there is
             // nothing here to refuse, only to spell.

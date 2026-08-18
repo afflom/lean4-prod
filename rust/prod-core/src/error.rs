@@ -112,7 +112,7 @@ mod tests {
             ComputeError::InvariantViolated("X"),
         ];
         for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
+            for b in all.iter().skip(i + 1) {
                 assert_ne!(a.as_str(), b.as_str());
             }
         }
@@ -132,17 +132,20 @@ mod tests {
 
     impl Buf {
         fn as_str(&self) -> &str {
-            core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("<invalid utf-8>")
+            self.bytes
+                .get(..self.len)
+                .and_then(|b| core::str::from_utf8(b).ok())
+                .unwrap_or("<invalid utf-8>")
         }
     }
 
     impl Write for Buf {
         fn write_str(&mut self, s: &str) -> fmt::Result {
             let end = self.len + s.len();
-            if end > self.bytes.len() {
+            let Some(dst) = self.bytes.get_mut(self.len..end) else {
                 return Err(fmt::Error);
-            }
-            self.bytes[self.len..end].copy_from_slice(s.as_bytes());
+            };
+            dst.copy_from_slice(s.as_bytes());
             self.len = end;
             Ok(())
         }

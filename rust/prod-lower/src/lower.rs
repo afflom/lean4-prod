@@ -71,7 +71,7 @@ pub fn lower_def_in(
     // so each branch supplies its own terminator rather than yielding a value
     // for a `Return` this function appends.
     let mut stmts: Vec<Stmt> = Vec::new();
-    let mut env: Vec<(String, &Expr)> = Vec::new();
+    let mut env: Vec<ListBinding> = Vec::new();
     let output = match shape {
         // A list-shaped definition appends to a sequence instead of yielding
         // a value, so the first thing it needs is a name for that sequence.
@@ -653,9 +653,15 @@ fn lower_invariant(
         // generated `new` -- output that does not compile -- where
         // `prod-codegen`, whose invariant renderer is built with the module's
         // type table, reports `UnknownField`.
+        //
+        // The field is checked BEFORE the operand is lowered, because the
+        // rejection KIND is published: for `(proj "M.S" "nope" (opaque "x"))`
+        // the renderer this replaced reported `UnknownField`, and lowering the
+        // operand first would report `OpaqueExpr` instead. Both are refusals;
+        // only one is the one the contract names.
         Expr::Proj(ty, field, value) => {
-            let value = sub(value)?;
             check_projected_field(decls, ty, field)?;
+            let value = sub(value)?;
             Ok(TExpr::Proj(ty.clone(), field.clone(), Box::new(value)))
         }
 
@@ -939,6 +945,28 @@ enum DivMod {
     Mod,
 }
 
+/// A `let`-bound list value, deferred to the point where the list is
+/// consumed.
+///
+/// A list `let` binds nothing at runtime: the elements go into the output
+/// sequence where the list is *used*, not where it is named, so the bound
+/// expression is re-lowered at each consumption site.
+struct ListBinding<'a> {
+    /// The source name the `let` bound.
+    name: String,
+    /// The expression it was bound to.
+    value: &'a Expr,
+    /// `Lowering::scope.len()` at the point the `let` was WRITTEN.
+    ///
+    /// Re-lowering happens somewhere else in the traversal, where `scope` may
+    /// have grown binders the bound expression cannot see. A `Var` inside it
+    /// has to resolve the way it would have resolved where it was written --
+    /// which is the whole reason `bind_source`/`scope` exist, and the
+    /// assumption ("LCNF names every binder uniquely") this used to rely on
+    /// instead is precisely the one the uniquification fix refused to make.
+    scope: usize,
+}
+
 /// What the lowering does with what an expression in tail position produces.
 ///
 /// The two positions share every control-flow lowering and differ only at the
@@ -1105,9 +1133,15 @@ impl<'a> Lowering<'a> {
             // needs is evaluated anyway and may be hoisted freely.
             Expr::Not(a) => Ok(TExpr::Not(Box::new(self.expr(a, stmts)?))),
 
+            // `Nat -> UIntN` is Lean's `Nat.toUIntN`, which TRUNCATES
+            // (`BitVec` truncation), so it needs the same mask an arithmetic
+            // result does on a host with no fixed-width integers. Rust's `as`
+            // truncates on its own; an unbounded-integer host's conversion
+            // does not.
             Expr::Convert(from, to, a) => {
                 check_conversion(*from, *to)?;
-                Ok(TExpr::Convert(*from, *to, Box::new(self.expr(a, stmts)?)))
+                let value = TExpr::Convert(*from, *to, Box::new(self.expr(a, stmts)?));
+                Ok(self.mask_sized(*to, value))
             }
 
             Expr::Neg(k, a) => {
@@ -1218,9 +1252,11 @@ impl<'a> Lowering<'a> {
                 ctor_expr(self.decls, name, lowered)
             }
 
+            // Field first, operand second -- the same order, and for the
+            // same published-kind reason, as the invariant path above.
             Expr::Proj(ty, field, value) => {
-                let value = self.expr(value, stmts)?;
                 check_projected_field(self.decls, ty, field)?;
+                let value = self.expr(value, stmts)?;
                 Ok(TExpr::Proj(ty.clone(), field.clone(), Box::new(value)))
             }
 
@@ -1275,7 +1311,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         e: &'a Expr,
         pos: Position<'_>,
-        env: &mut Vec<(String, &'a Expr)>,
+        env: &mut Vec<ListBinding<'a>>,
         stmts: &mut Vec<Stmt>,
     ) -> Result<(), LowerError> {
         match e {
@@ -1374,7 +1410,15 @@ impl<'a> Lowering<'a> {
                 // binding here is what lets the tail of a cons be a `Var`.
                 if let Position::List { .. } = pos {
                     if self.is_list_valued(value, env) {
-                        env.push((name.clone(), value));
+                        // The scope depth goes in with the binding: `append`
+                        // re-lowers `value` from somewhere else in the
+                        // traversal and has to see the scope this `let` was
+                        // written in, not the one it is consumed in.
+                        env.push(ListBinding {
+                            name: name.clone(),
+                            value,
+                            scope: self.scope.len(),
+                        });
                         let out = self.flow(body, pos, env, stmts);
                         env.pop();
                         return out;
@@ -1426,7 +1470,7 @@ impl<'a> Lowering<'a> {
         e: &'a Expr,
         seq: &str,
         bounded: bool,
-        env: &mut Vec<(String, &'a Expr)>,
+        env: &mut Vec<ListBinding<'a>>,
         stmts: &mut Vec<Stmt>,
     ) -> Result<(), LowerError> {
         match e {
@@ -1466,18 +1510,29 @@ impl<'a> Lowering<'a> {
             }
 
             // A list named by a `let` this definition made: continue with what
-            // it was bound to, in the environment that was in scope where the
-            // binding was written -- so `let x := x` cannot resolve to itself.
+            // it was bound to, in the environment AND the scope that were in
+            // effect where the binding was written -- so `let x := x` cannot
+            // resolve to itself, and a binder introduced between the `let` and
+            // its consumption cannot capture a `Var` inside it.
             //
-            // Only `env` is rewound, not `self.scope`. A list binding never
-            // pushes a `scope` entry (it has no runtime value to bind), and
-            // LCNF names every binder uniquely, so a `Var` inside the bound
-            // expression resolves to the same target name from either point.
-            Expr::Var(name) => match env.iter().rposition(|(n, _)| n == name) {
+            // BOTH are rewound. `env` is rewound by position; `self.scope` is
+            // rewound to the depth recorded in the binding, the same way
+            // `flow`'s `Jmp` arm truncates what `inline_jmp` pushed. Rewinding
+            // only `env` was a real defect: it left this arm reading `scope`
+            // at a point in the traversal other than where the bound
+            // expression was written, which is exactly the capture the
+            // uniquification work exists to prevent.
+            Expr::Var(name) => match env.iter().rposition(|b| b.name == *name) {
                 Some(index) => {
-                    let bound = env[index].1;
+                    let bound = env[index].value;
+                    let depth = env[index].scope;
                     let inner = env.split_off(index);
+                    // `flow` is scope-balanced -- every arm that pushes pops
+                    // again -- so what is set aside here is exactly what was
+                    // bound after the `let`, and it all comes back.
+                    let outer = self.scope.split_off(depth);
                     let out = self.flow(bound, Position::List { seq, bounded }, env, stmts);
+                    self.scope.extend(outer);
                     env.extend(inner);
                     out
                 }
@@ -1530,14 +1585,14 @@ impl<'a> Lowering<'a> {
 
     /// Is this the value of a list-typed binding -- one with no runtime
     /// representation of its own, to be resolved where the list is consumed?
-    fn is_list_valued(&self, e: &Expr, env: &[(String, &'a Expr)]) -> bool {
+    fn is_list_valued(&self, e: &Expr, env: &[ListBinding<'a>]) -> bool {
         match e {
             Expr::Ctor(name, _) => name == "List.nil" || name == "List.cons",
             Expr::Call(name, _) => matches!(
                 self.shapes.get(name.as_str()),
                 Some(Shape::Buffer) | Some(Shape::StaticList)
             ),
-            Expr::Var(name) => env.iter().any(|(n, _)| n == name),
+            Expr::Var(name) => env.iter().any(|b| b.name == *name),
             _ => false,
         }
     }
@@ -1679,10 +1734,49 @@ impl<'a> Lowering<'a> {
     ) -> Result<TExpr, LowerError> {
         let a = self.expr(a, stmts)?;
         let b = self.expr(b, stmts)?;
-        if self.profile.op_is_fallible(node) {
-            Ok(self.bind_fallible(kind_type(kind), FallibleOp::Arith(kind, op, a, b), stmts))
+        let value = if self.profile.op_is_fallible(node) {
+            self.bind_fallible(kind_type(kind), FallibleOp::Arith(kind, op, a, b), stmts)
         } else {
-            Ok(TExpr::BinOp(kind, op, Box::new(a), Box::new(b)))
+            TExpr::BinOp(kind, op, Box::new(a), Box::new(b))
+        };
+        Ok(self.mask_sized(kind, value))
+    }
+
+    /// Reduce a sized-kind result to its own width, on a host that has no
+    /// fixed-width integers.
+    ///
+    /// Lean's `UInt8.add` is `BitVec` addition: it *wraps*, and that wrapping
+    /// is the semantics, not an overflow. A host whose integers are unbounded
+    /// -- [`TargetProfile::sized_mask_required`] -- computes the mathematical
+    /// sum instead, so the lowering owes it an explicit `& 0xff`.
+    ///
+    /// # Why the lowering and not the printer
+    ///
+    /// Masking after a *sequence* of operations is a different function from
+    /// masking each one: `(a + b) * c` masked once at the end agrees with Lean
+    /// only when the intermediate sum did not exceed the width. A printer sees
+    /// one node at a time and would have to re-derive where the boundaries
+    /// are; here every operation carries its own mask by construction, so
+    /// composition is right for free.
+    ///
+    /// Applied to every sized-kind arithmetic result rather than only to the
+    /// operations that can widen (`add`, `mul`, `shl`). `div`, `mod` and `shr`
+    /// cannot leave the range their operands were already in, so their masks
+    /// are redundant -- but "mask every sized result" is a rule the next
+    /// operator inherits, and "mask the widening ones" is a list someone has
+    /// to remember to extend.
+    fn mask_sized(&self, kind: NumKind, value: TExpr) -> TExpr {
+        if !self.profile.sized_mask_required {
+            return value;
+        }
+        match sized_mask(kind) {
+            Some(mask) => TExpr::BinOp(
+                kind,
+                BinOp::BitAnd,
+                Box::new(value),
+                Box::new(TExpr::Lit(Lit::Nat(mask))),
+            ),
+            None => value,
         }
     }
 
@@ -1826,6 +1920,22 @@ fn count_jmps(expr: &Expr, name: &str) -> usize {
         _ => 0,
     };
     self_count + expr.children().map(|c| count_jmps(c, name)).sum::<usize>()
+}
+
+/// The mask that reduces a value to `kind`'s width: `2^width - 1`.
+///
+/// `None` for the two unbounded kinds -- Lean's `Nat` and `Int` have no width
+/// to reduce to, and a backend that bounds them says so through
+/// [`TargetProfile::nat_repr`] instead, which is a fallibility question rather
+/// than a masking one.
+fn sized_mask(kind: NumKind) -> Option<u64> {
+    match kind {
+        NumKind::U8 => Some(u8::MAX as u64),
+        NumKind::U16 => Some(u16::MAX as u64),
+        NumKind::U32 => Some(u32::MAX as u64),
+        NumKind::U64 => Some(u64::MAX),
+        NumKind::Nat | NumKind::Int => None,
+    }
 }
 
 fn kind_type(kind: NumKind) -> Type {
@@ -2050,6 +2160,17 @@ mod tests {
         }
     }
 
+    /// The operator a lowered expression computes with, seen THROUGH the
+    /// width mask a `sized_mask_required` profile wraps a sized result in.
+    /// The mask is not the operation; it is what the host needs around it.
+    fn arith_op(e: &TExpr) -> Option<BinOp> {
+        match e {
+            TExpr::BinOp(_, BinOp::BitAnd, inner, _) => arith_op(inner),
+            TExpr::BinOp(_, op, ..) => Some(*op),
+            _ => None,
+        }
+    }
+
     fn div_op(def: &Definition, profile: &TargetProfile) -> BinOp {
         let defs = vec![def.clone()];
         let shapes = signatures(&defs, profile);
@@ -2060,7 +2181,11 @@ mod tests {
                     op: FallibleOp::Arith(_, op, ..),
                     ..
                 } => return *op,
-                Stmt::Return(TExpr::BinOp(_, op, ..)) => return *op,
+                Stmt::Return(e) => {
+                    if let Some(op) = arith_op(e) {
+                        return op;
+                    }
+                }
                 _ => {}
             }
         }
@@ -2783,6 +2908,57 @@ mod tests {
         );
     }
 
+    /// The rejection KIND when a projection is wrong in two ways at once.
+    ///
+    /// `(proj "M.Pair" "nope" (opaque "x"))` is both an unknown field and an
+    /// opaque operand. The renderer this replaced checked the field BEFORE it
+    /// rendered the operand, so it published `UnknownField`; lowering the
+    /// operand first silently republishes the same input as `OpaqueExpr`.
+    /// The kind is part of the contract, so the order is too.
+    #[test]
+    fn an_unknown_field_outranks_an_opaque_operand_on_the_body_path() {
+        let module = parse(r#"(module M (type "M.Pair" (ctor "M.Pair.mk" (a Nat) (b Nat))))"#);
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![],
+            ret: Type::Nat,
+            body: Expr::Proj(
+                String::from("M.Pair"),
+                String::from("nope"),
+                Box::new(Expr::Opaque(String::from("x"))),
+            ),
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        assert_eq!(
+            lower_def_in(&defs[0], &shapes, &TargetProfile::RUST, &module.types).err(),
+            Some(LowerError::UnknownField(
+                String::from("M.Pair"),
+                String::from("nope")
+            )),
+        );
+    }
+
+    /// The same precedence on the invariant path, which has its own `Proj`
+    /// arm and had the same inversion.
+    #[test]
+    fn an_unknown_field_outranks_an_opaque_operand_on_the_invariant_path() {
+        let module = parse(
+            r#"
+(module M (type "M.Inner" (ctor "M.Inner.mk" (x Nat)))
+          (type "M.S" (ctor "M.S.mk" (q (named "M.Inner")))
+            (invariant (le 1 (proj "M.Inner" "nope" (opaque "x"))))))
+"#,
+        );
+        assert_eq!(
+            lower_types(&module, &crate::names::NamePolicy::RUST).err(),
+            Some(LowerError::UnknownField(
+                String::from("M.Inner"),
+                String::from("nope")
+            )),
+        );
+    }
+
     /// Every type-declaration rejection `prod-codegen` makes, with the payload
     /// each one carries. The wording is pinned by `REJECTIONS` and by the
     /// published subset contract, so this is a refactor, not a redesign.
@@ -3152,6 +3328,215 @@ mod tests {
             "a growable sequence cannot run out, so nothing may report that it did: {:?}",
             body.stmts
         );
+    }
+
+    /// The `sized_mask_required` seam, exercised the way the `ListStrategy`
+    /// one above is: the same definition under two profiles, and the
+    /// statement trees DIFFER.
+    ///
+    /// Lean's `UInt8.add` is `BitVec` addition -- it wraps, and the wrap is
+    /// the answer, not an overflow. Rust's `u8` wraps by itself, so `RUST`
+    /// needs no mask; a host whose integers are unbounded computes
+    /// `200 + 100 = 300` where Lean says `44`, so its profile asks for one.
+    /// The field used to be declared and read by nothing, which meant a
+    /// masking backend would have silently shipped unbounded arithmetic.
+    #[test]
+    fn a_masking_profile_reduces_a_sized_result_where_the_rust_profile_does_not() {
+        let (module, index) = corpus_def("c_u8_add");
+        let def = &module.definitions[index];
+
+        let native = lower_def(
+            def,
+            &signatures(&module.definitions, &TargetProfile::RUST),
+            &TargetProfile::RUST,
+        )
+        .expect("lowers");
+        let masked = lower_def(
+            def,
+            &signatures(&module.definitions, &TargetProfile::PYTHON),
+            &TargetProfile::PYTHON,
+        )
+        .expect("lowers");
+
+        assert_ne!(
+            native.stmts, masked.stmts,
+            "the masking profile changed nothing, so the seam is not wired"
+        );
+        // `a + b`, and nothing around it.
+        assert!(
+            matches!(
+                native.stmts.first(),
+                Some(Stmt::Let {
+                    value: TExpr::BinOp(NumKind::U8, BinOp::Add, ..),
+                    ..
+                })
+            ),
+            "expected a bare add under the Rust profile: {:?}",
+            native.stmts
+        );
+        assert!(
+            !find_stmt(&native.stmts, &|s| matches!(
+                s,
+                Stmt::Let {
+                    value: TExpr::BinOp(_, BinOp::BitAnd, ..),
+                    ..
+                }
+            )),
+            "the Rust profile must not mask -- `u8` already wraps: {:?}",
+            native.stmts
+        );
+        // `(a + b) & 0xff`.
+        assert!(
+            matches!(
+                masked.stmts.first(),
+                Some(Stmt::Let {
+                    value: TExpr::BinOp(NumKind::U8, BinOp::BitAnd, inner, mask),
+                    ..
+                }) if matches!(&**inner, TExpr::BinOp(NumKind::U8, BinOp::Add, ..))
+                    && **mask == TExpr::Lit(Lit::Nat(255))
+            ),
+            "expected the add masked to 8 bits: {:?}",
+            masked.stmts
+        );
+    }
+
+    /// `Nat.toUInt8` truncates in Lean (`BitVec` truncation), and Rust's `as`
+    /// truncates with it -- so the conversion is a mask on a host where
+    /// neither does. Same seam, the other node that narrows.
+    #[test]
+    fn a_masking_profile_masks_a_narrowing_conversion_too() {
+        let (module, index) = corpus_def("c_nat_to_u8");
+        let def = &module.definitions[index];
+
+        let native = lower_def(
+            def,
+            &signatures(&module.definitions, &TargetProfile::RUST),
+            &TargetProfile::RUST,
+        )
+        .expect("lowers");
+        let masked = lower_def(
+            def,
+            &signatures(&module.definitions, &TargetProfile::PYTHON),
+            &TargetProfile::PYTHON,
+        )
+        .expect("lowers");
+
+        assert!(
+            matches!(
+                native.stmts.first(),
+                Some(Stmt::Let {
+                    value: TExpr::Convert(NumKind::Nat, NumKind::U8, _),
+                    ..
+                })
+            ),
+            "expected a bare conversion under the Rust profile: {:?}",
+            native.stmts
+        );
+        assert!(
+            matches!(
+                masked.stmts.first(),
+                Some(Stmt::Let {
+                    value: TExpr::BinOp(NumKind::U8, BinOp::BitAnd, inner, mask),
+                    ..
+                }) if matches!(&**inner, TExpr::Convert(NumKind::Nat, NumKind::U8, _))
+                    && **mask == TExpr::Lit(Lit::Nat(255))
+            ),
+            "expected the conversion masked to 8 bits: {:?}",
+            masked.stmts
+        );
+    }
+
+    /// A binder introduced BETWEEN a list `let` and the point the list is
+    /// consumed must not capture a `Var` inside the deferred expression.
+    ///
+    /// A list `let` binds nothing at runtime, so its value is re-lowered where
+    /// the list is used. That is a different point in the traversal from where
+    /// it was written, and `scope` is position-dependent: here the source
+    /// writes `let x := ..` after `let xs := [x]`, which `bind_source` renames
+    /// (the parameter already holds `x`) and puts in scope. Re-lowering `[x]`
+    /// under that scope resolves the element to the RENAMED binder and the
+    /// definition computes the wrong list.
+    ///
+    /// This arm used to rewind only `env`, justified by "LCNF names every
+    /// binder uniquely" -- the assumption the uniquification work exists
+    /// because we cannot make.
+    #[test]
+    fn a_binder_between_a_list_let_and_its_use_does_not_capture_the_deferred_list() {
+        // f (x : Nat) : List Nat := let xs := [x]; let x := x + 1; xs
+        let def = Definition {
+            name: String::from("f"),
+            params: vec![(String::from("x"), Type::Nat)],
+            ret: Type::List(Box::new(Type::Nat)),
+            body: Expr::Let(
+                String::from("xs"),
+                Box::new(Expr::Ctor(
+                    String::from("List.cons"),
+                    vec![
+                        Expr::Var(String::from("x")),
+                        Expr::Ctor(String::from("List.nil"), Vec::new()),
+                    ],
+                )),
+                Box::new(Expr::Let(
+                    String::from("x"),
+                    Box::new(Expr::Add(
+                        NumKind::Nat,
+                        Box::new(Expr::Var(String::from("x"))),
+                        Box::new(Expr::Nat(1)),
+                    )),
+                    Box::new(Expr::Var(String::from("xs"))),
+                )),
+            ),
+        };
+        let defs = vec![def];
+        let shapes = signatures(&defs, &TargetProfile::RUST);
+        assert_eq!(shapes.get("f"), Some(&Shape::Buffer));
+        let body = lower_def(&defs[0], &shapes, &TargetProfile::RUST).expect("lowers");
+
+        // The shadowing `let` really did rename -- otherwise the test would
+        // pass because there was nothing to capture.
+        let renamed = body
+            .stmts
+            .iter()
+            .find_map(|s| match s {
+                Stmt::Let { name, .. } if name != "x" => Some(name.clone()),
+                _ => None,
+            })
+            .expect("the shadowing binder was renamed");
+        assert_ne!(renamed, "x");
+
+        // The single element is the PARAMETER, not the later binder.
+        let pushed: Vec<&TExpr> = collect_pushed(&body.stmts);
+        assert_eq!(
+            pushed,
+            vec![&TExpr::Var(String::from("x"))],
+            "the deferred list element resolved to `{}`, the binder written \
+             after the list `let`: {:?}",
+            renamed,
+            body.stmts
+        );
+    }
+
+    fn collect_pushed(stmts: &[Stmt]) -> Vec<&TExpr> {
+        let mut out = Vec::new();
+        for stmt in stmts {
+            match stmt {
+                Stmt::Push { value, .. } => out.push(value),
+                Stmt::If { then, else_, .. } => {
+                    out.extend(collect_pushed(then));
+                    out.extend(collect_pushed(else_));
+                }
+                Stmt::Switch { arms, default, .. } => {
+                    for arm in arms {
+                        out.extend(collect_pushed(&arm.body));
+                    }
+                    if let Some(d) = default {
+                        out.extend(collect_pushed(d));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// A list-shaped callee appends to the SAME sequence and reports how many

@@ -106,9 +106,9 @@ fn generated_definitions_never_touch_the_heap() -> Result<(), ComputeError> {
     // This is the case that used to allocate a `Box`-linked list per cons.
     let mut buffer = [0u64; 64];
     let len = assert_no_allocation("digits", || digits(10, 43, canonical, &mut buffer))?;
-    assert_eq!(&buffer[..len], &[3, 5]);
+    assert_eq!(written(&buffer, len), &[3, 5]);
     assert_eq!(
-        assert_no_allocation("digitSum", || digitSum(&buffer[..len]))?,
+        assert_no_allocation("digitSum", || digitSum(written(&buffer, len)))?,
         8
     );
 
@@ -133,4 +133,15 @@ fn generated_definitions_never_touch_the_heap() -> Result<(), ComputeError> {
     );
 
     Ok(())
+}
+
+/// The initialized prefix of a list builder's output buffer, taken without an
+/// index.
+///
+/// `prod-core` denies `clippy::indexing_slicing`: the rule that keeps a panic
+/// path out of the generated writer keeps one out of the test that exercises
+/// it too, so this returns the empty prefix rather than panicking on a `len`
+/// the buffer cannot cover.
+fn written<T>(buffer: &[T], len: usize) -> &[T] {
+    buffer.get(..len).unwrap_or(&[])
 }

@@ -168,7 +168,7 @@ Everything else fails, precisely:
 | `HeapType` | a type that would require a heap allocation in generated code |
 | `RecursiveType` | an inductive refers to itself (directly, or through one level of indirection); needs the tier-1 memory profile |
 | `PolymorphicType` | an inductive has type parameters; monomorphization is not implemented |
-| `UnsupportedFieldType` | a structure shape that has no allocation-free rendering. Two causes: a field type that would need owned storage (a list or vector field); or a type that carries an invariant and has more than one constructor, which cannot get the checked constructor an invariant requires, since a `Prop` field belongs to exactly one constructor |
+| `UnsupportedFieldType` | a structure shape with no allocation-free rendering. There are exactly four causes: a field type that would need owned storage (a list or vector field); a type that carries an invariant and has more than one constructor, which cannot get the checked constructor an invariant requires, since a `Prop` field belongs to exactly one constructor; a constructor application or a match alternative whose argument/binder count disagrees with the declaration, which is the IR contradicting itself; and an invariant containing an operation that can fail, whose checked constructor would report the arithmetic's error instead of the invariant it was checking |
 | `DuplicateTypeName` | two Lean types share a last name component, so they would collide in Rust |
 | `OpaqueType` | a type reached codegen with no Rust rendering |
 | `UnresolvedCall` | the callee is neither @[prod]-tagged nor a whitelisted operator, so there is nothing to call |

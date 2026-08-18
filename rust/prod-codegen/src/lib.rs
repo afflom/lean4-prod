@@ -30,9 +30,11 @@
 //!   trailing `output: &mut [α]` and returns `Result<usize, ComputeError>`,
 //!   the length of the initialized prefix. The body appends through a cursor:
 //!   every append is preceded by an explicit bounds check whose else-branch
-//!   returns `OutputTooSmall`, so exhaustion is an `Err`, never an index
-//!   panic. A list-shaped callee is handed the unwritten remainder and reports
-//!   how many elements it added. `let`-bound list values (LCNF emits lists in
+//!   returns `OutputTooSmall`, so exhaustion is an `Err` rather than a
+//!   truncated answer — and the append itself is written through `get_mut`,
+//!   never an index, so there is no panic path in the emitted text even
+//!   considered apart from that check. A list-shaped callee is handed the
+//!   unwritten remainder and reports how many elements it added. `let`-bound list values (LCNF emits lists in
 //!   A-normal form) are resolved through a scoped environment rather than
 //!   materialized.
 //! - **Zero-argument definitions returning a list** (the golden values) →
@@ -144,10 +146,16 @@ pub enum Error {
     RecursiveType(String),
     /// A type takes type parameters; needs monomorphization (S5).
     PolymorphicType(String),
-    /// A structure shape with no allocation-free rendering: a field type that
-    /// cannot appear in one, or — since a `Prop` field belongs to exactly one
-    /// constructor — an invariant on a type with more than one constructor,
-    /// which could not be given the checked constructor an invariant needs.
+    /// A structure shape with no allocation-free rendering, or a constructor
+    /// applied to the wrong number of values. Four causes, all sharing this
+    /// name: a field type that would need owned storage; an invariant on a
+    /// type with more than one constructor, which could not be given the
+    /// checked constructor an invariant needs, since a `Prop` field belongs to
+    /// exactly one constructor; an arity disagreement between a constructor's
+    /// declaration and a use of it (an application or a match alternative);
+    /// and an invariant containing an operation that can fail, whose checked
+    /// constructor would report that failure rather than the invariant it was
+    /// checking.
     UnsupportedFieldType(String),
     /// Two Lean types share a last name component, so they would collide.
     DuplicateTypeName(String),
@@ -263,7 +271,7 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     ),
     (
         "UnsupportedFieldType",
-        "a structure shape that has no allocation-free rendering. Two causes: a field type that would need owned storage (a list or vector field); or a type that carries an invariant and has more than one constructor, which cannot get the checked constructor an invariant requires, since a `Prop` field belongs to exactly one constructor",
+        "a structure shape with no allocation-free rendering. There are exactly four causes: a field type that would need owned storage (a list or vector field); a type that carries an invariant and has more than one constructor, which cannot get the checked constructor an invariant requires, since a `Prop` field belongs to exactly one constructor; a constructor application or a match alternative whose argument/binder count disagrees with the declaration, which is the IR contradicting itself; and an invariant containing an operation that can fail, whose checked constructor would report the arithmetic's error instead of the invariant it was checking",
     ),
     (
         "DuplicateTypeName",

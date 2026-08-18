@@ -699,9 +699,11 @@ fn render_one(ir: &str) -> String {
 /// The list-builder signature and, in the body, the bounds check the lowering
 /// put there.
 ///
-/// The `output[__len]` index cannot be out of range: the `if` immediately
-/// above it is the check, and its else-branch returns. That check being in the
-/// statement list rather than re-derived here is the point of the task.
+/// Two separate properties, both asserted below. The `if` immediately above
+/// the write is the check, and its else-branch returns `OutputTooSmall` --
+/// that check being in the statement list rather than re-derived here is the
+/// point of the task. And the write itself goes through `get_mut`, so it has
+/// no panic path even considered on its own, without the neighbouring `if`.
 #[test]
 fn a_caller_buffer_list_prints_its_guard_its_write_and_its_recursion() {
     let out = render_module(include_str!("../../../lean/Conformance/golden.ir"))
@@ -723,11 +725,22 @@ fn a_caller_buffer_list_prints_its_guard_its_write_and_its_recursion() {
         "got: {}",
         out
     );
-    assert!(out.contains("output[__len] = n;"), "got: {}", out);
+    // The write is a `get_mut`, not an index: no `[` anywhere near `__len`.
+    assert!(
+        out.contains("if let Some(__slot) = output.get_mut(__len) {"),
+        "got: {}",
+        out
+    );
+    assert!(out.contains("*__slot = n;"), "got: {}", out);
     assert!(out.contains("__len += 1;"), "got: {}", out);
+    assert!(
+        !out.contains("output[__len]"),
+        "an indexed write is a panic path the printer cannot rule out: {}",
+        out
+    );
     // The recursion writes where this call left off and reports what it used.
     assert!(
-        out.contains("c_list_build(n_27, _x_56, &mut output[__len..])?"),
+        out.contains("c_list_build(n_27, _x_56, output.get_mut(__len..).unwrap_or(&mut []))?"),
         "got: {}",
         out
     );
@@ -878,7 +891,7 @@ fn a_trylet_that_reads_the_cursor_is_never_folded_past_a_push() {
 
     let out = emit_body(&body, &[]);
     assert!(
-        out.contains("let t0 = f(&mut output[__len..])?;"),
+        out.contains("let t0 = f(output.get_mut(__len..).unwrap_or(&mut []))?;"),
         "the call must stay where the cursor was still 0: {}",
         out
     );

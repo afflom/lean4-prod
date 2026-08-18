@@ -58,7 +58,7 @@ pub enum LowerError {
     /// field's type is `Opaque`.
     OpaqueType(String),
     /// A structure shape with no allocation-free rendering, or a constructor
-    /// applied to the wrong number of values. Three causes, all sharing this
+    /// applied to the wrong number of values. Four causes, all sharing this
     /// name because `prod-codegen` gave them one: a field type that would need
     /// owned storage; a type that carries an invariant and has more than one
     /// constructor, which cannot get the checked constructor an invariant

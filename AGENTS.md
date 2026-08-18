@@ -103,10 +103,17 @@ Two rules keep this from collapsing back into one crate:
   inside `prod-lower`.** Whether `Nat.add` can fail is a property of the
   target's `Nat`, declared once as `NatRepr`; whether division needs a
   Euclidean correction is `DivisionSemantics`; whether a list needs a bounds
-  check is `ListStrategy`. A `if target == Rust` anywhere in `prod-lower` is
+  check is `ListStrategy`; whether a sized-integer result needs an explicit
+  `& (2^w - 1)` is `sized_mask_required`. A `if target == Rust` anywhere in
+  `prod-lower` is
   the design failure this split exists to prevent. The check is
-  `grep -rn "rust\|Rust" rust/prod-lower/src`, which should return doc
-  comments and the two `RUST` constants and nothing else.
+  `grep -rni rust rust/prod-lower/src`: every hit must be a comment, a test,
+  or one of the three constants that merely NAME a target as data --
+  `TargetProfile::RUST`, `NamePolicy::RUST` and `RUST_KEYWORDS`. A hit in
+  non-test control flow is the failure. (Case-insensitive on purpose: the
+  earlier spelling here, `grep -rn "rust\|Rust"`, matched neither `RUST`
+  constant, so the one thing it claimed to find was the one thing it could
+  not.)
 - **`TExpr` is total by construction; anything that can fail is a `Stmt`.**
   Rust and Python can propagate an error inside an expression; C cannot. A
   printer returning a `String` per expression node can serve the first two and
@@ -211,11 +218,21 @@ make, so a rejection that must keep its published kind has to keep it in
     lists in A-normal form, so `digits`'s cons cells arrive as chains of
     `let`s, and materializing them would need the heap.
   - Buffer exhaustion is an explicit bounds check emitted by `prod-lower`
-    beside every append, whose else-branch returns `OutputTooSmall`; the
-    generated code has no bounds-check panic path at all. (Until the
-    multi-backend cutover this was a nest of `split_first_mut`, which computes
-    the same function. The check moved into the lowering so three printers
-    cannot forget it three times.)
+    beside every append, whose else-branch returns `OutputTooSmall`. That is
+    what makes exhaustion an `Err`. Separately, the generated code contains no
+    slice index at all: `prod-emit-rust` spells the append as
+    `if let Some(__slot) = output.get_mut(__len)` and the recursive tail as
+    `output.get_mut(__len..).unwrap_or(&mut [])`, so the absence of a panic
+    path is a property of the emitted TEXT and does not rest on the bounds
+    check being adjacent. Both halves are needed: the printer cannot see the
+    check (`bounded` is lowering-local), and the check cannot make an index
+    safe by standing next to it. `prod-core` denies
+    `clippy::indexing_slicing` to hold its hand-written runtime to the same
+    rule — though note clippy does not lint proc-macro expansions, so that
+    deny never sees `prod_defs!`'s output. (Until the multi-backend cutover
+    this was a nest of `split_first_mut`, which computes the same function.
+    The check moved into the lowering so three printers cannot forget it
+    three times.)
   - `prod-ir`'s `parse_i64` parses the magnitude as `i128` before narrowing;
     the old `digits.parse::<i64>().unwrap()` panicked on `i64::MIN`.
 

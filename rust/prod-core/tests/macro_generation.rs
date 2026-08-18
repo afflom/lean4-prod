@@ -78,8 +78,8 @@ fn generated_definitions_compile_and_run() -> Result<(), ComputeError> {
     // digits of 43 in base 8 are [3, 5] (least-significant first).
     let mut buffer = [0u64; DIGIT_CAPACITY];
     let len = digits(10, 43, canonical, &mut buffer)?;
-    assert_eq!(&buffer[..len], &[3, 5]);
-    assert_eq!(digitSum(&buffer[..len])?, 8);
+    assert_eq!(written(&buffer, len), &[3, 5]);
+    assert_eq!(digitSum(written(&buffer, len))?, 8);
     // Decidable guards: 43//24 = 44//24 = 1 but 67//24 = 2; belt = 12288.
     assert!(sameClass(43, 44, canonical)?);
     assert!(!sameClass(43, 67, canonical)?);
@@ -213,9 +213,9 @@ fn generated_definitions_match_lean_goldens() -> Result<(), ComputeError> {
     );
     let mut buffer = [0u64; DIGIT_CAPACITY];
     let len = digits(10, 43, canonical, &mut buffer)?;
-    assert_eq!(&buffer[..len], golden_digits_43_canonical());
+    assert_eq!(written(&buffer, len), golden_digits_43_canonical());
     assert_eq!(
-        digitSum(&buffer[..len])?,
+        digitSum(written(&buffer, len))?,
         golden_digitSum_digits_43_canonical()
     );
     assert_eq!(
@@ -277,4 +277,15 @@ fn decode_encode_roundtrip_full_index_sweep() -> Result<(), ComputeError> {
         }
     }
     Ok(())
+}
+
+/// The initialized prefix of a list builder's output buffer, taken without an
+/// index.
+///
+/// `prod-core` denies `clippy::indexing_slicing`: the rule that keeps a panic
+/// path out of the generated writer keeps one out of the test that exercises
+/// it too, so this returns the empty prefix rather than panicking on a `len`
+/// the buffer cannot cover.
+fn written<T>(buffer: &[T], len: usize) -> &[T] {
+    buffer.get(..len).unwrap_or(&[])
 }

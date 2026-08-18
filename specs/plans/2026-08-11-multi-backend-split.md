@@ -1173,6 +1173,16 @@ pub fn generate_module(module: &Module) -> Result<String, Error> {
 
 Add a test asserting that lowering every definition in all three corpus files yields no `LowerError::NotYetLowered`. Then delete the variant and let the compiler find any arm still producing it. A remaining arm is an IR node with no lowering, which would otherwise degrade silently to a runtime rejection.
 
+- [ ] **Step 4b: Give the arms that outlive `NotYetLowered` a published home**
+
+Deleting `NotYetLowered` orphans a few arms that must still refuse. Map each onto an **existing** `REJECTIONS` kind — do not add a published rejection, because `REJECTIONS` and `specs/lean-for-production.md` are pinned.
+
+- **Lazy connectives whose right operand needs statements.** `&&`/`||` are lazy in the right operand and `TExpr` has no place to hang that operand's statements; hoisting them would report an overflow where Lean has none. Map to `Error::OpaqueExpr` with a message naming the construct. **This is not a regression in the published subset:** `prod-ir`'s own doc says `Expr::And`/`Or`/`Not` are "produced only by the invariant lowering", and `lean/Prod/Lower.lean` emits them only from `lowerProp` and the invariant fold — Lean cannot export a connective into a definition body at all.
+- **`Extern` and `Opaque` inside an invariant.** These currently degrade `prod-codegen`'s named rejections into `NotYetLowered`: restore `Error::UnresolvedCall` and `Error::OpaqueExpr` respectively, matching what the old renderer reports.
+- **`Jp`, `Jmp`, `Unreachable` inside an invariant.** Arm-less in `lower_invariant` and refused, where `prod-codegen` renders them. Refusal is the safe direction and these cannot appear in a Lean-exported invariant, but the divergence list must name them.
+
+Add a test per mapping asserting the rejection kind, so the cutover cannot quietly change a published one.
+
 - [ ] **Step 5: Delete the differential harness**
 
 It compared the new path against an implementation that no longer exists. Leaving it is dead weight that reads like coverage.

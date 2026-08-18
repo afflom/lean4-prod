@@ -405,12 +405,11 @@ written from this document:
    The old renderer is deleted; `prod-codegen` is a facade over `prod-lower` +
    `prod-emit-rust` with its public API unchanged. Parity is *behavioural* and
    what certifies it is `just prod`, which compiles the generated Rust and
-   executes every Lean-computed golden. Text differs in five known places, all
-   recorded in the Task 7 report: flat statement lists rather than nested
-   braces, `return` terminators in branches rather than block values,
-   branch-local temporaries never folded into their single use, a `__len`
-   cursor rather than nested `split_first_mut`, and an elided rather than
-   unit-bound join-point `let`.
+   executes every Lean-computed golden. Text differs in five known places:
+   flat statement lists rather than nested braces, `return` terminators in
+   branches rather than block values, branch-local temporaries never folded
+   into their single use, a `__len` cursor rather than nested
+   `split_first_mut`, and an elided rather than unit-bound join-point `let`.
 2. **Python end-to-end.** `prod-emit-python`, the prelude, generated
    assertions, the divergence registry, per-backend contracts, nix and CI.
 

@@ -83,7 +83,15 @@ pub enum TExpr {
     /// Infallible operations ONLY. Anything the profile marks fallible is a
     /// `TryLet`, never this.
     BinOp(NumKind, BinOp, Box<TExpr>, Box<TExpr>),
-    Ctor(String, String, Vec<TExpr>),
+    /// Constructor application: the constructor's full Lean name, and its
+    /// arguments IN DECLARATION ORDER.
+    ///
+    /// The Lean name and nothing else. A printer resolves it against
+    /// [`CtorDef::lean_name`], which is the same lookup an [`Arm`] needs and
+    /// [`Arm`] has no owner to short-cut it with -- so carrying the owner here
+    /// would buy one path a shortcut the other cannot have, and invite two
+    /// resolvers that can disagree.
+    Ctor(String, Vec<TExpr>),
     Proj(String, String, Box<TExpr>),
     /// Total callees ONLY.
     Call(String, Vec<TExpr>),

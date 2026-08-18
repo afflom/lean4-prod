@@ -483,7 +483,7 @@ impl Printer<'_> {
             // A constructor application needs the module's type table: a Rust
             // struct literal names its fields, and the constructor's
             // arguments arrive positionally.
-            TExpr::Ctor(_, name, args) => self.ctor(name, args),
+            TExpr::Ctor(name, args) => self.ctor(name, args),
         }
     }
 
@@ -753,8 +753,9 @@ fn unsupported(why: &str) -> String {
 /// A constructor's declaration, found by the Lean name the Target IR carries.
 ///
 /// Keyed on the constructor rather than on the owner because that is the name
-/// both a [`TExpr::Ctor`] and an [`Arm`] actually write; the owner is what the
-/// lookup produces, since the Rust path needs it.
+/// both a [`TExpr::Ctor`] and an [`Arm`] actually write. The owner is what the
+/// lookup produces, since the Rust path needs it, so neither of those two
+/// nodes has to carry it.
 fn resolve<'t>(types: &'t [TypeDef], lean_ctor: &str) -> Option<(&'t TypeDef, &'t CtorDef)> {
     types.iter().find_map(|def| {
         def.ctors
@@ -916,7 +917,7 @@ fn expr_mentions_sequence(e: &TExpr) -> bool {
             expr_mentions_sequence(a) || expr_mentions_sequence(b)
         }
         TExpr::Not(a) | TExpr::Proj(_, _, a) | TExpr::Convert(_, _, a) => expr_mentions_sequence(a),
-        TExpr::Ctor(_, _, args) | TExpr::Call(_, args) => args.iter().any(expr_mentions_sequence),
+        TExpr::Ctor(_, args) | TExpr::Call(_, args) => args.iter().any(expr_mentions_sequence),
     }
 }
 
@@ -994,7 +995,7 @@ fn count_expr(e: &TExpr, out: &mut BTreeMap<String, Usage>, same_level: bool) {
         }
         // A question about the sequence reads no bound name.
         TExpr::Seq(..) => {}
-        TExpr::Ctor(_, _, args) | TExpr::Call(_, args) => {
+        TExpr::Ctor(_, args) | TExpr::Call(_, args) => {
             for a in args {
                 count_expr(a, out, same_level);
             }

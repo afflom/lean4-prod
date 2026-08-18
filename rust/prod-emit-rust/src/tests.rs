@@ -899,9 +899,11 @@ fn a_trylet_that_reads_the_cursor_is_never_folded_past_a_push() {
 /// multi-constructor enum, the keyword field names and the inlined join point
 /// that the Lean corpus cannot produce.
 ///
-/// Every definition lowers and renders. The only `compile_error!` left is the
-/// struct literal, which needs the module's type table -- that is the Task 7
-/// cutover's job, and this asserts it is the *only* thing outstanding.
+/// Every definition lowers and renders, and nothing in the output is a
+/// `compile_error!`. The printer is total, so its way of saying "no rendering"
+/// is to emit one; on this corpus it never has to, which is the post-cutover
+/// invariant. Struct literals and enum patterns used to be the exception,
+/// before the module's type table reached this printer.
 #[test]
 fn the_hand_written_corpus_lowers_and_renders() {
     let rendered = render_module(include_str!(
@@ -910,14 +912,12 @@ fn the_hand_written_corpus_lowers_and_renders() {
     assert_eq!(rendered.len(), 6, "got {:?}", rendered.keys());
 
     for (name, out) in &rendered {
-        for line in out.lines().filter(|l| l.contains("compile_error!")) {
-            assert!(
-                line.contains("a struct literal needs the module's type table"),
-                "`{}` has an unexpected compile_error!: {}",
-                name,
-                line
-            );
-        }
+        assert!(
+            !out.contains("compile_error!"),
+            "`{}` has no rendering for something: {}",
+            name,
+            out
+        );
     }
     // The join point is inlined at its jump site, not rejected.
     assert!(
@@ -930,5 +930,131 @@ fn the_hand_written_corpus_lowers_and_renders() {
         rendered["r_keyword_fields"].contains("r#type"),
         "got {}",
         rendered["r_keyword_fields"]
+    );
+}
+
+/// The constructor spellings the type table buys, asserted on this crate
+/// directly rather than through `prod-codegen`.
+///
+/// Four cases, and they are four different lookups, not one:
+///
+/// * a **single-constructor** type: the type IS the struct, so the path is
+///   `crate::Type` with no variant;
+/// * a **multi-constructor** type: `crate::Type::Variant`;
+/// * in **expression** position the arguments arrive positionally and Rust's
+///   struct literal is by name, so the table supplies the names;
+/// * in **pattern** position the same is true of the binders, and an `Arm`
+///   carries no owner at all -- it is resolved by constructor name, which is
+///   why `TExpr::Ctor` carries no owner either.
+///
+/// A fifth: a **field-less** constructor is a bare path, not `Name { }`.
+#[test]
+fn a_declared_constructor_renders_as_a_named_struct_literal_and_pattern() {
+    let ir = r#"
+(module M
+  (type "M.Pair" (ctor "M.Pair.mk" (lo Nat) (hi Nat)))
+  (type "M.Shape"
+    (ctor "M.Shape.circle" (radius Nat))
+    (ctor "M.Shape.rect" (w Nat) (h Nat))
+    (ctor "M.Shape.point"))
+  (def make ((a Nat) (b Nat)) (named "M.Pair") (ctor "M.Pair.mk" a b))
+  (def unit ((r Nat)) (named "M.Shape") (ctor "M.Shape.circle" r))
+  (def nothing ((r Nat)) (named "M.Shape") (ctor "M.Shape.point"))
+  (def area ((s (named "M.Shape"))) Nat
+    (cases s
+      (alt "M.Shape.circle" (rad) rad)
+      (alt "M.Shape.rect" (ww hh) ww)
+      (alt "M.Shape.point" () 0))))
+"#;
+    let rendered = render_module(ir);
+
+    // One constructor: the type is the struct, and the positional arguments
+    // are bound to the declared field names in declaration order.
+    assert!(
+        rendered["make"].contains("crate::Pair { lo: a, hi: b }"),
+        "got {}",
+        rendered["make"]
+    );
+    // Several constructors: a variant path.
+    assert!(
+        rendered["unit"].contains("crate::Shape::circle { radius: r }"),
+        "got {}",
+        rendered["unit"]
+    );
+    // No fields: a bare path, not an empty brace pair.
+    assert!(
+        rendered["nothing"].contains("crate::Shape::point"),
+        "got {}",
+        rendered["nothing"]
+    );
+    assert!(
+        !rendered["nothing"].contains("point {"),
+        "a field-less constructor is a path, not a literal: {}",
+        rendered["nothing"]
+    );
+
+    // Patterns: same paths, binders bound BY FIELD NAME. Getting this wrong
+    // is not a formatting slip -- `M.Shape.circle(rad)` is a dotted Lean name
+    // used as a tuple-struct pattern, which rustc rejects outright, and a
+    // positional binding would silently swap `w` and `h`.
+    let area = &rendered["area"];
+    assert!(
+        area.contains("crate::Shape::circle { radius: rad } =>"),
+        "got {}",
+        area
+    );
+    assert!(
+        area.contains("crate::Shape::rect { w: ww, h: hh } =>"),
+        "got {}",
+        area
+    );
+    assert!(area.contains("crate::Shape::point =>"), "got {}", area);
+}
+
+/// Lean's own constructors need no declaration, and each has a fixed Rust
+/// spelling.
+///
+/// `Int.ofNat` and `Int.negSucc` are the ones that are easy to miss: `Int` is
+/// `inductive Int | ofNat | negSucc`, so LCNF sees `(1 : Int)` as a
+/// constructor application, and without them an `Int` literal would fall
+/// through to the undeclared case.
+#[test]
+fn leans_own_constructors_render_without_a_declaration() {
+    let rendered = render_module(
+        r#"
+(module M
+  (def pair ((a Nat) (b Nat)) (Tuple Nat Nat) (ctor "Prod.mk" a b))
+  (def yes () Bool (ctor "Bool.true"))
+  (def some_of ((a Nat)) (Option Nat) (ctor "Option.some" a))
+  (def none_of ((a Nat)) (Option Nat) (ctor "Option.none"))
+  (def of_nat ((a Nat)) Int (ctor "Int.ofNat" a))
+  (def neg_succ ((a Nat)) Int (ctor "Int.negSucc" a)))
+"#,
+    );
+    assert!(
+        rendered["pair"].contains("(a, b)"),
+        "got {}",
+        rendered["pair"]
+    );
+    assert!(rendered["yes"].contains("true"), "got {}", rendered["yes"]);
+    assert!(
+        rendered["some_of"].contains("Some(a)"),
+        "got {}",
+        rendered["some_of"]
+    );
+    assert!(
+        rendered["none_of"].contains("None"),
+        "got {}",
+        rendered["none_of"]
+    );
+    assert!(
+        rendered["of_nat"].contains("((a) as i64)"),
+        "got {}",
+        rendered["of_nat"]
+    );
+    assert!(
+        rendered["neg_succ"].contains("(-((a) as i64) - 1)"),
+        "got {}",
+        rendered["neg_succ"]
     );
 }

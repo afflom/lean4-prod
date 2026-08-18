@@ -137,17 +137,57 @@ pub fn lower_def_in(
 /// today.
 fn check_signature(def: &Definition, decls: &[TypeDecl]) -> Result<(), LowerError> {
     for (_, ty) in &def.params {
-        // A top-level list borrows as a slice, so it is the ELEMENT type that
-        // has to be renderable by value; nested any deeper, a list has no
-        // rendering at all.
-        match ty {
-            Type::List(inner) => check_value_type(inner, decls)?,
-            _ => check_value_type(ty, decls)?,
-        }
+        check_signature_type(ty, decls)?;
     }
-    match &def.ret {
+    check_signature_type(&def.ret, decls)
+}
+
+/// One signature type, checked in the order `prod-codegen` checked it.
+///
+/// **The order is load-bearing**, which is why it is one function rather than
+/// two calls at each site. `check_named_type` ran first and recursed through
+/// `Vec` and `List`, so `(Vec (named "Undeclared"))` reported the *undeclared
+/// name* rather than the heap; `type_to_rust` ran second and stops at the
+/// first unrenderable constructor. Both kinds are separately published, so
+/// swapping them would change which one a caller sees for a type that trips
+/// both.
+fn check_signature_type(ty: &Type, decls: &[TypeDecl]) -> Result<(), LowerError> {
+    check_named_types(ty, decls)?;
+    // A top-level list borrows as a slice, so it is the ELEMENT type that has
+    // to be renderable by value; nested any deeper, a list has no rendering at
+    // all.
+    match ty {
         Type::List(inner) => check_value_type(inner, decls),
         other => check_value_type(other, decls),
+    }
+}
+
+/// Every `(named ...)` in a signature type, **at any depth**, must be declared
+/// in this module -- inside `Option`, `List`, `Vec` or `Tuple` alike.
+///
+/// Deliberately blind to whether the surrounding type is renderable at all:
+/// that is [`check_value_type`]'s question, asked afterwards. An undeclared
+/// name is a disagreement inside the IR and outranks a type this tier cannot
+/// hold.
+fn check_named_types(ty: &Type, decls: &[TypeDecl]) -> Result<(), LowerError> {
+    match ty {
+        Type::Named(n) => {
+            if decls.iter().any(|d| d.name == *n) {
+                Ok(())
+            } else {
+                Err(LowerError::OpaqueType(n.clone()))
+            }
+        }
+        Type::Option(inner) | Type::Vec(inner) | Type::List(inner) => {
+            check_named_types(inner, decls)
+        }
+        Type::Tuple(items) => {
+            for item in items {
+                check_named_types(item, decls)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -681,7 +721,7 @@ fn lower_invariant(
 /// `prod-codegen`'s split.
 fn ctor_expr(decls: &[TypeDecl], name: &str, args: Vec<TExpr>) -> Result<TExpr, LowerError> {
     match ctor_decl(decls, name) {
-        Some((decl, cdecl)) => {
+        Some((_, cdecl)) => {
             // Arity is an agreement between the declaration and this use, so
             // a disagreement is the IR contradicting itself. Rendering it
             // would emit a call with the wrong number of arguments.
@@ -693,13 +733,11 @@ fn ctor_expr(decls: &[TypeDecl], name: &str, args: Vec<TExpr>) -> Result<TExpr, 
                     args.len()
                 )));
             }
-            Ok(TExpr::Ctor(decl.name.clone(), String::from(name), args))
+            Ok(TExpr::Ctor(String::from(name), args))
         }
-        None if is_builtin_ctor(name, args.len()) => {
-            Ok(TExpr::Ctor(String::new(), String::from(name), args))
-        }
+        None if is_builtin_ctor(name, args.len()) => Ok(TExpr::Ctor(String::from(name), args)),
         None if name.contains('.') => Err(LowerError::UnresolvedCall(String::from(name))),
-        None => Ok(TExpr::Ctor(String::new(), String::from(name), args)),
+        None => Ok(TExpr::Ctor(String::from(name), args)),
     }
 }
 
@@ -1106,13 +1144,14 @@ impl<'a> Lowering<'a> {
             Expr::Jp { name, body, .. } => {
                 if self.jps.jmp_count(name) == 0 {
                     self.expr(body, stmts)
-                } else if self.jps.is_inlineable(name) {
-                    // Inlineable, but reached somewhere `bind_let` could not
-                    // elide the `let` LCNF wraps it in, so there is no jump
-                    // site to inline it at. Still a join point this lowering
-                    // will not place, which is what the name says.
-                    Err(LowerError::UnsupportedJoinPoint(name.clone()))
                 } else {
+                    // Something jumps to it, so its body belongs at the jump
+                    // site and the declaration has no value to give. Either
+                    // it is inlineable and `bind_let` could not elide the
+                    // `let` LCNF wraps it in -- so there is no jump site to
+                    // inline it at -- or it is cyclic or multi-caller. A join
+                    // point this lowering will not place, either way, which is
+                    // what the name says.
                     Err(LowerError::UnsupportedJoinPoint(name.clone()))
                 }
             }
@@ -1167,12 +1206,10 @@ impl<'a> Lowering<'a> {
             // any target, so both stay in expression position rather than
             // becoming a `TryLet`.
             //
-            // The owner's Lean type name is carried alongside the constructor
-            // so a printer can find the declaration without a second lookup;
-            // it is empty for a constructor this module does not declare
-            // (`Bool.true`, `Option.some`, `Prod.mk`, and anything the host
-            // supplies by hand), which is exactly the case a printer has to
-            // special-case anyway.
+            // The constructor keeps its full LEAN name: that is the key a
+            // printer resolves against `CtorDef::lean_name`, and it is the
+            // only key an `Arm` has, so both sides of a type share one
+            // resolver rather than two that can disagree.
             Expr::Ctor(name, args) => {
                 let mut lowered = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1804,9 +1841,9 @@ fn kind_type(kind: NumKind) -> Type {
 /// [`Signatures`] records each definition's [`Shape`], not its return type, so
 /// a call's result is untyped here, as are constructors and projections.
 /// Rust's `let` infers, so `prod-emit-rust` never reads the field; a C backend
-/// will, and Task 6/7 widens the table consulted here. Spelled `Opaque`
-/// deliberately rather than guessed: a printer that does read it then fails
-/// loudly instead of declaring the wrong type.
+/// will, and widening the table consulted here is what that backend will need.
+/// Spelled `Opaque` deliberately rather than guessed: a printer that does read
+/// it then fails loudly instead of declaring the wrong type.
 fn unknown_type() -> Type {
     Type::Opaque(String::from("?"))
 }
@@ -3644,6 +3681,41 @@ mod tests {
         assert_eq!(
             lower_err(r#"(module M (def m ((xs (Vec Nat))) Nat 0))"#),
             LowerError::HeapType(String::from("(Vec Nat)"))
+        );
+        assert_eq!(
+            lower_err(r#"(module M (def m ((xs (Option (List Nat)))) Nat 0))"#),
+            LowerError::UnsupportedList(String::from(
+                "(List Nat) is only supported directly as a parameter or return type"
+            ))
+        );
+    }
+
+    /// A type that trips BOTH signature checks reports the undeclared name,
+    /// not the container.
+    ///
+    /// The order is `prod-codegen`'s: `check_named_type` ran first and recursed
+    /// through `Vec` and `List`, so `(Vec (named "M.Nope"))` was
+    /// `OpaqueType`, not `HeapType`. Both kinds are separately published, so
+    /// the two checks running in the other order would silently change which
+    /// one a caller sees. Pathological input, pinned anyway -- it is exactly
+    /// the kind of thing a port loses without anyone noticing.
+    #[test]
+    fn an_undeclared_name_inside_an_unrenderable_container_reports_the_name() {
+        assert_eq!(
+            lower_err(r#"(module M (def m ((xs (Vec (named "M.Nope")))) Nat 0))"#),
+            LowerError::OpaqueType(String::from("M.Nope"))
+        );
+        assert_eq!(
+            lower_err(r#"(module M (def m ((xs (List (List (named "M.Nope"))))) Nat 0))"#),
+            LowerError::OpaqueType(String::from("M.Nope"))
+        );
+        // ...and with the name declared, the container is what is reported.
+        assert_eq!(
+            lower_err(
+                r#"(module M (type "M.Ok" (ctor "M.Ok.mk" (a Nat)))
+                     (def m ((xs (Vec (named "M.Ok")))) Nat 0))"#
+            ),
+            LowerError::HeapType(String::from("(Vec (named \"M.Ok\"))"))
         );
     }
 

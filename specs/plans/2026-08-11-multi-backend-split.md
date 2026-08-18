@@ -1181,7 +1181,9 @@ Deleting `NotYetLowered` orphans a few arms that must still refuse. Map each ont
 - **`Extern` and `Opaque` inside an invariant.** These currently degrade `prod-codegen`'s named rejections into `NotYetLowered`: restore `Error::UnresolvedCall` and `Error::OpaqueExpr` respectively, matching what the old renderer reports.
 - **`Jp`, `Jmp`, `Unreachable` inside an invariant.** Arm-less in `lower_invariant` and refused, where `prod-codegen` renders them. Refusal is the safe direction and these cannot appear in a Lean-exported invariant, but the divergence list must name them.
 
-Add a test per mapping asserting the rejection kind, so the cutover cannot quietly change a published one.
+- **The five list rejections carry the wrong KIND.** Task 6 restored their text verbatim but raises `LowerError::UnsupportedKind` where `prod-codegen` raises `Error::UnsupportedList` for the identical cause. Both names are separately published in `REJECTIONS` and pinned by the variant-name loop in `prod-codegen/src/tests.rs`, so `From<LowerError>` in Step 3 **cannot recover `UnsupportedList` from `UnsupportedKind`** — the mapping has to distinguish them at the source. Give `LowerError` a same-named variant, the way `error.rs` already did for the type-declaration rejections precisely so this could not happen.
+
+Add a test per mapping asserting the rejection kind, so the cutover cannot quietly change a published one. `test_every_error_variant_is_published_in_rejections` checks that every variant *appears*; it does not check that a given input still produces the same one, which is the property at risk here.
 
 - [ ] **Step 5: Delete the differential harness**
 

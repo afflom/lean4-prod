@@ -8,10 +8,23 @@ conversions). The published contract's `Int` qualifier from S1 ("no Int
 operators are whitelisted") is gone, all three arithmetic policies in the
 table below match the shipped rendering, and `specs/lean-for-production.md`
 now lists the kinds, operators, conversions, and deciders it actually
-accepts. Phase B (invariant-carrying types and `Fin`, migration steps 6–8) is
-now unblocked and should be planned as a separate plan against the
-arithmetic layer as it actually shipped — see the note at the top of "Phase
-B" below.
+accepts.
+Phase B1 (invariant-carrying types, migration steps 6–7) is DONE —
+implemented by
+`.superpowers/sdd/2026-08-10-s2-phase-b1-invariants/`. A structure whose
+`Prop` fields all lower gets `pub(crate)` fields, a checked
+`new(..) -> Result<Self, ComputeError>` and per-field accessors; one whose
+`Prop` fields do not lower keeps public fields and no constructor, as
+before. The rule and the bypass rationale below match what shipped; the one
+correction is that the fields are `pub(crate)`, not private, so in-crate
+generated code can keep building these types by struct literal.
+Phase B2 (`Fin` with a literal bound, migration step 8) is now **unblocked**
+and should be planned against the B1 machinery as it actually shipped —
+`lowerProp`/`propCmpKinds` in `lean/Prod/Lower.lean` and the `(invariant
+...)` clause on `(type ...)` declarations — rather than against this design's
+prediction of it. In particular `Fin n`'s `val < n` is already expressible in
+the fragment B1 implements, so B2 is likely a lowering question (recognising
+`Fin` and its literal bound) rather than a new enforcement mechanism.
 **Scope:** Milestone S2 of the coverage roadmap in
 `specs/designs/2026-08-08-lean-for-production-coverage.md`, extended to include
 `Fin` and the first piece of the invariant subsystem.
@@ -219,27 +232,58 @@ lean/Conformance/golden.ir. No IR change is needed.
 
 ## Phase B — invariant-carrying types
 
-**Unblocked.** Phase A shipped exactly the arithmetic layer this phase is
-built on: comparisons per kind (`Eq`/`Lt`/`Le`/`Gt`, kind-less by design),
-the deciders per kind that make `∧`/`∨`/`¬`-shaped predicates lowerable, and
-`NumKind` itself for describing a bound like `Fin`'s `val < n`. Plan Phase B
-against what actually shipped, not this design's prediction of it — in
-particular, `conversionNames`/`Expr::Convert` (Phase A's conversions) are a
-plain lookup-table + kind-pair match, the same shape `deciderNames` and
-`numOpNames` already used, which Phase B's invariant predicates can likely
-follow rather than invent a new mechanism for.
+**B1 DONE; B2 (`Fin`) unblocked.** Phase A shipped exactly the arithmetic
+layer this phase is built on: comparisons per kind (`Eq`/`Lt`/`Le`/`Gt`,
+kind-less by design), the deciders per kind that make `∧`/`∨`/`¬`-shaped
+predicates lowerable, and `NumKind` itself for describing a bound like
+`Fin`'s `val < n`.
+
+B1 built on it as predicted — `lowerProp` is a straight recursive match over
+`And`/`Or`/`Not` and a comparison table, with `propCmpKinds = [Nat, Int] ++
+sizedKinds` gating which kinds a comparison may be lowered on (`Bool` is
+excluded on purpose, so a `Bool` equality invariant is simply not enforced).
+Three things B1 learned that this design did not anticipate, and that B2 should
+carry forward:
+
+1. **The fields are `pub(crate)`, not private.** Generated code inside the
+   crate keeps constructing these types by struct literal; only the crate
+   boundary is guarded. See "Generated code bypasses the check" below, which
+   was right about the *why* and wrong about the visibility.
+2. **A lowered comparison must be tested by running it, not by reading it.**
+   Reversed operands compile and produce a `bool`. `Conformance.MixedCompare`
+   (`lo ≥ 2 ∧ hi ≤ 7 ∧ lo < hi`) exists because `UorAtlas.Instance`'s three
+   same-direction conjuncts cannot distinguish a blanket operand swap from a
+   correct per-operator one. Any B2 bound needs the same treatment.
+3. **`Fin`'s bound is a type parameter, and that is a case `lowerProp` has
+   never been given.** Every `bvar` inside a proposition today is an earlier
+   *field*, because `lowerTypeDecl` rejects `numParams != 0` before it walks
+   the telescope. `Fin n`'s `isLt : val < n` references `n`, a binder outside
+   the field telescope, so B2 is the first input where an index can point past
+   the fields. `lowerPropOperand` now declines such an index explicitly; before
+   this branch's final wave it computed `depth - 1 - i` unguarded, and `Nat`
+   subtraction truncates, so `n` would have resolved to `fields[0]` — which for
+   `Fin` is `val`, lowering `val < n` to `(lt val val)`: a comparison that
+   compiles, returns a `bool`, and is always false. B2 must *supply* the bound
+   (recognise `Fin`'s parameter and substitute the literal), not rely on the
+   telescope walk to find it.
+
+Plan B2 against what actually shipped, not this design's prediction of it.
 
 ### The rule
 
-A structure gets private fields and a generated checked constructor **iff every
-one of its `Prop` fields is lowerable to a runtime predicate over that
+A structure gets crate-visible fields and a generated checked constructor **iff
+every one of its `Prop` fields is lowerable to a runtime predicate over that
 structure's own fields**. Otherwise it keeps public fields and its `Prop` is
-erased and documented, exactly as today.
+erased and documented, exactly as today. (Shipped as `pub(crate)`, not
+private — see the note above.)
 
 A `Prop` is lowerable when it is built from comparisons on supported numeric
 kinds, `∧`, `∨`, and `¬` — which is precisely what Phase A delivers. `∀`, `∃`,
 arbitrary predicates, and propositions mentioning anything other than the
 structure's own fields (or its literal type arguments) are not lowerable.
+As shipped, "supported numeric kinds" is `propCmpKinds = [Nat, Int] ++
+sizedKinds`: `Bool` equality is outside the fragment, so a structure whose
+only `Prop` field compares `Bool`s takes the unenforced shape.
 
 ### Generated code bypasses the check
 
@@ -323,10 +367,12 @@ two need calling out:
   policies (a table, not a sentence), the conversions, and `Fin` with literal
   bounds. The `Int` qualifier added in S1 is removed.
 - **The "Erased invariants" section becomes false and must be rewritten, not
-  appended to.** It currently states the generated struct does *not* enforce
-  the invariant and that callers must re-check. After Phase B that is backwards
-  for every lowerable case. This project has already shipped one documentation
-  section that survived the change it described; this is a required edit.
+  appended to.** It stated the generated struct does *not* enforce the
+  invariant and that callers must re-check, illustrated with a struct literal
+  that no longer compiles from outside the crate. After Phase B that is
+  backwards for every lowerable case. DONE in B1: the section is now
+  "Erased invariants, and where they are re-checked", covers both published
+  shapes, and tells a reader how to identify which one a type got.
 
 ## Testing
 

@@ -28,12 +28,56 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
 
     // Structure projection, including the type whose Prop field sits in the
     // middle of the declaration.
-    let m = MidProp {
-        first: 1,
-        second: 2,
-        third: 3,
-    };
+    let m = MidProp::new(1, 2, 3)?;
     assert_eq!(c_proj_middle_prop(m), (1, (2, 3)));
+
+    // The invariant-lowering probe structures (`lean/Conformance/Structures.lean`).
+    // What each one pins about lowering lives in `golden.ir`, which `just
+    // conformance` diffs; these calls only establish that the generated Rust
+    // for them is constructible and callable. Each carries an invariant, so it
+    // is constructed through the generated checked `new` — these values satisfy
+    // the Lean invariant, so `new` accepts them.
+    // Interior values, not boundary ones. `MixedCompare`'s invariant is
+    // `lo >= 2 /\ hi <= 7 /\ lo < hi`, and it exists to discriminate a blanket
+    // operand swap from a correct per-operator one. At `lo = 2, hi = 7` both
+    // non-strict conjuncts read the same either way (`2 <= 2`, `7 <= 7`), so
+    // only `lo < hi` would catch a swap. At `lo = 3, hi = 6` all three
+    // conjuncts discriminate. (3 + 6 + 5 is still 14.)
+    let mixed = MixedCompare::new(3, 6, 5)?;
+    assert_eq!(c_mixed_compare(mixed)?, 14);
+    // Interior values here too: `SplitInvariant`'s invariant is
+    // `1 <= a /\ a <= b`, and at `a = 1` the first conjunct reads the same
+    // either way (`1 <= 1`). At `a = 2, b = 3` both conjuncts discriminate.
+    let split = SplitInvariant::new(2, 3)?;
+    assert_eq!(c_split_invariant(split)?, 5);
+    let tagged = TaggedMode::new(1, 9)?;
+    assert_eq!(c_tagged_mode(tagged)?, 10);
+    // These two have Prop fields OUTSIDE the lowerable fragment, so they carry
+    // no invariant and keep plain public fields — the decline path.
+    let unlowerable = UnlowerableProp { x: 1, y: 2 };
+    assert_eq!(c_unlowerable_prop(unlowerable)?, 3);
+    let non_numeric = NonNumericCompare {
+        flagA: true,
+        flagB: true,
+    };
+    assert!(c_non_numeric_compare(non_numeric));
+    // `PartialProp` has one lowerable and one unlowerable `Prop` field, so the
+    // WHOLE invariant is declined: it takes the plain public-field shape, the
+    // same as the two above. Constructing it by struct literal is what proves
+    // that at the type level — if a partial invariant were ever emitted this
+    // line would stop compiling, because the fields would become `pub(crate)`
+    // and `new` would appear. `tests/no_partial_invariant.rs` checks the same
+    // property against the IR.
+    let partial = PartialProp { x: 1, y: 2 };
+    assert_eq!(c_partial_prop(partial)?, 3);
+
+    // The `Int` and sized-kind invariants. Before these, every `(invariant
+    // ...)` in the repo was over `Nat`, so the contract's "comparisons lower
+    // only on `Nat`, `Int` and the sized kinds" was two thirds unexecuted.
+    let range = IntRange::new(-3, 4)?;
+    assert_eq!(c_int_range(range)?, 1);
+    let window = ByteWindow::new(100, 200)?;
+    assert_eq!(c_byte_window(window), 44); // wraps: 300 - 256
 
     // List: caller-owned output buffer in, borrowed slice back out.
     // `c_list_build` is base-2 digits least-significant-first, so 5 is [1,0,1]
@@ -120,6 +164,106 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
     // Cross-checked against Lean's own computed answer, same reasoning as the
     // Int/UInt8 goldens above.
     assert_eq!(c_int_to_nat(-5), golden_int_to_nat_neg_5());
+    Ok(())
+}
+
+#[test]
+fn mixed_compare_constructor_rejects_each_violated_conjunct() -> Result<(), ComputeError> {
+    // `Conformance.MixedCompare`'s Lean invariant is `lo >= 2 /\ hi <= 7 /\
+    // lo < hi` (`lean/Conformance/golden.ir`: `(and (le 2 lo) (and (le hi 7)
+    // (lt lo hi)))`). It is the one probe structure whose conjuncts do NOT all
+    // point the same direction, which is what lets it separate a blanket
+    // operand swap from a correct per-operator lowering. `UorAtlas.Instance`
+    // cannot: its three conjuncts are all `1 <= field`.
+    //
+    // `extra` is unconstrained by the invariant, so it is held at 5 throughout
+    // and every difference below is a difference in a constrained field.
+    assert!(MixedCompare::new(3, 6, 5).is_ok());
+    assert!(
+        MixedCompare::new(2, 7, 5).is_ok(),
+        "both non-strict bounds at their boundary are still valid"
+    );
+
+    // One violated conjunct at a time. The middle row is the load-bearing one:
+    // `hi <= 7` is the only conjunct whose bound sits on the RIGHT, so an
+    // inverted rendering of it (`7 <= hi`) would accept `hi = 8` while every
+    // other case in this crate stayed green.
+    for (lo, hi, extra, violated) in [
+        (1, 6, 5, "lo >= 2"),
+        (3, 8, 5, "hi <= 7"),
+        (6, 6, 5, "lo < hi"),
+    ] {
+        assert_eq!(
+            MixedCompare::new(lo, hi, extra),
+            Err(ComputeError::InvariantViolated("Conformance.MixedCompare")),
+            "MixedCompare::new({}, {}, {}) violates `{}` and must be rejected",
+            lo,
+            hi,
+            extra,
+            violated
+        );
+    }
+
+    // The other two lowerable probes, for the connectives rather than the
+    // comparison directions: `SplitInvariant` is `1 <= a /\ a <= b` (a
+    // field-to-field comparison, not a field-to-literal one), and `TaggedMode`
+    // is `(mode = 0 \/ mode = 1) /\ !(limit = 0)` — disjunction and negation.
+    assert_eq!(
+        SplitInvariant::new(0, 3),
+        Err(ComputeError::InvariantViolated(
+            "Conformance.SplitInvariant"
+        ))
+    );
+    assert_eq!(
+        SplitInvariant::new(4, 3),
+        Err(ComputeError::InvariantViolated(
+            "Conformance.SplitInvariant"
+        ))
+    );
+    assert_eq!(
+        TaggedMode::new(2, 9),
+        Err(ComputeError::InvariantViolated("Conformance.TaggedMode"))
+    );
+    assert_eq!(
+        TaggedMode::new(1, 0),
+        Err(ComputeError::InvariantViolated("Conformance.TaggedMode"))
+    );
+    Ok(())
+}
+
+#[test]
+fn int_and_sized_invariant_constructors_are_checked() -> Result<(), ComputeError> {
+    // `Conformance.IntRange`'s Lean invariant is `lo <= hi /\ hi <= 100`
+    // (`golden.ir`: `(invariant (and (le lo hi) (le hi 100)))`), the only
+    // invariant in the repo over `Int`. Negative values are the point: under an
+    // unsigned reading of the comparison, `-3 <= 4` would still hold but
+    // `-3 <= -1` would not, so the pair below separates `i64` from `u64`.
+    assert!(IntRange::new(-3, -1).is_ok());
+    assert!(
+        IntRange::new(-3, 100).is_ok(),
+        "the upper bound is inclusive"
+    );
+    for (lo, hi, violated) in [(4, -3, "lo <= hi"), (1, 101, "hi <= 100")] {
+        assert_eq!(
+            IntRange::new(lo, hi),
+            Err(ComputeError::InvariantViolated("Conformance.IntRange")),
+            "IntRange::new({lo}, {hi}) violates `{violated}` and must be rejected"
+        );
+    }
+
+    // `Conformance.ByteWindow`'s is `used <= cap /\ cap <= 200`
+    // (`(invariant (and (le used cap) (le cap 200)))`), the only invariant on a
+    // sized kind. `cap = 201` is the case that would pass if the literal bound
+    // were dropped or widened, and `used = 201, cap = 200` is the one that
+    // separates the two conjuncts.
+    assert!(ByteWindow::new(100, 200).is_ok());
+    for (used, cap, violated) in [(201u8, 200u8, "used <= cap"), (0, 201, "cap <= 200")] {
+        assert_eq!(
+            ByteWindow::new(used, cap),
+            Err(ComputeError::InvariantViolated("Conformance.ByteWindow")),
+            "ByteWindow::new({used}, {cap}) violates `{violated}` and must be rejected"
+        );
+    }
     Ok(())
 }
 

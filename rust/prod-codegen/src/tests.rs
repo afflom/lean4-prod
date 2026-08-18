@@ -399,6 +399,7 @@ fn test_every_error_variant_is_published_in_rejections() {
         Error::UnknownField(s(), s()),
         Error::UnsupportedJoinPoint(s()),
         Error::UnsupportedKind(s()),
+        Error::ReservedFieldName(s(), s()),
     ];
 
     for error in &all {
@@ -416,6 +417,7 @@ fn test_every_error_variant_is_published_in_rejections() {
             Error::UnknownField(..) => "UnknownField",
             Error::UnsupportedJoinPoint(_) => "UnsupportedJoinPoint",
             Error::UnsupportedKind(_) => "UnsupportedKind",
+            Error::ReservedFieldName(..) => "ReservedFieldName",
         };
         assert!(
             REJECTIONS.iter().any(|(variant, _)| *variant == name),
@@ -1049,4 +1051,127 @@ fn test_unsupported_conversion_is_rejected() {
     // Cross-width sized conversions are a deliberate non-goal.
     let ir = r#"(module M (def f ((a U8)) U32 (convert U8 U32 a)))"#;
     assert!(matches!(generate_err(ir), Error::UnsupportedKind(_)));
+}
+
+#[test]
+fn test_invariant_type_gets_private_fields_and_a_checked_constructor() {
+    let ir = r#"
+(module M
+  (type "UorAtlas.Instance"
+    (ctor "UorAtlas.Instance.mk" (q Nat) (T Nat) (O Nat))
+    (invariant (and (le 1 q) (and (le 1 T) (le 1 O)))))
+)
+"#;
+    let out = generate(ir);
+    // Fields are pub(crate): generated code in this crate still constructs by
+    // struct literal, because Lean already supplied the proof. Only external
+    // callers are routed through the check.
+    assert!(out.contains("pub(crate) q: u64"), "got: {}", out);
+    assert!(!out.contains("pub q: u64"));
+    assert!(out.contains("pub fn new(q: u64, T: u64, O: u64) -> Result<Self, crate::ComputeError>"));
+    assert!(out.contains("if ((1 <= q) && ((1 <= T) && (1 <= O)))"));
+    assert!(out.contains("crate::ComputeError::InvariantViolated(\"UorAtlas.Instance\")"));
+    // One accessor per field, so external callers can still read.
+    assert!(out.contains("pub fn q(&self) -> u64 { self.q }"));
+    assert!(out.contains("pub fn T(&self) -> u64 { self.T }"));
+}
+
+#[test]
+fn test_type_without_invariant_is_unchanged() {
+    // The common case must not regress: public fields, no constructor, no
+    // accessors.
+    let ir = r#"(module M (type "M.Pair" (ctor "M.Pair.mk" (a Nat) (b Nat))))"#;
+    let out = generate(ir);
+    assert!(out.contains("pub a: u64"));
+    assert!(!out.contains("pub(crate)"));
+    assert!(!out.contains("fn new("));
+}
+
+#[test]
+fn test_connectives_render() {
+    let ir = r#"
+(module M
+  (def f ((a Nat) (b Nat)) Bool (and (lt a b) (not (eq a b)))))
+"#;
+    assert!(generate(ir).contains("((a < b) && (!(a == b)))"));
+}
+
+#[test]
+fn test_or_renders() {
+    let ir = r#"(module M (def f ((a Nat) (b Nat)) Bool (or (lt a b) (eq a b))))"#;
+    assert!(generate(ir).contains("((a < b) || (a == b))"));
+}
+
+#[test]
+fn test_multi_constructor_type_with_an_invariant_is_rejected() {
+    // A `Prop` field belongs to one constructor, so an invariant on a
+    // multi-constructor type has no honest rendering: `new` would not know
+    // which variant to build. Reject rather than render half of it.
+    let ir = r#"
+(module M
+  (type "M.Shape"
+    (ctor "M.Shape.circle" (radius Nat))
+    (ctor "M.Shape.rect" (w Nat) (h Nat))
+    (invariant (le 1 radius))))
+"#;
+    match generate_err(ir) {
+        Error::UnsupportedFieldType(msg) => {
+            assert!(msg.contains("M.Shape"), "got: {}", msg);
+            assert!(msg.contains("2 constructors"), "got: {}", msg);
+        }
+        other => panic!("expected UnsupportedFieldType, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_field_named_new_on_an_invariant_type_is_rejected() {
+    // The accessors share an `impl` block with the generated `new`, so a field
+    // named `new` would emit two inherent methods of that name (E0592).
+    // `new` is not a Rust keyword, so nothing downstream escapes or renames it
+    // — without this rejection the output simply would not compile.
+    let ir = r#"
+(module M
+  (type "M.Collide"
+    (ctor "M.Collide.mk" (new Nat) (other Nat))
+    (invariant (le 1 new))))
+"#;
+    assert_eq!(
+        generate_err(ir),
+        Error::ReservedFieldName(String::from("M.Collide"), String::from("new"))
+    );
+}
+
+#[test]
+fn test_field_named_new_without_an_invariant_is_fine() {
+    // The name is only reserved where the constructor exists. A type with no
+    // invariant gets neither `new` nor accessors, so nothing collides.
+    let ir = r#"(module M (type "M.Plain" (ctor "M.Plain.mk" (new Nat))))"#;
+    assert!(generate(ir).contains("pub new: u64"));
+}
+
+#[test]
+fn test_keyword_field_name_is_raw_escaped_inside_the_checked_constructor() {
+    // `new`'s parameters, the struct's fields and the accessors all go through
+    // `rust_ident`, so the invariant's references to those fields must too --
+    // otherwise a field named `type` renders `pub fn new(r#type: u64)` whose
+    // body reads `if (1 <= type)`, which is a syntax error.
+    let ir = r#"
+(module M
+  (type "M.Kw"
+    (ctor "M.Kw.mk" (type Nat) (fn Nat))
+    (invariant (and (le 1 type) (le 1 fn)))))
+"#;
+    let out = generate(ir);
+    assert!(
+        out.contains("pub fn new(r#type: u64, r#fn: u64) -> Result<Self, crate::ComputeError>"),
+        "got: {}",
+        out
+    );
+    assert!(
+        out.contains("if ((1 <= r#type) && (1 <= r#fn))"),
+        "the invariant must escape the same names the parameters do; got: {}",
+        out
+    );
+    assert!(out.contains("Ok(Kw { r#type, r#fn })"), "got: {}", out);
+    assert!(out.contains("pub fn r#type(&self) -> u64 { self.r#type }"));
 }

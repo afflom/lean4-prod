@@ -129,7 +129,10 @@ pub enum Error {
     RecursiveType(String),
     /// A type takes type parameters; needs monomorphization (S5).
     PolymorphicType(String),
-    /// A field's type cannot appear in an allocation-free generated type.
+    /// A structure shape with no allocation-free rendering: a field type that
+    /// cannot appear in one, or — since a `Prop` field belongs to exactly one
+    /// constructor — an invariant on a type with more than one constructor,
+    /// which could not be given the checked constructor an invariant needs.
     UnsupportedFieldType(String),
     /// Two Lean types share a last name component, so they would collide.
     DuplicateTypeName(String),
@@ -147,6 +150,13 @@ pub enum Error {
     /// An operation that has no rendering for the numeric kind it was applied
     /// to — for example a shift on `Int`, or negation on an unsigned kind.
     UnsupportedKind(String),
+    /// An invariant-carrying type has a field whose name the generated
+    /// checked constructor has already taken. `new` and the field's accessor
+    /// would be two inherent methods of the same name in one `impl` (E0592),
+    /// so the output would not compile. Only invariant-carrying types are
+    /// affected: without an invariant there is no `new` and no accessors, and
+    /// a field named `new` is unremarkable.
+    ReservedFieldName(String, String),
 }
 
 impl fmt::Display for Error {
@@ -197,6 +207,11 @@ impl fmt::Display for Error {
                 "operation has no rendering for its numeric kind: {}",
                 s
             ),
+            Error::ReservedFieldName(ty, field) => write!(
+                f,
+                "type `{}` carries an invariant, so it gets a generated `new` constructor and one accessor per field; its field `{}` would collide with `new`",
+                ty, field
+            ),
         }
     }
 }
@@ -233,7 +248,7 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     ),
     (
         "UnsupportedFieldType",
-        "a field type not allowed in an allocation-free generated type (e.g. a list or vector field, which would need owned storage)",
+        "a structure shape that has no allocation-free rendering. Two causes: a field type that would need owned storage (a list or vector field); or a type that carries an invariant and has more than one constructor, which cannot get the checked constructor an invariant requires, since a `Prop` field belongs to exactly one constructor",
     ),
     (
         "DuplicateTypeName",
@@ -258,6 +273,10 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     (
         "UnsupportedKind",
         "an operation with no rendering for the numeric kind it was applied to. There are exactly four causes: a shift on Int; negation on any kind other than Int; pow on a sized kind (UInt8..UInt64), whose u32 exponent cannot be narrowed without silently changing the answer; and a conversion between a pair of numeric kinds that has no rendering, namely every sized-to-sized pair (e.g. UInt8 -> UInt32) and every Int-to-sized pair, both deliberate non-goals",
+    ),
+    (
+        "ReservedFieldName",
+        "a field of a structure whose invariant is enforced is named `new`, which the generated checked constructor already uses; the field's accessor would collide with it. Structures with no enforced invariant get neither, so the name is only reserved where the constructor exists",
     ),
 ];
 
@@ -329,7 +348,12 @@ fn type_table(types: &[TypeDecl]) -> Result<TypeTable<'_>, Error> {
 /// Every generated type is `Copy`, which is what keeps it inside the
 /// allocation-free tier: a type is eligible only if every field is a scalar, a
 /// tuple of eligible types, or another eligible generated type.
-fn generate_type_decl(decl: &TypeDecl, table: &TypeTable) -> Result<String, Error> {
+///
+/// A type carrying an invariant (the exporter lowered its `Prop` fields to a
+/// boolean expression over its own fields) additionally gets `pub(crate)`
+/// fields, a checked `new`, and one accessor per field — see the invariant
+/// block below for why the fields are crate-visible rather than private.
+fn generate_type_decl<'m>(decl: &'m TypeDecl, table: &TypeTable<'m>) -> Result<String, Error> {
     // The exporter reached this type but could not describe it. It is declared
     // anyway so that the rejection names a reason instead of an unknown type.
     if let Some(reason) = &decl.unsupported {
@@ -350,16 +374,108 @@ fn generate_type_decl(decl: &TypeDecl, table: &TypeTable) -> Result<String, Erro
 
     if decl.ctors.len() == 1 {
         let ctor = &decl.ctors[0];
+        // Generated code keeps constructing invariant-carrying types by struct
+        // literal — Lean already supplied the proof — so the fields stay
+        // reachable in-crate. Only callers outside the crate, where the proof
+        // was erased on export, are routed through the checked constructor.
+        let vis = if decl.invariant.is_some() {
+            "pub(crate)"
+        } else {
+            "pub"
+        };
         out.push_str(&format!("pub struct {} {{\n", rust_ident(short)));
         for (name, ty) in &ctor.fields {
             out.push_str(&format!(
-                "    pub {}: {},\n",
+                "    {} {}: {},\n",
+                vis,
                 rust_ident(name),
                 type_to_rust(ty)?
             ));
         }
         out.push_str("}\n");
+
+        if let Some(invariant) = &decl.invariant {
+            let rust_name = rust_ident(short);
+
+            // The accessors share an `impl` block with `new`, so a field named
+            // `new` would emit two inherent methods of that name (E0592).
+            // `new` is not a Rust keyword, so `rust_ident` leaves it alone and
+            // nothing downstream would catch it — the output would simply not
+            // compile. Reject here, naming the type and the field.
+            for (name, _) in &ctor.fields {
+                if rust_ident(name) == "new" {
+                    return Err(Error::ReservedFieldName(
+                        decl.name.clone(),
+                        String::from(name.as_str()),
+                    ));
+                }
+            }
+
+            // Render the invariant with the constructor's parameters in scope:
+            // the IR refers to fields by name, and `new`'s parameters carry
+            // those same names, so `Var("q")` resolves without any rebinding.
+            // `no_shapes` must be a named binding, not a temporary: `Renderer`
+            // holds `&'s Signatures<'m>`, so `&BTreeMap::new()` inline would be
+            // dropped at the end of the statement and fail to borrow-check.
+            let no_shapes: Signatures = BTreeMap::new();
+            let renderer = Renderer {
+                shapes: &no_shapes,
+                params: &[],
+                types: table,
+                ctx: JpContext::collect(invariant),
+            };
+            let predicate = renderer.value(invariant)?;
+
+            let mut params = Vec::with_capacity(ctor.fields.len());
+            let mut inits = Vec::with_capacity(ctor.fields.len());
+            for (name, ty) in &ctor.fields {
+                params.push(format!("{}: {}", rust_ident(name), type_to_rust(ty)?));
+                inits.push(rust_ident(name));
+            }
+
+            out.push_str(&format!("impl {} {{\n", rust_name));
+            out.push_str(&format!(
+                "    /// Re-checks the invariant Lean proved at construction.\n\
+                 \x20   ///\n\
+                 \x20   /// Generated code does not call this: inside the generated world the\n\
+                 \x20   /// proof holds, and re-checking would turn proved-total functions\n\
+                 \x20   /// fallible. It exists for callers at the crate boundary, where the\n\
+                 \x20   /// proof is not available because it was erased on export.\n\
+                 \x20   pub fn new({}) -> Result<Self, crate::ComputeError> {{\n\
+                 \x20       if {} {{\n\
+                 \x20           Ok({} {{ {} }})\n\
+                 \x20       }} else {{\n\
+                 \x20           Err(crate::ComputeError::InvariantViolated({:?}))\n\
+                 \x20       }}\n\
+                 \x20   }}\n",
+                params.join(", "),
+                predicate,
+                rust_name,
+                inits.join(", "),
+                decl.name
+            ));
+            for (name, ty) in &ctor.fields {
+                out.push_str(&format!(
+                    "    pub fn {}(&self) -> {} {{ self.{} }}\n",
+                    rust_ident(name),
+                    type_to_rust(ty)?,
+                    rust_ident(name)
+                ));
+            }
+            out.push_str("}\n");
+        }
         return Ok(out);
+    }
+
+    // Only a single-constructor structure can carry an invariant: a `Prop`
+    // field belongs to one constructor. Reject rather than render half of it.
+    if decl.invariant.is_some() {
+        return Err(Error::UnsupportedFieldType(format!(
+            "`{}` carries an invariant but has {} constructors; only a \
+             single-constructor structure can have one",
+            decl.name,
+            decl.ctors.len()
+        )));
     }
 
     out.push_str(&format!("pub enum {} {{\n", rust_ident(short)));
@@ -878,7 +994,16 @@ impl<'m> Renderer<'_, 'm> {
                         name
                     ))),
                 },
-                Mode::Value => Ok(name.clone()),
+                // Raw-escaped, because a `Var` can name a structure field: an
+                // invariant refers to the fields by name, and the `new` that
+                // renders it declares its parameters (and the struct declares
+                // its fields) through `rust_ident`. Emitting the use raw would
+                // give `pub fn new(r#type: u64) { if (1 <= type)`. The lookup
+                // key above stays raw — only the emitted text is escaped.
+                //
+                // `rust_ident` is the identity on every non-keyword name, so
+                // this changes no rendering that compiles today.
+                Mode::Value => Ok(rust_ident(name)),
             },
             Expr::Call(name, args) => {
                 let rendered = self.render_args(args)?;
@@ -1186,6 +1311,11 @@ impl<'m> Renderer<'_, 'm> {
             },
             Expr::Unreachable => Ok(String::from("unreachable!()")),
             Expr::Opaque(s) => Err(Error::OpaqueExpr(s.clone())),
+            // Boolean connectives. Fully parenthesised, so the rendering never
+            // depends on Rust's precedence agreeing with the IR's nesting.
+            Expr::And(a, b) => Ok(format!("({} && {})", self.value(a)?, self.value(b)?)),
+            Expr::Or(a, b) => Ok(format!("({} || {})", self.value(a)?, self.value(b)?)),
+            Expr::Not(a) => Ok(format!("(!{})", self.value(a)?)),
             // Handled by `render` before it delegates here.
             Expr::If(..)
             | Expr::Let(..)

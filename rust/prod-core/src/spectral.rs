@@ -26,14 +26,16 @@ impl SpectralOperator {
     }
 
     /// Saturating, not bare, subtraction. `Instance`'s Lean invariant
-    /// (`q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1`) is a `Prop` field, and `Prop` fields are
-    /// erased on export — the generated Rust struct is a plain data carrier
-    /// that does not enforce it, so `Instance { q: 0, T: 0, O: 0 }` is
-    /// constructible here even though the Lean type forbids it. With `T = 0`,
+    /// (`q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1`) is a `Prop` field, erased on export, and
+    /// re-checked by the generated `Instance::new` — but only at the crate
+    /// boundary. `Instance`'s fields are `pub(crate)`, so *in this crate*
+    /// `Instance { q: 0, T: 0, O: 0 }` is still constructible without going
+    /// through `new`, and the test below does exactly that. With `T = 0`,
     /// `inst.T - 1` underflows: a panic under debug and the
     /// `release-assertions` lane, a silent wrap in release. This crate denies
-    /// `clippy::panic`, so saturating at zero is the only honest option; the
-    /// caller that needs the invariant must re-check it.
+    /// `clippy::panic`, so saturating at zero is the only honest option.
+    /// External callers cannot reach this state at all, since `new` rejects
+    /// it; this is defence for the in-crate literal, not for them.
     pub const fn multiplicities(inst: &Instance) -> [u64; 4] {
         let t = inst.T.saturating_sub(1);
         let o = inst.O.saturating_sub(1);
@@ -49,8 +51,9 @@ impl SpectralOperator {
     /// At canonical instance: 14 - 10 = 4 = scope q
     ///
     /// Saturating for the same reason as [`Self::multiplicities`]: the Lean
-    /// `q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1` invariant is an erased `Prop` and the generated
-    /// struct does not enforce it, so `T = O = 0` reaches this arithmetic.
+    /// `q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1` invariant is an erased `Prop`, and the checked
+    /// `Instance::new` that re-checks it guards the crate boundary only — an
+    /// in-crate struct literal with `T = O = 0` still reaches this arithmetic.
     pub const fn signature_defect(inst: &Instance) -> i64 {
         let pos = inst.T.saturating_add(inst.O).saturating_sub(1) as i64;
         let neg = (inst.T.saturating_sub(1)).saturating_mul(inst.O.saturating_sub(1)) as i64;
@@ -81,9 +84,13 @@ mod tests {
 
     #[test]
     fn test_degenerate_instance_does_not_underflow() {
-        // The Lean invariant `q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1` is an erased `Prop`, so
-        // the generated struct permits this value. It must not panic here
-        // (debug / release-assertions) nor wrap silently (release).
+        // `Instance::new` would reject this — that is what
+        // `checked_constructor_accepts_valid_and_rejects_each_violation` in
+        // `tests/macro_generation.rs` asserts. This is a unit test *inside*
+        // the crate, where the fields are visible and a struct literal
+        // bypasses `new`, which is exactly the state the saturating
+        // arithmetic above exists for. It must not panic here (debug /
+        // release-assertions) nor wrap silently (release).
         let zero = Instance { q: 0, T: 0, O: 0 };
         assert_eq!(SpectralOperator::multiplicities(&zero), [1, 0, 0, 0]);
         assert_eq!(SpectralOperator::signature_defect(&zero), 0);

@@ -55,7 +55,9 @@ What that means in practice, and what you must not regress:
   drifted regeneration shows up as a reviewable diff instead of silently not
   existing: `lean/Conformance/golden.ir` (pinned by `just conformance`,
   rewritten and accepted with `just conformance-bless` — review the diff
-  first) and `specs/lean-for-production.md` (pinned by `just subset-check`,
+  first, then commit; the gate diffs against `HEAD`, not the index, so
+  staging alone will not make `just prod` pass) and
+  `specs/lean-for-production.md` (pinned by `just subset-check`,
   part of `just prod`; there is no bless step, just rerun `just subset` and
   review+commit the diff). Never hand-edit either.
 - Every golden in `goldens.ir` must be **consumed**. `goldenEntries`
@@ -239,10 +241,11 @@ What that means in practice, and what you must not regress:
     `opWhitelist` matches first. **Any new non-`Nat` operator whose
     typeclass wrapper is one of those thirteen names needs its own
     conformance case before its contract row can be believed.**
-  - One documented, deliberate gap: `Prop` fields (e.g. `Instance.valid : q
-    ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1`) are erased on export, so the generated Rust struct
-    does not enforce the invariant its Lean source states — see the "Erased
-    invariants" note in `specs/lean-for-production.md`.
+  - `Prop` fields (e.g. `Instance.valid : q ≥ 1 ∧ T ≥ 1 ∧ O ≥ 1`) are erased
+    on export, since they are proofs and have no runtime representation. As
+    of S2 Phase B1 the *proposition* is no longer erased with them when it
+    falls inside the lowerable fragment — see "S2 Phase B1" below and the
+    "Erased invariants" note in `specs/lean-for-production.md`.
 
 - S2 Phase A (`specs/designs/2026-08-09-s2-scalar-completeness-and-invariants.md`,
   plan `specs/plans/2026-08-09-s2-phase-a-arithmetic.md`) DONE: `Int` and
@@ -341,6 +344,59 @@ What that means in practice, and what you must not regress:
     one place in the generated contract a reader can confirm `Nat → Int`
     works at all.
 
+- S2 Phase B1 (`specs/designs/2026-08-09-s2-scalar-completeness-and-invariants.md`,
+  "Phase B") DONE: **invariant-carrying types**. A structure's `Prop` fields
+  are still erased, but the proposition they state is lowered to a boolean
+  expression over the structure's own fields and re-checked in Rust.
+  - **Two published shapes, and the difference is visible in the struct.**
+    Lowerable → `pub(crate)` fields, a checked `pub fn new(..) -> Result<Self,
+    ComputeError>` returning `ComputeError::InvariantViolated(<full Lean type
+    name>)`, and one accessor per field. Not lowerable → `pub` fields, no
+    `impl` block, invariant not enforced (the pre-B1 behaviour). Never a
+    partial check.
+  - **Generated code bypasses the check on purpose.** In-crate, generated code
+    still builds these types by struct literal, because Lean already supplied
+    the proof; calling `new` there would turn proved-total functions fallible
+    and put a `Result` on every construction. That is why the fields are
+    `pub(crate)` and not private — the enforcement boundary is the crate
+    boundary, which is exactly where the proof was erased. `prod-core`'s
+    `spectral.rs` unit tests deliberately exercise the in-crate bypass with
+    `Instance { q: 0, T: 0, O: 0 }`, which is why the saturating arithmetic
+    there is still load-bearing.
+  - **The lowerable fragment** (`lowerProp`, `lean/Prod/Lower.lean`):
+    conjunction, disjunction, negation, and the comparisons `=`/`≤`/`<`/`≥`/`>`
+    (`≥`/`>` lower to `le`/`lt` with operands swapped; `≠` is `Ne` and is NOT
+    handled — spell it `¬ (a = b)`).
+  - **The numeric-kind restriction is real and applied, not just documented.**
+    `propCmpKinds = [Nat, Int] ++ sizedKinds` — comparisons lower ONLY on
+    those kinds. `Bool` is deliberately absent, so `flagA = flagB` does not
+    lower and a structure whose only `Prop` field is that gets no constructor
+    at all. The corpus case pinning this is
+    `Conformance.NonNumericCompare` in `lean/Conformance/golden.ir`, which
+    must keep appearing there with NO `(invariant ...)`. This restriction was
+    at one point documented in the docstring but not enforced by the code —
+    `Eq` matched on any type as long as both operands were field references —
+    which is why the check now exists and the corpus case pins it.
+  - **An invariant on a multi-constructor type is rejected**
+    (`Error::UnsupportedFieldType`), since a `Prop` field belongs to exactly
+    one constructor. A field named `new` on an invariant-carrying type is
+    rejected too (`Error::ReservedFieldName`): its accessor would collide with
+    the generated constructor.
+  - **The inversion test is the point of the whole feature.** A comparison
+    lowered with reversed operands compiles, returns a `bool`, and rejects
+    exactly the inputs it should accept. `macro_generation.rs`'s
+    `checked_constructor_accepts_valid_and_rejects_each_violation` runs the
+    real `kernel.ir` `Instance::new`; `smoke.rs`'s
+    `mixed_compare_constructor_rejects_each_violated_conjunct` runs
+    `Conformance.MixedCompare`, whose invariant (`lo ≥ 2 ∧ hi ≤ 7 ∧ lo < hi`)
+    is the only one in the corpus whose conjuncts do not all point the same
+    direction. `Instance` alone cannot separate a blanket operand swap from a
+    correct per-operator lowering; verified by inverting `Expr::Le` for
+    literal-right operands only, which left every `prod-core` test green and
+    failed `MixedCompare`. Keep both, and keep their values INTERIOR: at a
+    boundary (`lo = 2`, `a = 1`) a non-strict comparison reads the same in
+    either direction and the test stops discriminating.
+
 Known remaining limitations: Closures (`Code.fun`) still
 lower to opaque. User-defined inductives now generate real Rust structs/enums,
 and `ctor`/`proj` on them resolve against the module's own `(type ...)`
@@ -352,8 +408,10 @@ PATTERNS: an alt naming an undeclared constructor still renders
 expression". Same defect class, same fix shape; not done. Monomorphization is still absent, so a
 parameterised inductive is rejected (`PolymorphicType`) rather than lowered.
 No data-parallel codegen. Invariant-carrying types (a structure's erased
-`Prop` fields re-checked at the crate boundary) and `Fin` with a literal bound
-are S2 Phase B, not yet implemented — see "Phase B" in the S2 design doc.
+`Prop` fields re-checked at the crate boundary) shipped as S2 Phase B1, above;
+`Fin` with a literal bound is Phase B2 and is not implemented — it is unblocked
+now and should be planned against the B1 machinery as it shipped, not as the
+design predicted it.
 
 ## M3 spec — the LCNF extractor (the defensible core)
 
@@ -393,6 +451,26 @@ Verified Lean 4.30.0 API facts (from leanprover/lean4 v4.30.0 sources — trust 
   `Conformance.MidProp.mk` has `numParams=0 numFields=4` for 4 declared fields.
   Getting this wrong swaps struct fields SILENTLY, so any change here must
   re-run that conformance case.
+- Structure `Prop` field propositions, as seen in the constructor telescope:
+  conjunction is `And` with `2` args; `a ≥ b` appears as `GE.ge α inst a b`
+  (still `GE.ge`, not unfolded to `LE.le`/`Nat.le`/`Nat.ble`; `inst` is an
+  `LE α` instance — e.g. `instLENat` — because `GE.ge`'s own signature takes
+  `[LE α]` directly, there is no separate synthesized `GE Nat` instance;
+  4 args total: type, instance, lhs, rhs); earlier fields are referenced as
+  `Expr.bvar` with index `(i - 1) - j`, where `i` is the 0-indexed position
+  of the `Prop` field itself in the telescope and `j` is the 0-indexed
+  position of the referenced field (both counted over ALL fields, not just
+  computational ones) — e.g. in `UorAtlas.Instance` (fields `q`=0,`T`=1,`O`=2,
+  `valid`=3), `valid`'s type is `And (GE.ge Nat instLENat #2 1) (And (GE.ge
+  Nat instLENat #1 1) (GE.ge Nat instLENat #0 1))`, i.e. `q`→`#2`, `T`→`#1`,
+  `O`→`#0`; in `Conformance.MidProp` (fields `first`=0,`ok`=1,`second`=2,
+  `third`=3), `ok`'s type is `GE.ge Nat instLENat #0 0`, i.e. `first`→`#0`;
+  numeric literals appear as `OfNat.ofNat Nat n (instOfNatNat n)`, never a
+  raw `Expr.lit`. Verified by dumping `UorAtlas.Instance.mk` and
+  `Conformance.MidProp.mk`. The invariant lowering (`lowerProp`) is written
+  against exactly this shape, so a toolchain bump that changes it will show
+  up as propositions no longer lowering — which degrades to "no checked
+  constructor", never to a wrong check.
 
 Lowerer requirements:
 - Emit sexp matching `rust/prod-ir` grammar EXACTLY — read

@@ -134,11 +134,19 @@ The first ABI supports scalar `Nat` (`uint64_t`), `Int` (`int64_t`), and
 `*_result_t` with a `status` code and `value`; status zero means success.
 
 ```sh
-mkdir -p output
-cargo run -p prod-cli -- header rust/prod-core/kernel.ir \
-  --output output/kernel.h \
-  --rust-output output/kernel_ffi.rs
+just c-headers
 ```
+
+That uses `rust/prod-core/goldens.ir` and writes
+`output/lean4-prod.h` plus `output/lean4-prod_ffi.rs`. For an exported module
+of your own:
+
+```sh
+just c-headers ir=path/to/kernel.ir stem=kernel
+```
+
+The command is a convenience wrapper around `prod header`; it always keeps
+the generated artifacts together under `./output`.
 
 Include the generated wrapper after the proc-macro expansion in the crate
 that owns the generated definitions:

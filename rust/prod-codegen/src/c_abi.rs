@@ -18,6 +18,27 @@ use prod_ir::{Definition, Module, Type};
 pub struct CBindings {
     pub header: String,
     pub rust: String,
+    pub(crate) functions: Vec<FunctionSpec>,
+}
+
+/// One scalar function in the generated C ABI. Other SDK printers consume
+/// this metadata so their names and status/result shapes cannot drift from
+/// the C header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FunctionSpec {
+    pub(crate) definition: String,
+    pub(crate) params: Vec<(String, Scalar)>,
+    pub(crate) ret: Scalar,
+    pub(crate) shape: Shape,
+    pub(crate) c_name: String,
+}
+
+pub(crate) fn rust_abi_type(scalar: Scalar) -> &'static str {
+    scalar.rust_abi_type()
+}
+
+pub(crate) fn is_bool(scalar: Scalar) -> bool {
+    scalar == Scalar::Bool
 }
 
 /// A C ABI request that cannot be represented safely by the scalar adapter.
@@ -47,7 +68,7 @@ impl fmt::Display for CAbiError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scalar {
+pub(crate) enum Scalar {
     Nat,
     Int,
     Bool,
@@ -213,6 +234,22 @@ pub fn generate_c_bindings(module: &Module) -> Result<CBindings, CAbiError> {
         });
     }
 
+    let functions: Vec<FunctionSpec> = entries
+        .iter()
+        .map(|(def, shape, params, ret, name)| FunctionSpec {
+            definition: def.name.clone(),
+            params: def
+                .params
+                .iter()
+                .zip(params.iter())
+                .map(|((name, _), scalar)| (name.clone(), *scalar))
+                .collect(),
+            ret: *ret,
+            shape: *shape,
+            c_name: name.clone(),
+        })
+        .collect();
+
     let guard = header_guard(&module.name);
     let mut header = format!(
         "/* Generated from Lean 4 module: {}. Do not edit. */\n#ifndef {}\n#define {}\n\n#include <stdint.h>\n\n",
@@ -310,5 +347,9 @@ pub fn generate_c_bindings(module: &Module) -> Result<CBindings, CAbiError> {
     header.push_str(&guard);
     header.push_str(" */\n");
 
-    Ok(CBindings { header, rust })
+    Ok(CBindings {
+        header,
+        rust,
+        functions,
+    })
 }

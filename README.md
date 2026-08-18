@@ -148,6 +148,29 @@ just c-headers ir=path/to/kernel.ir stem=kernel
 The command is a convenience wrapper around `prod header`; it always keeps
 the generated artifacts together under `./output`.
 
+For language SDKs over the same compiled native library, run:
+
+```sh
+just sdks
+```
+
+This writes a bundle under `output/lean4-prod/`:
+
+```text
+output/lean4-prod/
+├── c/           # header and Rust extern-C adapter
+├── rust/        # safe Rust wrapper crate source
+├── python/      # ctypes module
+├── typescript/  # loader-neutral TypeScript binding
+└── kotlin/      # JNA interface and helpers
+```
+
+Use another exported module with `just sdks ir=path/to/kernel.ir stem=kernel`.
+All SDKs target the same scalar C ABI (`Nat`/`Int`/`Bool`) and the same status
+codes, so the compiled Rust library remains the single implementation. The
+TypeScript binding accepts a native function loader (for example `koffi` or
+`ffi-napi`), Python uses `ctypes`, and Kotlin uses JNA.
+
 Include the generated wrapper after the proc-macro expansion in the crate
 that owns the generated definitions:
 

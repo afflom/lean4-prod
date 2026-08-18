@@ -88,6 +88,29 @@ fn test_c_header_omits_list_abi_without_guessing_ownership() {
 }
 
 #[test]
+fn test_generate_multi_language_sdk_bundle_from_one_abi() {
+    let ir = r#"
+(module Demo
+  (def add ((a Nat) (b Nat)) Nat (add a b))
+  (def less ((a Nat) (b Nat)) Bool (lt a b))
+)
+"#;
+    let (_, module) = parse_module(ir).unwrap();
+    let sdk = generate_sdks(&module, "demo").unwrap();
+
+    assert!(sdk.c_header.contains("prod_demo_add_result_t"));
+    assert!(sdk.c_wrapper.contains("extern \"C\" fn prod_demo_add"));
+    assert!(sdk.rust.contains("#[link(name = \"demo\")]"));
+    assert!(sdk.rust.contains("pub fn prod_demo_less"));
+    assert!(sdk.python.contains("import ctypes"));
+    assert!(sdk.python.contains("def prod_demo_add(lib, a, b):"));
+    assert!(sdk.typescript.contains("export function bind"));
+    assert!(sdk.typescript.contains("prod_demo_less"));
+    assert!(sdk.kotlin.contains("import com.sun.jna.Library"));
+    assert!(sdk.kotlin.contains("interface Lean4ProdNative"));
+}
+
+#[test]
 fn test_generate_class_index() {
     let ir = r#"
 (module UorAtlas.Kernel

@@ -104,6 +104,7 @@
 extern crate alloc;
 
 mod c_abi;
+mod sdk;
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -113,6 +114,7 @@ use core::fmt;
 use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, Type, TypeDecl};
 
 pub use c_abi::{generate_c_bindings, CAbiError, CBindings};
+pub use sdk::{generate_sdks, SdkBindings};
 
 /// Errors that can occur during code generation
 #[derive(Debug, Clone, PartialEq, Eq)]

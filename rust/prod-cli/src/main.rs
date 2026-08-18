@@ -9,6 +9,7 @@ mod roots;
 
 use clap::{Parser, Subcommand};
 use std::fs;
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "prod")]
@@ -43,6 +44,20 @@ enum Commands {
         /// Output path for the matching Rust wrapper source
         #[arg(long)]
         rust_output: String,
+    },
+    /// Generate C, Rust, Python, TypeScript, and Kotlin SDK artifacts.
+    Sdks {
+        /// Path to the exported IR file
+        path: String,
+        /// Root directory for generated SDK bundles
+        #[arg(short, long, default_value = "output")]
+        output: String,
+        /// Bundle name and generated artifact stem
+        #[arg(long, default_value = "lean4-prod")]
+        stem: String,
+        /// Native library name used by the Rust/Kotlin SDKs
+        #[arg(long, default_value = "lean4_prod")]
+        library_name: String,
     },
     /// Validate an IR file (check for unsupported constructs)
     Validate {
@@ -218,6 +233,45 @@ fn main() {
                 .unwrap_or_else(|e| panic!("Failed to write {}: {}", rust_output, e));
             println!("Generated: {}", output);
             println!("Generated: {}", rust_output);
+        }
+        Commands::Sdks {
+            path,
+            output,
+            stem,
+            library_name,
+        } => {
+            let content = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {}", path, e));
+            let (_, module) = prod_ir::parser::parse_module(&content)
+                .unwrap_or_else(|e| panic!("Parse error: {:?}", e));
+            let bindings = prod_codegen::generate_sdks(&module, &library_name)
+                .unwrap_or_else(|e| panic!("SDK generation error: {}", e));
+            let root = Path::new(&output).join(&stem);
+            let c_dir = root.join("c");
+            let rust_dir = root.join("rust");
+            let python_dir = root.join("python");
+            let typescript_dir = root.join("typescript");
+            let kotlin_dir = root.join("kotlin");
+            for directory in [&c_dir, &rust_dir, &python_dir, &typescript_dir, &kotlin_dir] {
+                fs::create_dir_all(directory)
+                    .unwrap_or_else(|e| panic!("Failed to create {}: {}", directory.display(), e));
+            }
+            fs::write(c_dir.join(format!("{}.h", stem)), bindings.c_header)
+                .unwrap_or_else(|e| panic!("Failed to write C header: {}", e));
+            fs::write(c_dir.join(format!("{}_ffi.rs", stem)), bindings.c_wrapper)
+                .unwrap_or_else(|e| panic!("Failed to write C Rust wrapper: {}", e));
+            fs::write(rust_dir.join("lib.rs"), bindings.rust)
+                .unwrap_or_else(|e| panic!("Failed to write Rust SDK: {}", e));
+            fs::write(
+                python_dir.join(format!("{}.py", stem.replace('-', "_"))),
+                bindings.python,
+            )
+            .unwrap_or_else(|e| panic!("Failed to write Python SDK: {}", e));
+            fs::write(typescript_dir.join("index.ts"), bindings.typescript)
+                .unwrap_or_else(|e| panic!("Failed to write TypeScript SDK: {}", e));
+            fs::write(kotlin_dir.join("Lean4Prod.kt"), bindings.kotlin)
+                .unwrap_or_else(|e| panic!("Failed to write Kotlin SDK: {}", e));
+            println!("Generated SDK bundle: {}", root.display());
         }
         Commands::Validate { path } => {
             let content = fs::read_to_string(&path)

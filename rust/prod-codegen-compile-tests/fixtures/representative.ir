@@ -31,18 +31,18 @@
 
   (def r_area ((s (named "Representative.Shape"))) Nat
     (cases s
-      (alt "Representative.Shape.circle" (rad) (mul rad rad))
-      (alt "Representative.Shape.rect" (ww hh) (mul ww hh))))
+      (alt "Representative.Shape.circle" (rad) (mul Nat rad rad))
+      (alt "Representative.Shape.rect" (ww hh) (mul Nat ww hh))))
 
   (def r_keyword_fields ((k (named "Representative.Keyword"))) Nat
-    (add (proj "Representative.Keyword" "type" k)
+    (add Nat (proj "Representative.Keyword" "type" k)
          (proj "Representative.Keyword" "fn" k)))
 
   ;; Single-caller join point: inlined at its jump site. The multi-caller and
   ;; cyclic forms are rejected (`UnsupportedJoinPoint`), so this is the only
   ;; join-point shape that should ever reach rustc.
   (def r_jp_inlined ((x Nat)) Nat
-    (let g (jp g (a) (add a 1)) (jmp g x)))
+    (let g (jp g (a) (add Nat a 1)) (jmp g x)))
 
   ;; Right-nested Prod.mk becomes a nested Rust tuple, not a generated struct.
   (def r_nested_tuple ((a Nat) (b Nat) (c Nat)) (Tuple Nat (Tuple Nat Nat))

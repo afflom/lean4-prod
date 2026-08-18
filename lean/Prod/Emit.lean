@@ -53,7 +53,7 @@ def conformanceRejectedIrModule : String := "ConformanceRejected"
 Machine-readable description of the Lean-side lowering surface, consumed by
 `prod subset` to render `specs/lean-for-production.md`. Hand-rolled JSON, no
 dependencies, matching how `rootsJson` is built. The operator and decider
-lists are derived from `natOpNames`/`deciderNames` (`Prod.Lower`) — the same
+lists are derived from `numOpNames`/`deciderNames` (`Prod.Lower`) — the same
 association lists `opWhitelist`/`deciderOp` consume to decide what actually
 lowers — so the published contract cannot describe more, or less, than the
 lowerer accepts. -/
@@ -63,7 +63,8 @@ lowerer accepts. -/
     subset` (`prod-cli`), which merges it with codegen's rejection list to
     render the published contract. -/
 def subsetJson : String :=
-  let ops := natOpNames.map fun p => toString p.1
+  let ops := numOpNames.map fun r => toString r.1
+  let conversions := conversionNames.map fun r => toString r.1
   let deciders := deciderNames.map fun p => toString p.1
   -- `Nat`/`Bool`/`Int`/`Prod`/`List`/`Option` are built into the IR type
   -- grammar (`lowerType`); anything else is a user inductive, and
@@ -71,13 +72,14 @@ def subsetJson : String :=
   -- single-block inductives with a single constructor (`Prop` fields
   -- erased) — the only shape the conformance suite exercises
   -- (`Conformance.MidProp`, `Conformance.NoProp`, `UorAtlas.Instance`).
-  let types := ["Nat", "Bool", "Int (renders as i64; no Int operators are whitelisted, so Int arithmetic is rejected as UnresolvedCall)",
+  let types := ["Nat", "Bool", "Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int; Nat -> Int is supported, via the constructors Int.ofNat (n renders as (n as i64)) and Int.negSucc (n renders as -(n as i64) - 1) -- these are constructor applications, not conversion calls, so they never appear in the Conversions list below)",
+                "UInt8, UInt16, UInt32, UInt64 (render as u8/u16/u32/u64; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) — none of this can fail; pow is not whitelisted for sized kinds)",
                 "Prod", "List", "Option",
                 "parameterless, non-recursive, single-constructor structures (Prop fields erased)"]
   let quoted (xs : List String) : String :=
     String.intercalate ", " (xs.map fun s => "\"" ++ jsonEscape s ++ "\"")
-  "{\n  \"operators\": [" ++ quoted ops ++ "],\n  \"deciders\": [" ++ quoted deciders ++
-    "],\n  \"types\": [" ++ quoted types ++ "]\n}\n"
+  "{\n  \"operators\": [" ++ quoted ops ++ "],\n  \"conversions\": [" ++ quoted conversions ++
+    "],\n  \"deciders\": [" ++ quoted deciders ++ "],\n  \"types\": [" ++ quoted types ++ "]\n}\n"
 
 /-- Rendered `(type ...)` declarations for every inductive reachable from the
     extracted definitions — from their signatures *and* from the constructor
@@ -90,9 +92,16 @@ def collectTypeDecls (ctx : LowerCtx) (extracted : Array ExtractedDef)
   for ed in extracted do
     if let some decl := ed.decl? then
       for n in declTypeNames env decl do
-        -- Builtins already have IR types; only user inductives need declaring.
+        -- Builtins already have IR types; only user inductives need
+        -- declaring. Sized integers are structures wrapping `BitVec` (per
+        -- `UInt8.ofBitVec`), so without this exclusion they would be
+        -- collected as ordinary user inductives and `lowerTypeDecl` would
+        -- try (and fail) to describe their `toBitVec : BitVec 8` field —
+        -- `sizedKinds` is the same list `lowerType` uses to map them to
+        -- `U8`…`U64` instead.
+        let isSized := sizedKinds.any fun p => p.1 == n
         if n != ``Nat && n != ``Bool && n != ``Int && n != ``Prod
-            && n != ``List && n != ``Option && !wanted.contains n then
+            && n != ``List && n != ``Option && !isSized && !wanted.contains n then
           if (env.find? n).isSome && !wanted.contains n then
             wanted := wanted.push n
   let sorted := wanted.qsort fun a b => Name.quickCmp a b == .lt
@@ -206,6 +215,41 @@ def goldenEntries : Array GoldenEntry := Id.run do
   out := out.push { name := "golden_smallEnough_20000_canonical", ret := "Bool", value := toString (UorAtlas.smallEnough 20000 c) }
   out := out.push { name := "golden_tryClassDecode_43_canonical", ret := "(Option (Tuple Nat (Tuple Nat Nat)))", value := optTripleSexp (UorAtlas.tryClassDecode 43 c) }
   out := out.push { name := "golden_tryClassDecode_100_canonical", ret := "(Option (Tuple Nat (Tuple Nat Nat)))", value := optTripleSexp (UorAtlas.tryClassDecode 100 c) }
+  -- Euclidean, not truncating: computed by calling the compiled `Int` `/`/`%`
+  -- instances (`Int.ediv`/`Int.emod`) themselves, so the golden comes from
+  -- Lean, not from anyone's expectation of what Euclidean division gives.
+  out := out.push { name := "golden_int_ediv_neg_12_7", ret := "Int",
+                    value := toString (Conformance.c_int_ediv (-12) 7) }
+  out := out.push { name := "golden_int_emod_neg_12_7", ret := "Int",
+                    value := toString (Conformance.c_int_emod (-12) 7) }
+  -- Sized integers wrap: both goldens are boundary cases computed by calling
+  -- the compiled `UInt8` `+`/`<<<` instances themselves. `c_u8_add 255 1`'s
+  -- Lean answer is `0` (wraps; a checked rendering would instead report an
+  -- overflow error, disagreeing with Lean's total answer). `c_u8_shl 1 8`'s
+  -- Lean answer is `1`: `UInt8.shiftLeft` masks the amount mod the width
+  -- (`8 % 8 = 0`, so `1 <<< 0 = 1`), which is what `wrapping_shl` renders; a
+  -- rendering that truncates to `0` past the width instead (`Nat.shiftRight`'s
+  -- `checked_shr(..).unwrap_or(0)` shape) would disagree with Lean's actual
+  -- answer of `1`.
+  out := out.push { name := "golden_u8_add_255_1", ret := "U8",
+                    value := toString (Conformance.c_u8_add 255 1) }
+  out := out.push { name := "golden_u8_shl_1_8", ret := "U8",
+                    value := toString (Conformance.c_u8_shl 1 8) }
+  -- `Int.pow` is the one contract row whose *kind* was in doubt: it is reached
+  -- through `instance : NatPow Int` → `instPowNat` → `instHPow`, and all three
+  -- of those wrapper names are matched by `natHDictOp` (`Prod.Lower`) and
+  -- hard-mapped to kind `"Nat"`. The conformance golden settles the lowering
+  -- (`(pow Int a b)`); this golden settles the *value*, with a negative base so
+  -- a `pow Nat` rendering — `((a) as u64).checked_pow(..)` — could not agree by
+  -- accident: `(-2)^3 = -8`, where the unsigned reading gives 2^192-ish and
+  -- overflows instead.
+  out := out.push { name := "golden_int_pow_neg_2_3", ret := "Int",
+                    value := toString (Conformance.c_int_pow (-2) 3) }
+  -- Int.toNat clamps negatives to 0 (`Init/Data/Int/Basic.lean`); computed by
+  -- calling the compiled `c_int_to_nat` itself, so a bare-cast rendering
+  -- (which would wrap -5 to 18446744073709551611) would visibly disagree
+  -- with Lean's own answer rather than only with a hand-typed expectation.
+  out := out.push { name := "golden_int_to_nat_neg_5", value := toString (Conformance.c_int_to_nat (-5)) }
   return out
 
 /-- Assemble the `goldens.ir` text: one zero-arg def per golden. -/

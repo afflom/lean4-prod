@@ -59,3 +59,15 @@ prod_macros::prod_defs! { ir = "../../lean/Conformance/golden.ir" }
 
 // Hand-written IR for constructs the Lean corpus cannot currently produce.
 prod_macros::prod_defs! { ir = "fixtures/representative.ir" }
+
+// Lean-computed golden values (`golden_*`, zero-arg), regenerated alongside
+// `kernel.ir`'s copy by `lake exe prod-export`. Expanded here too — distinct
+// from the `c_*` conformance defs above, names don't collide — so
+// `tests/smoke.rs` can assert the generated `c_*` functions reproduce what
+// Lean itself computed, not just a value someone typed by hand. Before this,
+// `goldens.ir` was only expanded in `prod-core`'s tests, a different crate
+// from the conformance `c_*` defs, so Lean's answer and Rust's answer were
+// never actually compared for the conformance suite — which is how a
+// backwards shift rendering shipped with a passing test suite: the golden
+// said `1`, the hardcoded assertion said `0`, and nothing read both.
+prod_macros::prod_defs! { ir = "../prod-core/goldens.ir" }

@@ -14,6 +14,11 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
     // From `lean/Conformance/` — the real Lean → LCNF → IR pipeline.
     assert_eq!(c_nat_add(2, 3)?, 5);
     assert_eq!(c_nat_sub(3, 10), 0); // Lean Nat subtraction truncates
+                                     // Lean `Nat.mod`'s own doc comment: "When the divisor is `0`, the result
+                                     // is the dividend rather than an error" (doctest `5 % 0 = 5`). This was a
+                                     // pre-existing bug (shipping since M3): the shared div/mod zero-guard
+                                     // rendered `0` for both, which is right for division but wrong here.
+    assert_eq!(c_nat_mod(5, 0), 5);
     assert_eq!(c_nat_shr(8, 2), 2);
     assert_eq!(c_nat_shr(8, 70), 0); // shift past the width is 0, not an error
                                      // Infallible by the fallibility fixpoint: a decidable guard performs no
@@ -44,6 +49,77 @@ fn conformance_golden_code_runs() -> Result<(), ComputeError> {
         c_list_build(10, 5, &mut too_small),
         Err(ComputeError::OutputTooSmall)
     );
+
+    // Int. Euclidean, not truncating. Rust's own `/` and `%` would give -1 and -5.
+    assert_eq!(c_int_ediv(-12, 7)?, -2);
+    assert_eq!(c_int_emod(-12, 7)?, 2);
+    assert_eq!(c_int_sub(i64::MIN, 1), Err(ComputeError::SubOverflow));
+    assert_eq!(c_int_neg(i64::MIN), Err(ComputeError::NegOverflow));
+    assert_eq!(c_int_ediv(i64::MIN, -1), Err(ComputeError::DivOverflow));
+    assert_eq!(c_int_ediv(5, 0)?, 0); // total, like Nat
+                                      // `Int`'s `emod_zero : a % 0 = a` (doctest `(7 : Int) % (0 : Int) = 7`):
+                                      // modulo by zero is the dividend, not zero, same as `Nat` above.
+    assert_eq!(c_int_emod(7, 0)?, 7);
+    // Cross-checked against Lean's own computed answer, not just a value
+    // someone typed by hand — see the `golden_*` comparisons below for why
+    // that distinction matters.
+    assert_eq!(c_int_ediv(-12, 7)?, golden_int_ediv_neg_12_7());
+    assert_eq!(c_int_emod(-12, 7)?, golden_int_emod_neg_12_7());
+    // `Int.pow` was the only published operator with no conformance witness.
+    // `Int.pow : Int → Nat → Int` reaches the lowerer through `instance :
+    // NatPow Int` → `instPowNat` → `instHPow`, every one of which `natHDictOp`
+    // hard-maps to kind `"Nat"` — so the risk was `(pow Nat a b)`, rendering
+    // `((a) as u64).checked_pow(..)`. The golden pins `(pow Int a b)`, and a
+    // negative base is what makes the assertion able to tell the two apart:
+    // under the unsigned reading -2 becomes 18446744073709551614 and the
+    // power overflows rather than giving -8.
+    assert_eq!(c_int_pow(-2, 3)?, -8);
+    assert_eq!(c_int_pow(-2, 3)?, golden_int_pow_neg_2_3());
+    assert_eq!(c_int_pow(2, 0)?, 1);
+    // Checked, like the rest of `Int`: the exponent is a `Nat`, so both the
+    // overflow and the "exponent does not fit u32" case are reported.
+    assert_eq!(c_int_pow(2, 63), Err(ComputeError::PowOverflow));
+    assert_eq!(
+        c_int_pow(2, u64::from(u32::MAX) + 1),
+        Err(ComputeError::PowExponentTooLarge)
+    );
+
+    // Sized integers. Lean's `UInt8.add` is BitVec addition, so overflow
+    // wraps rather than erroring — the opposite of `Nat`/`Int`.
+    // Wrapping is the semantics, not a failure — and no Result in sight.
+    assert_eq!(c_u8_add(255, 1), 0);
+    assert_eq!(c_u8_mul(16, 16), 0);
+    assert_eq!(c_u8_div(5, 0), 0); // total
+                                   // Sized shifts mask the amount mod the width (`UInt8.shiftLeft a b =
+                                   // a <<< (b % 8)`, `Init/Data/UInt/Basic.lean:126`) — they do NOT
+                                   // truncate to 0 past the width the way `Nat`'s shift does. So
+                                   // `1u8 <<< 8` masks to `1u8 <<< 0 == 1`, not 0.
+    assert_eq!(c_u8_shl(1, 8), 1);
+    // Guard: a decidable `<` comparison on sized integers lowers to a plain
+    // `if`, exercising the `UInt8` decider rows in `deciderNames` (added but
+    // previously unexercised by any conformance case).
+    assert_eq!(c_u8_guard_lt(1, 2), 1);
+    assert_eq!(c_u8_guard_lt(2, 1), 0);
+
+    // The comparison that actually catches a wrong sized rendering: Lean's
+    // own compiled `UInt8.add`/`UInt8.shiftLeft`, not a value typed by hand.
+    // This is what would have caught (and, once added, did catch) a
+    // backwards shift rendering — a hardcoded assertion above can be wrong
+    // in the same direction as the bug it's meant to catch; a golden
+    // computed by the real Lean toolchain cannot.
+    assert_eq!(c_u8_add(255, 1), golden_u8_add_255_1());
+    assert_eq!(c_u8_shl(1, 8), golden_u8_shl_1_8());
+
+    // Conversions. Int.toNat is the one with a wrong-by-default rendering:
+    // Lean clamps negatives to 0, while a bare `as u64` cast would wrap -5 to
+    // 18446744073709551611.
+    assert_eq!(c_int_to_nat(-5), 0); // clamps, does not wrap
+    assert_eq!(c_int_to_nat(5), 5);
+    assert_eq!(c_nat_to_u8(300), 44); // truncates: 300 - 256
+    assert_eq!(c_u8_to_nat(255), 255);
+    // Cross-checked against Lean's own computed answer, same reasoning as the
+    // Int/UInt8 goldens above.
+    assert_eq!(c_int_to_nat(-5), golden_int_to_nat_neg_5());
     Ok(())
 }
 

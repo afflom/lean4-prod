@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn generate_returns_rust() {
-        let source = generate("(module M (def inc ((x Nat)) Nat (add x 1)))").unwrap();
+        let source = generate("(module M (def inc ((x Nat)) Nat (add Nat x 1)))").unwrap();
         assert!(source.contains("pub fn inc(x: u64) -> Result<u64, crate::ComputeError>"));
         assert!(source.contains("checked_add(1).ok_or(crate::ComputeError::AddOverflow)?"));
         // Overflow is reported, never panicked: the wasm shell renders the

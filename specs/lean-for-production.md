@@ -10,7 +10,8 @@ named error rather than silently mis-compiled.
 
 - `Nat`
 - `Bool`
-- `Int (renders as i64; no Int operators are whitelisted, so Int arithmetic is rejected as UnresolvedCall)`
+- `Int (renders as i64; checked add/sub/mul/neg/pow, Euclidean checked div/mod (Int.ediv/Int.emod); shifts are not whitelisted for Int; Nat -> Int is supported, via the constructors Int.ofNat (n renders as (n as i64)) and Int.negSucc (n renders as -(n as i64) - 1) -- these are constructor applications, not conversion calls, so they never appear in the Conversions list below)`
+- `UInt8, UInt16, UInt32, UInt64 (render as u8/u16/u32/u64; wrapping add/sub/mul; total div/mod (zero divisor gives 0/the dividend, as for Nat); shiftLeft/shiftRight mask the shift amount mod the width rather than truncating to 0 (unlike Nat's shifts) — none of this can fail; pow is not whitelisted for sized kinds)`
 - `Prod`
 - `List`
 - `Option`
@@ -36,6 +37,53 @@ generated struct is a plain data carrier, not a refinement type.
 - `Nat.shiftLeft`
 - `Nat.shiftRight`
 - `Nat.pow`
+- `Int.add`
+- `Int.sub`
+- `Int.mul`
+- `Int.ediv`
+- `Int.emod`
+- `Int.neg`
+- `Int.pow`
+- `UInt8.add`
+- `UInt8.sub`
+- `UInt8.mul`
+- `UInt8.div`
+- `UInt8.mod`
+- `UInt8.shiftLeft`
+- `UInt8.shiftRight`
+- `UInt16.add`
+- `UInt16.sub`
+- `UInt16.mul`
+- `UInt16.div`
+- `UInt16.mod`
+- `UInt16.shiftLeft`
+- `UInt16.shiftRight`
+- `UInt32.add`
+- `UInt32.sub`
+- `UInt32.mul`
+- `UInt32.div`
+- `UInt32.mod`
+- `UInt32.shiftLeft`
+- `UInt32.shiftRight`
+- `UInt64.add`
+- `UInt64.sub`
+- `UInt64.mul`
+- `UInt64.div`
+- `UInt64.mod`
+- `UInt64.shiftLeft`
+- `UInt64.shiftRight`
+
+## Conversions
+
+- `Int.toNat`
+- `UInt8.toNat`
+- `UInt8.ofNat`
+- `UInt16.toNat`
+- `UInt16.ofNat`
+- `UInt32.toNat`
+- `UInt32.ofNat`
+- `UInt64.toNat`
+- `UInt64.ofNat`
 
 ## Decidable guards
 
@@ -43,6 +91,26 @@ generated struct is a plain data carrier, not a refinement type.
 - `Nat.decLe`
 - `Nat.decEq`
 - `instDecidableEqNat`
+- `Int.decLt`
+- `Int.decLe`
+- `Int.decEq`
+- `Int.instDecidableEq`
+- `UInt8.decLt`
+- `UInt8.decLe`
+- `UInt8.decEq`
+- `instDecidableEqUInt8`
+- `UInt16.decLt`
+- `UInt16.decLe`
+- `UInt16.decEq`
+- `instDecidableEqUInt16`
+- `UInt32.decLt`
+- `UInt32.decLe`
+- `UInt32.decEq`
+- `instDecidableEqUInt32`
+- `UInt64.decLt`
+- `UInt64.decLe`
+- `UInt64.decEq`
+- `instDecidableEqUInt64`
 
 ## Rejections
 
@@ -62,3 +130,4 @@ Everything else fails, precisely:
 | `UnresolvedCall` | the callee is neither @[prod]-tagged nor a whitelisted operator, so there is nothing to call |
 | `UnknownField` | a projection names a field the declared type does not have |
 | `UnsupportedJoinPoint` | a join point with several callers, or one that jumps to itself; only the single-caller form, which inlines at its jump site, has a lowering |
+| `UnsupportedKind` | an operation with no rendering for the numeric kind it was applied to. There are exactly four causes: a shift on Int; negation on any kind other than Int; pow on a sized kind (UInt8..UInt64), whose u32 exponent cannot be narrowed without silently changing the answer; and a conversion between a pair of numeric kinds that has no rendering, namely every sized-to-sized pair (e.g. UInt8 -> UInt32) and every Int-to-sized pair, both deliberate non-goals |

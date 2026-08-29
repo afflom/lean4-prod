@@ -77,4 +77,23 @@ def exportModule (moduleRoot : Name) (irModule : String) : CoreM ModuleExport :=
     coverage := ← buildCoverage moduleRoot own reports
   }
 
+/-- Export named roots and their transitive closure from an already imported environment. -/
+def exportNames (roots : Array Name) (irModule : String) : CoreM ModuleExport := do
+  let env ← getEnv
+  if roots.isEmpty then
+    throwError "exportNames: roots array cannot be empty"
+  let ctx : LowerCtx := { tagged := roots }
+  let mut extracted : Array ExtractedDef := #[]
+  for root in roots do
+    if let some decl := env.find? root then
+      extracted := extracted.push { name := root, decl? := some decl, skipReason := none }
+    else
+      throwError "exportNames: root {root} not found in environment"
+  let (ir, reports) ← emitKernelIr ctx irModule extracted
+  return {
+    ir
+    roots := rootsJson (roots.map fun n => { name := n, exported := true })
+    coverage := s!"# Coverage report for {irModule}\nExported {roots.size} roots.\n"
+  }
+
 end Prod

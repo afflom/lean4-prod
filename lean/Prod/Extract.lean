@@ -41,13 +41,31 @@ def ownConstants (env : Environment) (moduleRoot : Name) : Array (Name × Consta
 
 /-- The tagged names, in deterministic (sorted) order.
 
-    NOTE: `prodAttr.ext.getState env` is empty in 4.30 even though the
+    NOTE: `prodAttr.ext.getState env` is empty in 4.32 even though the
     attribute is applied (async env-extension entries are not folded into
     `getState` here); `TagAttribute.hasTag` is the reliable query, so we
     enumerate the module's own constants and filter by it. -/
 def taggedNames (env : Environment) (moduleRoot : Name) : List Name :=
   (ownConstants env moduleRoot).toList.filterMap fun (n, _) =>
     if prodAttr.hasTag env n then some n else none
+
+/-- Extract an exact sorted set of already validated code-generating names.
+    Unlike `extractTagged`, this path never consults the `@[prod]` attribute. -/
+def extractNames (names : Array Name) : CoreM (Array ExtractedDef) := do
+  let env ← getEnv
+  let mut out := #[]
+  for name in names do
+    let some ci := env.find? name
+      | throwError "extractNames: declaration {name} is missing"
+    if ci.value?.isNone then
+      throwError "extractNames: declaration {name} has no value"
+    if !(← shouldGenerateCode name) then
+      throwError "extractNames: declaration {name} does not generate code"
+    let decl ← CompilerM.run do
+      let d ← toDecl name
+      d.simp {}
+    out := out.push { name, decl? := some decl, skipReason := "" }
+  return out
 
 /-- Extract the pure-phase LCNF declaration for every `@[prod]`-tagged name.
 

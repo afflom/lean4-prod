@@ -193,7 +193,7 @@ private def spaced (xs : Array String) : String :=
 def natOpNames : List (Name × String) :=
   [ (`Nat.add, "add"), (`Nat.sub, "sub"), (`Nat.mul, "mul"), (`Nat.div, "div"),
     (`Nat.mod, "mod"), (`Nat.shiftLeft, "shl"), (`Nat.shiftRight, "shr"),
-    (`Nat.pow, "pow") ]
+    (`Nat.pow, "pow"), (`Nat.beq, "eq"), (`Nat.ble, "le"), (`Nat.blt, "lt") ]
 
 /-- `.const` operator whitelist: Lean kernel Nat ops → IR binary ops. -/
 def opWhitelist (n : Name) : Option String :=

@@ -1,0 +1,25 @@
+{
+  "name": "lean4-prod",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "vscode",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "leanprover.lean4"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        },
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  },
+  "remoteEnv": {
+    "PATH": "/usr/local/elan/bin:/home/vscode/.cargo/bin:${containerEnv:PATH}"
+  }
+}

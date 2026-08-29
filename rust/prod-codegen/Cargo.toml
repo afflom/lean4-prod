@@ -9,4 +9,4 @@ license = "MIT"
 workspace = true
 
 [dependencies]
-prod-ir = { path = "../prod-ir" }
+prod-ir = { version = "0.1.0", path = "../prod-ir" }

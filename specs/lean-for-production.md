@@ -36,6 +36,9 @@ generated struct is a plain data carrier, not a refinement type.
 - `Nat.shiftLeft`
 - `Nat.shiftRight`
 - `Nat.pow`
+- `Nat.beq`
+- `Nat.ble`
+- `Nat.blt`
 
 ## Decidable guards
 

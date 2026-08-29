@@ -2,8 +2,21 @@
 default:
     @just --list
 
+# Complete clean-checkout CI contract.
+ci: fixture-provenance prod fmt-check lint wasm-check wasm-sdk-fixture uor-fixture
+
+# Confirm every committed Prism Lean fixture is byte-bound to its LexLean
+# source and compiler-semantics identity.
+fixture-provenance:
+    scripts/check-generated-fixtures.sh
+
 # Full pipeline: export from Lean, then verify the Rust build against it.
-prod: lean-fixtures prod-export conformance test test-assertions no-alloc roots-check subset-check
+prod: lean-fixtures prod-export conformance named-export test test-assertions no-alloc roots-check subset-check
+
+# Named-root export over an exact LexLean-1.1-generated fixture, including
+# closure metadata, bad-root diagnostics, Rust generation, and two-run bytes.
+named-export:
+    scripts/check-named-export.sh
 
 # Compile the standalone Lean proof-fixture library. These declarations are
 # real kernel-checked proofs, but are not part of the production export target.
@@ -152,4 +165,4 @@ fmt:
 
 # Portable half must stay no_std/wasm32-clean.
 wasm-check:
-    cd rust && RUSTC_WRAPPER= RUSTC=$(rustup which --toolchain stable rustc) rustup run stable cargo build -p prod-ir -p prod-codegen -p prod-wasm --target wasm32-unknown-unknown
+    cd rust && RUSTC_WRAPPER= RUSTC=$(rustup which --toolchain 1.97.1 rustc) rustup run 1.97.1 cargo build -p prod-ir -p prod-codegen -p prod-wasm --target wasm32-unknown-unknown

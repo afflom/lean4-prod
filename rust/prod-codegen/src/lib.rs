@@ -292,6 +292,16 @@ fn rust_ident(name: &str) -> String {
     }
 }
 
+/// A Lean binder/local as a Rust local. Path keywords such as `self` cannot
+/// be written as raw identifiers, so all keywords receive a stable prefix.
+fn rust_local_ident(name: &str) -> String {
+    if RUST_KEYWORDS.contains(&name) {
+        format!("__prod_{name}")
+    } else {
+        String::from(name)
+    }
+}
+
 /// Last dot-separated component of a full Lean name.
 fn last_component(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
@@ -518,7 +528,11 @@ fn generate_def_in<'m>(
         if i > 0 {
             params.push_str(", ");
         }
-        params.push_str(&format!("{}: {}", name, param_type_to_rust(ty, table)?));
+        params.push_str(&format!(
+            "{}: {}",
+            rust_local_ident(name),
+            param_type_to_rust(ty, table)?
+        ));
     }
     check_named_type(&def.ret, table)?;
 
@@ -808,7 +822,7 @@ impl<'m> Renderer<'_, 'm> {
                 }
                 _ => Ok(format!(
                     "{{ let {} = {}; {} }}",
-                    name,
+                    rust_local_ident(name),
                     self.value(val)?,
                     self.render(body, mode)?
                 )),
@@ -847,7 +861,7 @@ impl<'m> Renderer<'_, 'm> {
                         name
                     ))),
                 },
-                Mode::Value => Ok(name.clone()),
+                Mode::Value => Ok(rust_local_ident(name)),
             },
             Expr::Call(name, args) => {
                 let rendered = self.render_args(args)?;
@@ -897,7 +911,7 @@ impl<'m> Renderer<'_, 'm> {
             Expr::Param(index) => self
                 .params
                 .get(*index)
-                .map(|(name, _)| name.clone())
+                .map(|(name, _)| rust_local_ident(name))
                 .ok_or(Error::ParamOutOfBounds(*index)),
             Expr::Add(a, b) => self.checked_binop(a, b, "checked_add", "AddOverflow"),
             Expr::Mul(a, b) => self.checked_binop(a, b, "checked_mul", "MulOverflow"),
@@ -1034,7 +1048,11 @@ impl<'m> Renderer<'_, 'm> {
                 Some((jp_params, body)) if self.ctx.is_inlineable(name) => {
                     let mut out = String::from("{ ");
                     for (p, a) in jp_params.iter().zip(args.iter()) {
-                        out.push_str(&format!("let {} = {}; ", p, self.value(a)?));
+                        out.push_str(&format!(
+                            "let {} = {}; ",
+                            rust_local_ident(p),
+                            self.value(a)?
+                        ));
                     }
                     out.push_str(&self.value(body)?);
                     out.push_str(" }");
@@ -1111,7 +1129,9 @@ impl<'m> Renderer<'_, 'm> {
                 ("Nat.zero", 0) => format!("        0 => {},\n", body),
                 ("Nat.succ", 1) => format!(
                     "        _ => {{ let {} = ({}).saturating_sub(1); {} }},\n",
-                    alt.binders[0], scrut, body
+                    rust_local_ident(&alt.binders[0]),
+                    scrut,
+                    body
                 ),
                 // Lists are slices: the empty and non-empty slice patterns are
                 // exhaustive, and the tail binds as a sub-slice at no cost.
@@ -1120,12 +1140,20 @@ impl<'m> Renderer<'_, 'm> {
                 ("List.nil", 0) => format!("        [] => {},\n", body),
                 ("List.cons", 2) => format!(
                     "        [{}, {} @ ..] => {{ let {} = *{}; {} }},\n",
-                    alt.binders[0], alt.binders[1], alt.binders[0], alt.binders[0], body
+                    rust_local_ident(&alt.binders[0]),
+                    rust_local_ident(&alt.binders[1]),
+                    rust_local_ident(&alt.binders[0]),
+                    rust_local_ident(&alt.binders[0]),
+                    body
                 ),
                 ("Bool.true", 0) => format!("        true => {},\n", body),
                 ("Bool.false", 0) => format!("        false => {},\n", body),
                 ("Option.none", 0) => format!("        None => {},\n", body),
-                ("Option.some", 1) => format!("        Some({}) => {},\n", alt.binders[0], body),
+                ("Option.some", 1) => format!(
+                    "        Some({}) => {},\n",
+                    rust_local_ident(&alt.binders[0]),
+                    body
+                ),
                 _ => match self.ctor_decl(&alt.ctor) {
                     Some((decl, cdecl)) if alt.binders.len() == cdecl.fields.len() => {
                         let path = if decl.ctors.len() == 1 {
@@ -1143,7 +1171,11 @@ impl<'m> Renderer<'_, 'm> {
                             let mut bound = Vec::with_capacity(alt.binders.len());
                             for ((field, _), binder) in cdecl.fields.iter().zip(alt.binders.iter())
                             {
-                                bound.push(format!("{}: {}", rust_ident(field), binder));
+                                bound.push(format!(
+                                    "{}: {}",
+                                    rust_ident(field),
+                                    rust_local_ident(binder)
+                                ));
                             }
                             format!("        {} {{ {} }} => {},\n", path, bound.join(", "), body)
                         }
@@ -1169,7 +1201,11 @@ impl<'m> Renderer<'_, 'm> {
                     None => format!(
                         "        {}({}) => {},\n",
                         alt.ctor,
-                        alt.binders.join(", "),
+                        alt.binders
+                            .iter()
+                            .map(|binder| rust_local_ident(binder))
+                            .collect::<Vec<_>>()
+                            .join(", "),
                         body
                     ),
                 },

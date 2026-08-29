@@ -16,6 +16,17 @@ lean_lib Example where
 lean_lib Conformance where
   roots := #[`Conformance]
 
+-- Exact LexLean-generated PrismPM fixture modules. The nested roots are
+-- compiled directly: no handwritten Lean driver, wrapper, or attribute
+-- adapter participates in named export.
+lean_lib PrismPMGeneratedFixture where
+  roots := #[
+    `PrismPM.Foundation.Arch,
+    `PrismPM.Foundation.Qual,
+    `PrismPM.Foundation.Sec,
+    `PrismPM.Foundation.Holo
+  ]
+
 -- Test-only Lean definitions and theorem proofs. This library is compiled by
 -- `just lean-fixtures` but is deliberately not imported by `Prod.Emit`, so
 -- proof fixtures cannot change production IR or committed goldens.

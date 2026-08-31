@@ -1,0 +1,5 @@
+{
+  "erased_proof_dependencies": [],
+  "included_definitions": ["SemanticFixture.Main.allConsecutive"],
+  "requested_roots": ["SemanticFixture.Main.allConsecutive"]
+}

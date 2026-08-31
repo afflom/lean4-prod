@@ -424,6 +424,9 @@ fun main() {
     .expect("write Kotlin SDK behavior test");
     run_command(
         Command::new("kotlinc")
+            // Kotlin 1.3 requires this compatibility flag for the public
+            // Result-returning adapter API; newer compilers accept it too.
+            .arg("-Xallow-result-return-type")
             .arg(&jna_stub)
             .arg(&sdk_source)
             .arg(&test_source)

@@ -9,8 +9,12 @@ integrations/uor-framework/.lake/
 rust/target
 rust/prod-core/kernel.ir
 roots.json
+!/fixtures/lexlean-1.1/expected/roots.json
 coverage.md
 goldens.txt
 .direnv/
+.nix-cargo/
+.nix-elan/
+.nix-rustup/
 rust/prod-core/goldens.ir
 /subset.json

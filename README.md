@@ -87,7 +87,7 @@ caller-controlled input, and no heap allocation.** Concretely:
   runtime tricks are exported as opaque signatures and counted in
   `coverage.md`.
 - We couple to Lean's internal LCNF API. The toolchain is pinned
-  (`leanprover/lean4:v4.30.0`) and CI-gated against API drift.
+  (`leanprover/lean4:v4.32.1`) and CI-gated against API drift.
 - Structural recursion on `Nat` works (LCNF `cases` on `Nat.zero`/`Nat.succ`
   → Rust match with predecessor binding); `Option α` and `Bool` map to Rust
   `Option`/`bool`. Decidable `if` guards are rewritten for `<`, `≤`, and `=`
@@ -130,7 +130,7 @@ non-blocking.
 ## Quick start
 
 ```sh
-nix develop              # lean4 + rust + just (or: install lean4 4.30.0 and rust manually)
+nix develop              # pinned Lean 4.32.1 + Rust 1.97.1 development shell
 just prod                # compiles proof fixtures, exports, then runs cargo tests
 ```
 
@@ -143,6 +143,24 @@ Lean side:
 ```sh
 cd lean && lake exe prod-export   # → rust/prod-core/{kernel,goldens}.ir, roots.json, coverage.md
 ```
+
+External generated packages use the named-root mode; no `@[prod]` attribute,
+wrapper module, or source adapter is required:
+
+```sh
+lake exe prod-export \
+  --module SemanticFixture.Main \
+  --root SemanticFixture.Main.allConsecutive \
+  --ir-module SemanticFixture \
+  --out ./export
+```
+
+Roots must be unique and ASCII-sorted. `Prod.exportNames` validates them,
+computes the deterministic compilable closure, erases proof-only
+dependencies, and rejects unsafe, partial, opaque/noncomputable,
+non-code-generating, unresolved, and unsupported runtime content before a
+successful export is returned. `just named-export` runs the exact
+LexLean-1.1-generated conformance fixture and pins its IR, reports, and Rust.
 
 Rust side:
 
@@ -252,7 +270,7 @@ claim that its entire generated data model is supported. UOR also contains
 polymorphic structures and arrays; those require explicit foreign-language
 ownership and layout contracts before they can be exported safely. The
 fixture therefore keeps that boundary visible instead of inventing an ABI.
-Its own `lean-toolchain` selects Lean 4.30 so the external declarations pass
+Its own `lean-toolchain` selects Lean 4.32.1 so the external declarations pass
 through the same compiler frontend as this generator; only the imported
 production modules are built, avoiding unrelated upstream test assertions
 pinned to UOR's older toolchain.

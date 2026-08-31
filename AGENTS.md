@@ -235,7 +235,7 @@ example-agnostic; `Prod.Emit` imports Example). Tag the five kernel defs
 (`UorAtlas.stride/class_count/belt/classIndex/classDecode`) with `@[prod]`, replacing
 their `-- M3:` comments.
 
-Verified Lean 4.30.0 API facts (from leanprover/lean4 v4.30.0 sources — trust these):
+Verified Lean 4.32.1 API facts (from leanprover/lean4 v4.32.1 sources — trust these):
 
 - `Lean.Compiler.LCNF.toDecl : Name → CompilerM (Decl .pure)` — runs toLCNF:
   matches/recursors already `cases`, dictionaries explicit, instance wrappers unfolded.
@@ -254,7 +254,7 @@ Verified Lean 4.30.0 API facts (from leanprover/lean4 v4.30.0 sources — trust 
 - Structure projection indices: LCNF `.proj typeName idx fvar` indexes into the
   declared field list — verified with `Conformance.MidProp`, whose
   `Prop` field sits in the middle (`Conformance/Structures.lean`). Field names
-  come from `getStructureFields env structName` (resolves directly under 4.30,
+  come from `getStructureFields env structName` (resolves directly under 4.32,
   returns declared field names in declaration order including `Prop` fields;
   `Lean.getStructureInfo?` corroborates via `.fieldNames`); `Prop` fields are
   retained as an index slot (their projection is simply never emitted/used by

@@ -388,6 +388,15 @@ fn test_projection_of_keyword_field_is_raw_escaped() {
 }
 
 #[test]
+fn test_keyword_parameter_is_raw_escaped() {
+    let ir = r#"(module M (def identity ((self Nat)) Nat (param 0)))"#;
+    assert_eq!(
+        generate(ir),
+        "pub fn identity(__prod_self: u64) -> u64 {\n    __prod_self\n}\n\n"
+    );
+}
+
+#[test]
 fn test_generate_kernel_ir_shapes() {
     // The exact def shapes prod-export emits for stride and classDecode
     // (see rust/prod-core/kernel.ir).

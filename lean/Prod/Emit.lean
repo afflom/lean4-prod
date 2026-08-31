@@ -163,6 +163,57 @@ private def parseOutDir : List String → Option System.FilePath
   | _ :: rest => parseOutDir rest
   | [] => none
 
+private structure NamedArgs where
+  modules : Array String := #[]
+  roots : Array String := #[]
+  irModule : Option String := none
+  out : Option System.FilePath := none
+
+private def parseNamedArgs (args : List String) : Except String (Option NamedArgs) := do
+  let named := args.contains "--module" || args.contains "--root" || args.contains "--ir-module"
+  if !named then return none
+  let rec loop (rest : List String) (parsed : NamedArgs) : Except String NamedArgs := do
+    match rest with
+    | [] => return parsed
+    | "--module" :: value :: tail => loop tail { parsed with modules := parsed.modules.push value }
+    | "--root" :: value :: tail => loop tail { parsed with roots := parsed.roots.push value }
+    | "--ir-module" :: value :: tail =>
+      if parsed.irModule.isSome then throw "duplicate --ir-module"
+      loop tail { parsed with irModule := some value }
+    | "--out" :: value :: tail =>
+      if parsed.out.isSome then throw "duplicate --out"
+      loop tail { parsed with out := some value }
+    | flag :: _ => throw s!"unknown or incomplete named-export argument `{flag}`"
+  let parsed ← loop args {}
+  if parsed.modules.isEmpty then throw "named export requires at least one --module"
+  if parsed.roots.isEmpty then throw "named export requires at least one --root"
+  if parsed.irModule.isNone then throw "named export requires --ir-module"
+  if parsed.out.isNone then throw "named export requires --out"
+  return some parsed
+
+private def nameOfString (value : String) : Except String Name := do
+  let segments := value.splitOn "."
+  if segments.isEmpty || segments.any String.isEmpty then
+    throw s!"invalid Lean name `{value}`"
+  if segments.any fun segment =>
+      !(segment.front.isAlpha || segment.front == '_') ||
+      !segment.toList.all (fun character => character.isAlphanum || character == '_') then
+    throw s!"invalid Lean name `{value}`"
+  return segments.foldl Name.str .anonymous
+
+private def namedNames (values : Array String) : Except String (Array Name) := do
+  let mut out := #[]
+  for value in values do
+    out := out.push (← nameOfString value)
+  return out
+
+private def runNamedExportSafe (roots : Array Name) (irModule : String) :
+    CoreM (Except String Prod.ModuleExport) := do
+  try
+    pure (.ok (← Prod.exportNames roots irModule))
+  catch error =>
+    pure (.error (← error.toMessageData.toString))
+
 /-- `unsafe` because `Lean.enableInitializersExecution` is an unsafe
     primitive: running imported modules' initializers is required for
     `importModules (loadExts := true)`, which loads env-extension data
@@ -172,9 +223,40 @@ private def parseOutDir : List String → Option System.FilePath
 unsafe def main (args : List String) : IO Unit := do
   Lean.initSearchPath (← Lean.findSysroot)
   Lean.enableInitializersExecution
-  let env ← Lean.importModules #[{ module := Prod.targetModule }, { module := Prod.conformanceModule }]
-    {} (leakEnv := true) (loadExts := true)
+  let named ← match parseNamedArgs args with
+    | .ok parsed => pure parsed
+    | .error message => throw (IO.userError s!"prod-export: {message}")
+  let imports ← match named with
+    | none => pure #[{ module := Prod.targetModule }, { module := Prod.conformanceModule }]
+    | some parsed =>
+      let names ← match namedNames parsed.modules with
+        | .ok names => pure names
+        | .error message => throw (IO.userError s!"prod-export: {message}")
+      pure (names.map fun module => { module := module })
+  let env ← Lean.importModules imports {} (leakEnv := true) (loadExts := true)
   let coreCtx : Core.Context := { fileName := "prod-export", fileMap := default }
+  if let some parsed := named then
+    let roots ← match namedNames parsed.roots with
+      | .ok roots => pure roots
+      | .error message => throw (IO.userError s!"prod-export: {message}")
+    let irModule := parsed.irModule.get!
+    let eio := (ReaderT.run (runNamedExportSafe roots irModule) coreCtx).run { env := env }
+    let result ← EIO.toIO' eio
+    let exported ← match result with
+      | Except.ok (Except.ok exported, _st) => pure exported
+      | Except.ok (Except.error message, _st) =>
+        throw (IO.userError s!"prod-export failed: {message}")
+      | Except.error _ => throw (IO.userError "prod-export failed: uncaught exception")
+    let out := parsed.out.get!
+    IO.FS.createDirAll out
+    let irPath := out / "kernel.ir"
+    let rootsPath := out / "roots.json"
+    let coveragePath := out / "coverage.json"
+    IO.FS.writeFile irPath exported.ir
+    IO.FS.writeFile rootsPath exported.roots
+    IO.FS.writeFile coveragePath exported.coverage
+    IO.println s!"prod-export: wrote {irPath}, {rootsPath}, {coveragePath}"
+    return
   let eio := (ReaderT.run Prod.runExportSafe coreCtx).run { env := env }
   let result ← EIO.toIO' eio
   let (ir, roots, coverage, confIr) ← match result with

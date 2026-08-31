@@ -1,0 +1,8 @@
+{
+  "erased_proof_dependencies": [],
+  "external_calls": [],
+  "included_definitions": ["SemanticFixture.Main.allConsecutive"],
+  "opaque_nodes": [],
+  "requested_roots": ["SemanticFixture.Main.allConsecutive"],
+  "unsupported_types": []
+}

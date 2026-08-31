@@ -12,9 +12,14 @@ contains the example-independent part so another Lean package can import
 coverage artifacts without copying the extractor.
 -/
 
-open Lean
+open Lean Compiler LCNF
 
 namespace Prod
+
+/-- Public named-export ordering is ASCII order of fully qualified spelling,
+    independent of Lean's internal name hash/representation. -/
+def namedOrder (left right : Name) : Ordering :=
+  compare (toString left) (toString right)
 
 /-- The three artifacts produced for one imported Lean module tree. -/
 structure ModuleExport where
@@ -75,6 +80,153 @@ def exportModule (moduleRoot : Name) (irModule : String) : CoreM ModuleExport :=
     ir
     roots := rootsJson (← computeRoots own)
     coverage := ← buildCoverage moduleRoot own reports
+  }
+
+/-- Root/callee validation shared by closure discovery. -/
+def validateCodeDefinition (role : String) (name : Name) : CoreM Unit := do
+  let env ← getEnv
+  let some info := env.find? name
+    | throwError "exportNames: {role} {name} is missing"
+  if info.isTheorem then
+    throwError "exportNames: {role} {name} is theorem-only"
+  if info.isPartial then
+    throwError "exportNames: {role} {name} is partial"
+  match info with
+  | .defnInfo value =>
+    match value.safety with
+    | .unsafe => throwError "exportNames: {role} {name} is unsafe"
+    | .partial => throwError "exportNames: {role} {name} is partial"
+    | .safe => pure ()
+  | .opaqueInfo value =>
+    -- Some ordinary `partial def` declarations are represented by an opaque
+    -- default-value wrapper at this imported-environment boundary in Lean
+    -- 4.32. When an unsafe recursion helper remains visible, classify it
+    -- precisely; otherwise report the closed opaque/partial/noncomputable
+    -- rejection class without pretending the imported environment retained
+    -- source modifiers that it discarded.
+    let partialWrapper := value.value.getUsedConstants.any fun dependency =>
+      dependency.isInternal && (toString dependency).endsWith "_unsafe_rec"
+    if value.isUnsafe || partialWrapper then
+      throwError "exportNames: {role} {name} is partial"
+    else
+      throwError "exportNames: {role} {name} is opaque, partial, or noncomputable"
+  | _ =>
+    throwError "exportNames: {role} {name} is not a definition"
+  if !(← shouldGenerateCode name) then
+    throwError "exportNames: {role} {name} does not generate code"
+
+/-- Validate exact requested-root ordering and root classification. -/
+def validateNamedRoots (roots : Array Name) : CoreM Unit := do
+  if roots.isEmpty then
+    throwError "exportNames: roots array cannot be empty"
+  for index in [:roots.size] do
+    if index + 1 < roots.size then
+      let left := roots[index]!
+      let right := roots[index + 1]!
+      match namedOrder left right with
+      | .eq => throwError "exportNames: duplicate root {left}"
+      | .gt => throwError "exportNames: roots are not strictly sorted: {left} precedes {right}"
+      | .lt => pure ()
+    else pure ()
+  for root in roots do
+    validateCodeDefinition "root" root
+
+/-- Deterministic transitive closure over code-generating callees in the
+    generated package namespace. Theorem/proof dependencies are recorded as
+    erased metadata and never emitted as runtime definitions. -/
+def namedClosure (roots : Array Name) : CoreM (Array Name × Array Name) := do
+  let env ← getEnv
+  let rootNamespaces := roots.map Name.getRoot
+  let mut included := roots
+  let mut erased : Array Name := #[]
+  let mut cursor := 0
+  while cursor < included.size do
+    let name := included[cursor]!
+    cursor := cursor + 1
+    let some info := env.find? name
+      | throwError "exportNames: included definition {name} disappeared"
+    let dependencies := (info.value? (allowOpaque := true)).map
+      (fun value => value.getUsedConstants.qsort (namedOrder · · == .lt)) |>.getD #[]
+    for dependency in dependencies do
+      if included.contains dependency || erased.contains dependency then
+        continue
+      -- Compiler-generated equation/matcher helpers are internal details of
+      -- the owning declaration. The LCNF simplifier internalizes them while
+      -- extracting that owner; exporting them as public closure roots would
+      -- expose `lcAny` implementation signatures rather than source-level
+      -- definitions.
+      if dependency.isInternal then
+        continue
+      let some dependencyInfo := env.find? dependency | continue
+      if dependencyInfo.isTheorem then
+        erased := erased.push dependency
+        continue
+      if !rootNamespaces.contains dependency.getRoot then
+        continue
+      match dependencyInfo with
+      | .defnInfo value =>
+        match value.safety with
+        | .unsafe => throwError "exportNames: callee {dependency} is unsafe"
+        | .partial => throwError "exportNames: callee {dependency} is partial"
+        | .safe =>
+          -- Lean creates matcher/equation helpers that occur in the kernel
+          -- value but are deliberately not standalone code-generation
+          -- units. `toLCNF` eliminates those while compiling their owner, so
+          -- only independently compilable callees belong in the closure.
+          if (← shouldGenerateCode dependency) then
+            included := included.push dependency
+      | .opaqueInfo _ =>
+        throwError "exportNames: opaque or noncomputable callee {dependency}"
+      | _ =>
+        if (← shouldGenerateCode dependency) then
+          throwError "exportNames: unsupported callee {dependency}"
+  let sortedIncluded := included.qsort (namedOrder · · == .lt)
+  let sortedErased := erased.qsort (namedOrder · · == .lt)
+  return (sortedIncluded, sortedErased)
+
+private def nameArrayJson (names : Array Name) : String :=
+  String.intercalate "," (names.toList.map fun name => s!"\"{jsonEscape (toString name)}\"")
+
+/-- Canonical named-root and closure metadata. -/
+def namedRootsJson (requested included erased : Array Name) : String :=
+  "{\n  \"erased_proof_dependencies\": [" ++ nameArrayJson erased ++
+  "],\n  \"included_definitions\": [" ++ nameArrayJson included ++
+  "],\n  \"requested_roots\": [" ++ nameArrayJson requested ++ "]\n}\n"
+
+/-- Canonical machine-readable coverage for a successful named export. -/
+def namedCoverageJson (requested included erased : Array Name)
+    (reports : Array DefReport) : String :=
+  let opaqueNodes := reports.toList.flatMap fun report => report.opaques.toList
+  let external := reports.toList.flatMap fun report => report.externs.toList
+  "{\n  \"erased_proof_dependencies\": [" ++ nameArrayJson erased ++
+  "],\n  \"external_calls\": [" ++
+    String.intercalate "," (external.map fun row => s!"\"{jsonEscape row}\"") ++
+  "],\n  \"included_definitions\": [" ++ nameArrayJson included ++
+  "],\n  \"opaque_nodes\": [" ++
+    String.intercalate "," (opaqueNodes.map fun row => s!"\"{jsonEscape row}\"") ++
+  "],\n  \"requested_roots\": [" ++ nameArrayJson requested ++
+  "],\n  \"unsupported_types\": []\n}\n"
+
+/-- Export exact named roots and their deterministic transitive compilation
+    closure from an already imported environment. No `@[prod]` attribute is
+    consulted. -/
+def exportNames (roots : Array Name) (irModule : String) : CoreM ModuleExport := do
+  validateNamedRoots roots
+  let (included, erased) ← namedClosure roots
+  let extracted ← extractNames included
+  let ctx : LowerCtx := { tagged := included }
+  let (ir, reports) ← emitKernelIr ctx irModule extracted
+  for report in reports do
+    if !report.opaques.isEmpty then
+      throwError "exportNames: opaque lowering in {report.name}: {report.opaques}"
+    if !report.externs.isEmpty then
+      throwError "exportNames: unresolved external call in {report.name}: {report.externs}"
+    if !report.lowered then
+      throwError "exportNames: {report.name} did not lower: {report.skipReason}"
+  return {
+    ir
+    roots := namedRootsJson roots included erased
+    coverage := namedCoverageJson roots included erased reports
   }
 
 end Prod

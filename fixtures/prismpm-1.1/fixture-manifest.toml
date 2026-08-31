@@ -1,0 +1,30 @@
+spec = "lean4-prod/generated-lean-fixture/1"
+generator = "lexlean"
+generator_version = "0.1.1"
+language = "1.1"
+compiler_semantics_id = "6b613e860795cea66671c05f25703733da99c4679dbc73d74a1b52680066452c"
+lean_toolchain = "leanprover/lean4:v4.32.1"
+
+[[pair]]
+source_path = "fixtures/prismpm-1.1/source/Foundation/Arch.lex.tex"
+source_sha256 = "0136c31ea4d780d5cd24324302a7c08b7c721b5c78f5914aadff7dc40c94f4bc"
+generated_path = "lean/PrismPM/Foundation/Arch.lean"
+generated_sha256 = "ca1b7dacc4063fdc6c34b3b963080a8d4df7c7864b014a54d1433ac590c35a4f"
+
+[[pair]]
+source_path = "fixtures/prismpm-1.1/source/Foundation/Holo.lex.tex"
+source_sha256 = "d37e09e6e6b0ad71b253ed699f6ee6bd9f06c6bd9397e2119bba46525c0313df"
+generated_path = "lean/PrismPM/Foundation/Holo.lean"
+generated_sha256 = "444795b6dc4223f41e01a49924ee29fe1b795a168bc2b9114d10c3f4597c2a33"
+
+[[pair]]
+source_path = "fixtures/prismpm-1.1/source/Foundation/Qual.lex.tex"
+source_sha256 = "7222860192b83e2afd074c130f7e6f59ee4d4c5669a5ac4bc8466300908e24c3"
+generated_path = "lean/PrismPM/Foundation/Qual.lean"
+generated_sha256 = "564115967117a3ed0bec4cb6ac2e4853e028f27dc5479bde3b46f43149b0d721"
+
+[[pair]]
+source_path = "fixtures/prismpm-1.1/source/Foundation/Sec.lex.tex"
+source_sha256 = "5ccc7b59871c45343db28f6c44d612a2d694667bf560e2d508616d0a8c7ceb73"
+generated_path = "lean/PrismPM/Foundation/Sec.lean"
+generated_sha256 = "9f0137c834ea0c68de871167b36682e6132b46c44acdcd6e3c8692eb5d8ec1c8"

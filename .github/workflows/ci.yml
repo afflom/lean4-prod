@@ -8,19 +8,8 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@v16
-      - name: Export Lean definitions and run Rust goldens
-        run: nix develop --command just prod
-      - name: Check proof-root graph
-        run: nix develop --command just roots-check
-      - name: Check formatting
-        run: nix develop --command just fmt-check
-      - name: Run clippy
-        run: nix develop --command just lint
-      - name: Check wasm32 portability
-        run: nix develop --command just wasm-check
-      - name: Build generated WebAssembly SDK fixture
-        run: nix develop --command just wasm-sdk-fixture
-      - name: Export and execute pinned UOR Framework fixture
-        run: nix develop --command just uor-fixture
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Run the complete pinned devcontainer gate
+        uses: devcontainers/ci@8bf61b26e9c3a98f69cb6ce2f88d24ff59b785c6 # v0.3.1900000417
+        with:
+          runCmd: just ci

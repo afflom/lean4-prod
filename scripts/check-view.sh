@@ -37,7 +37,12 @@ grep -F 'fixture-core = "=0.1.0"' "$first/browser-adapter/Cargo.toml" >/dev/null
 
 adapter="$first/browser-adapter"
 patch="patch.crates-io.fixture-core.path='$core'"
-cargo generate-lockfile --manifest-path "$adapter/Cargo.toml" --offline --config "$patch"
+# A clean devcontainer has not resolved the generated adapter's registry
+# dependencies yet. Resolve and fetch the exact lock once, then require every
+# compilation step below to succeed offline from that locked dependency set.
+cargo generate-lockfile --manifest-path "$adapter/Cargo.toml" --config "$patch"
+cargo fetch --manifest-path "$adapter/Cargo.toml" --target wasm32-unknown-unknown \
+  --locked --config "$patch"
 cargo check --manifest-path "$adapter/Cargo.toml" --target wasm32-unknown-unknown \
   --locked --offline --config "$patch"
 cargo build --manifest-path "$adapter/Cargo.toml" --target wasm32-unknown-unknown \

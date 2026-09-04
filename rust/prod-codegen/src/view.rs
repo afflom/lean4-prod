@@ -302,7 +302,7 @@ fn css() -> String {
 
 fn shared_javascript(view: &EvaluatedViewV1) -> String {
     format!(
-        "const form=document.getElementById('application-form');const left=document.getElementById('left');const right=document.getElementById('right');const operation=document.getElementById('operation');const result=document.getElementById('result');const INPUT_ERROR={};const DIVISION_ERROR={};const OVERFLOW_ERROR={};const MIN=-9223372036854775808n;const MAX=9223372036854775807n;function operand(value){{const text=value.replace(/^[\\t\\n\\v\\f\\r ]+|[\\t\\n\\v\\f\\r ]+$/g,'');if(!/^[+-]?[0-9]+$/.test(text))return null;const parsed=BigInt(text);return parsed<MIN||parsed>MAX?null:parsed.toString();}}function show(value){{result.textContent=value;}}",
+        "const form=document.getElementById('application-form');const left=document.getElementById('left');const right=document.getElementById('right');const operation=document.getElementById('operation');const result=document.getElementById('result');const INPUT_ERROR={};const DIVISION_ERROR={};const OVERFLOW_ERROR={};const MIN=-9223372036854775808n;const MAX=9223372036854775807n;function operand(value){{if(!/^(?:0|-[1-9][0-9]*|[1-9][0-9]*)$/.test(value))return null;const parsed=BigInt(value);return parsed<MIN||parsed>MAX?null:value;}}function show(value){{result.textContent=value;}}",
         json(&view.input_error),
         json(&view.division_by_zero_error),
         json(&view.overflow_error),

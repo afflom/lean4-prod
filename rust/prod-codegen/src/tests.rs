@@ -222,6 +222,9 @@ fn test_view_v1_projects_both_transports_without_raw_content() {
     .unwrap();
     assert!(browser.contains("calculate(Number(operation.value),a,b)"));
     assert!(browser.contains("const MIN=-9223372036854775808n"));
+    assert!(browser.contains("/^(?:0|-[1-9][0-9]*|[1-9][0-9]*)$/"));
+    assert!(!browser.contains("value.replace"));
+    assert!(!browser.contains("parsed.toString()"));
     let cargo =
         core::str::from_utf8(package_file(&generated.browser_adapter, "Cargo.toml")).unwrap();
     assert!(cargo.contains("prism-calculator = \"=0.1.0\""));

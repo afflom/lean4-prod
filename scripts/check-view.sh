@@ -31,6 +31,10 @@ test "$(find "$first/browser" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n
 head -c 10 "$first/hologram/view.holoview" | od -An -tx1 | tr -d ' \n' | \
   grep -Fx '484f4c4f564945570001'
 grep -F "name:'application.invoke'" "$first/hologram/app.js" >/dev/null
+grep -F '<div class="field"><label for="left">Left operand</label><input id="left"' \
+  "$first/hologram/index.html" >/dev/null
+grep -F '.field{display:grid;gap:.35rem;min-width:0}' \
+  "$first/hologram/app.css" >/dev/null
 grep -F "const MIN=-9223372036854775808n" "$first/browser/app.js" >/dev/null
 grep -F 'fixture-core = "=0.1.0"' "$first/browser-adapter/Cargo.toml" >/dev/null
 ! grep -E '(path|git)[[:space:]]*=' "$first/browser-adapter/Cargo.toml"

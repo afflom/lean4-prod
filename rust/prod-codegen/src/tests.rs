@@ -200,6 +200,25 @@ fn test_view_v1_projects_both_transports_without_raw_content() {
     )
     .unwrap();
     assert!(index.contains("<title>Calculator &lt;safe&gt;</title>"));
+    assert!(
+        index.contains("<div class=\"field\"><label for=\"left\">Left</label><input id=\"left\"")
+    );
+    assert!(index.contains(
+        "<div class=\"field\"><label for=\"operation\">Operation</label><select id=\"operation\""
+    ));
+    assert!(index
+        .contains("<div class=\"field\"><label for=\"right\">Right</label><input id=\"right\""));
+    let stylesheet = core::str::from_utf8(
+        &generated
+            .hologram_assets
+            .iter()
+            .find(|file| file.path == "app.css")
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert!(stylesheet.contains(".field{display:grid;gap:.35rem;min-width:0}"));
+    assert!(stylesheet.contains("input,select,button{width:100%"));
     let intent = core::str::from_utf8(
         &generated
             .hologram_assets

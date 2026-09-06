@@ -17,4 +17,10 @@ public def alpha (value : Nat) : Nat := value
 
 public def zeta (value : Nat) : Nat := alpha value
 
+public def belowLimit (value : Nat) : Bool := value < 4
+
+public def matchedCallee : List Nat → Bool
+  | [] => true
+  | value :: rest => belowLimit value && matchedCallee rest
+
 end Conformance.BadRoots

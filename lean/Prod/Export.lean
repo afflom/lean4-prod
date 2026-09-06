@@ -138,16 +138,25 @@ def namedClosure (roots : Array Name) : CoreM (Array Name × Array Name) := do
   let rootNamespaces := roots.map Name.getRoot
   let mut included := roots
   let mut erased : Array Name := #[]
+  -- Kernel definitions that pattern match commonly name only a generated
+  -- matcher in their body. The matcher is internalized by `toLCNF`, so it
+  -- must not become a public exported definition, but its body is still part
+  -- of closure discovery: it can be the only place public callees occur.
+  let mut pending := roots
+  let mut scanned : Array Name := #[]
   let mut cursor := 0
-  while cursor < included.size do
-    let name := included[cursor]!
+  while cursor < pending.size do
+    let name := pending[cursor]!
     cursor := cursor + 1
+    if scanned.contains name then
+      continue
+    scanned := scanned.push name
     let some info := env.find? name
-      | throwError "exportNames: included definition {name} disappeared"
+      | throwError "exportNames: closure definition {name} disappeared"
     let dependencies := (info.value? (allowOpaque := true)).map
       (fun value => value.getUsedConstants.qsort (namedOrder · · == .lt)) |>.getD #[]
     for dependency in dependencies do
-      if included.contains dependency || erased.contains dependency then
+      if scanned.contains dependency || erased.contains dependency then
         continue
       -- A closed LexLean semantic primitive is lowered at its call site by
       -- `lexLeanPrimitive?`. Pulling its generic typeclass implementation into
@@ -155,16 +164,26 @@ def namedClosure (roots : Array Name) : CoreM (Array Name × Array Name) := do
       -- target semantics depend on incidental implementation details.
       if isLexLeanRuntimeName dependency || isErasedPortableDictionary dependency then
         continue
+      let some dependencyInfo := env.find? dependency | continue
+      if dependencyInfo.isTheorem then
+        erased := erased.push dependency
+        continue
       -- Compiler-generated equation/matcher helpers are internal details of
       -- the owning declaration. The LCNF simplifier internalizes them while
       -- extracting that owner; exporting them as public closure roots would
       -- expose `lcAny` implementation signatures rather than source-level
-      -- definitions.
+      -- definitions. Scan safe definition bodies nevertheless, because an
+      -- internal matcher may be the sole kernel reference to a public callee.
       if dependency.isInternal then
-        continue
-      let some dependencyInfo := env.find? dependency | continue
-      if dependencyInfo.isTheorem then
-        erased := erased.push dependency
+        match dependencyInfo with
+        | .defnInfo value =>
+          match value.safety with
+          | .safe =>
+            if !pending.contains dependency then
+              pending := pending.push dependency
+          | .unsafe => throwError "exportNames: internal callee {dependency} is unsafe"
+          | .partial => throwError "exportNames: internal callee {dependency} is partial"
+        | _ => pure ()
         continue
       if !rootNamespaces.contains dependency.getRoot then
         continue
@@ -179,7 +198,10 @@ def namedClosure (roots : Array Name) : CoreM (Array Name × Array Name) := do
           -- units. `toLCNF` eliminates those while compiling their owner, so
           -- only independently compilable callees belong in the closure.
           if (← shouldGenerateCode dependency) then
-            included := included.push dependency
+            if !included.contains dependency then
+              included := included.push dependency
+            if !pending.contains dependency then
+              pending := pending.push dependency
       | .opaqueInfo _ =>
         throwError "exportNames: opaque or noncomputable callee {dependency}"
       | _ =>

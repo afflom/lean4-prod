@@ -1,6 +1,7 @@
 use super::*;
 use alloc::vec;
 use prod_ir::parser::parse_module;
+extern crate std;
 
 fn generate(ir: &str) -> String {
     let (_, module) = parse_module(ir).unwrap();
@@ -534,6 +535,77 @@ fn test_nested_list_type_is_an_explicit_owned_vec() {
 )
 "#;
     assert!(generate(ir).contains("-> Option<alloc::vec::Vec<u64>>"));
+}
+
+#[test]
+fn test_structure_list_projection_copies_into_the_output_buffer() {
+    let ir = r#"
+(module M
+  (type "M.Relation" (ctor "M.Relation.mk" (bound Nat) (values (List Nat))))
+  (type "M.Manifest" (ctor "M.Manifest.mk" (relation (named "M.Relation"))))
+  (def values ((self (named "M.Relation"))) (List Nat)
+    (let projected (proj "M.Relation" "values" self) projected))
+  (def relation ((self (named "M.Manifest"))) (named "M.Relation")
+    (let projected (proj "M.Manifest" "relation" self) projected))
+)
+"#;
+    let out = generate(ir);
+    assert!(out.contains("pub values: alloc::vec::Vec<u64>"));
+    assert!(out.contains("pub fn values(__prod_self: &crate::Relation, output: &mut [u64])"));
+    assert!(out.contains("pub fn relation(__prod_self: &crate::Manifest) -> &crate::Relation"));
+    assert!(out.contains(
+        "if __source.len() > (output).len() { Err(crate::ComputeError::OutputTooSmall) }"
+    ));
+    assert!(out.contains("clone_from_slice(__source)"));
+    assert!(!out.contains("output["));
+    assert!(!out.contains("__list"));
+
+    // Compile and execute the generated projection so the undersized-buffer
+    // branch is behaviorally pinned: caller-controlled exhaustion is an
+    // error and leaves the caller's buffer untouched.
+    let directory = std::env::temp_dir().join(std::format!(
+        "prod-codegen-list-projection-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("main.rs");
+    let executable = directory.join("projection-test");
+    std::fs::write(
+        &source,
+        std::format!(
+            r#"extern crate alloc;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeError {{ OutputTooSmall }}
+{out}
+fn main() {{
+    let relation_value = Relation {{ bound: 2, values: alloc::vec![10, 20] }};
+    let mut exact = [0_u64; 2];
+    assert_eq!(values(&relation_value, &mut exact), Ok(2));
+    assert_eq!(exact, [10, 20]);
+    let mut short = [99_u64; 1];
+    assert_eq!(values(&relation_value, &mut short), Err(ComputeError::OutputTooSmall));
+    assert_eq!(short, [99]);
+    let manifest = Manifest {{ relation: relation_value }};
+    assert_eq!(relation(&manifest).bound, 2);
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let compiled = std::process::Command::new("rustc")
+        .args(["--edition", "2021"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .unwrap();
+    assert!(compiled.success());
+    assert!(std::process::Command::new(&executable)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

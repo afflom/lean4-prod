@@ -602,6 +602,11 @@ fn generate_def_in<'m>(
         ));
     }
     check_named_type(&def.ret, table)?;
+    let return_type = if returns_borrowed_projection(&def.body, &def.ret, table) {
+        format!("&{}", type_to_rust(&def.ret)?)
+    } else {
+        type_to_rust(&def.ret)?
+    };
 
     match shape {
         Shape::StaticList => {
@@ -644,17 +649,44 @@ fn generate_def_in<'m>(
             "pub fn {}({}) -> Result<{}, crate::ComputeError> {{\n    Ok({})\n}}\n",
             def.name,
             params,
-            type_to_rust(&def.ret)?,
+            return_type,
             renderer.value(&def.body)?
         )),
         Shape::Value => Ok(format!(
             "pub fn {}({}) -> {} {{\n    {}\n}}\n",
             def.name,
             params,
-            type_to_rust(&def.ret)?,
+            return_type,
             renderer.value(&def.body)?
         )),
     }
+}
+
+/// Whether a definition is the compiler-generated shape of an accessor for a
+/// non-`Copy` field. Returning a borrow preserves the source value without a
+/// clone (and therefore without a possible allocation).
+fn returns_borrowed_projection(expr: &Expr, ret: &Type, table: &TypeTable) -> bool {
+    let Expr::Let(name, value, body) = expr else {
+        return false;
+    };
+    if !matches!(body.as_ref(), Expr::Var(result) if result == name) {
+        return false;
+    }
+    let Expr::Proj(owner, field, _) = value.as_ref() else {
+        return false;
+    };
+    table
+        .get(owner.as_str())
+        .and_then(|declaration| {
+            declaration
+                .ctors
+                .iter()
+                .flat_map(|constructor| constructor.fields.iter())
+                .find_map(|(name, ty)| (name == field).then_some(ty))
+        })
+        .is_some_and(|field_type| {
+            field_type == ret && !copy_type(field_type, table, &mut BTreeSet::new())
+        })
 }
 
 /// Rust spelling of a type in an ordinary (owned, by-value) position.
@@ -708,10 +740,19 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
 /// silently render as `crate::Whatever` instead of being rejected.
 fn param_type_to_rust(ty: &Type, table: &TypeTable) -> Result<String, Error> {
     check_named_type(ty, table)?;
-    match ty {
-        Type::List(inner) => Ok(format!("&[{}]", type_to_rust(inner)?)),
-        _ => type_to_rust(ty),
+    if borrowed_parameter(ty, table) {
+        match ty {
+            Type::List(inner) => Ok(format!("&[{}]", type_to_rust(inner)?)),
+            _ => Ok(format!("&{}", type_to_rust(ty)?)),
+        }
+    } else {
+        type_to_rust(ty)
     }
+}
+
+fn borrowed_parameter(ty: &Type, table: &TypeTable) -> bool {
+    matches!(ty, Type::List(_))
+        || matches!(ty, Type::Named(_)) && !copy_type(ty, table, &mut BTreeSet::new())
 }
 
 /// A `(named ...)` type occurring in a definition's signature must be
@@ -864,6 +905,22 @@ impl<'m> Renderer<'_, 'm> {
         self.shapes.get(name).copied()
     }
 
+    /// Return the declared type of a projected structure field.
+    ///
+    /// LCNF lowers a structure accessor returning `List T` to a projection in
+    /// a `let`, rather than to a cons chain.  The list still has an existing
+    /// owner (the structure argument), so it can be copied into the caller's
+    /// output buffer without allocating.
+    fn projection_field_type(&self, ty: &str, field: &str) -> Option<&'m Type> {
+        self.types.get(ty).and_then(|declaration| {
+            declaration
+                .ctors
+                .iter()
+                .flat_map(|constructor| constructor.fields.iter())
+                .find_map(|(name, ty)| (name == field).then_some(ty))
+        })
+    }
+
     fn render_call_args(&self, name: &str, args: &'m [Expr]) -> Result<Vec<String>, Error> {
         let definition = self
             .definitions
@@ -875,7 +932,7 @@ impl<'m> Renderer<'_, 'm> {
                 let rendered = self.value(argument)?;
                 if definition
                     .and_then(|definition| definition.params.get(index))
-                    .is_some_and(|(_, ty)| matches!(ty, Type::List(_)))
+                    .is_some_and(|(_, ty)| borrowed_parameter(ty, self.types))
                 {
                     Ok(format!("&({rendered})"))
                 } else {
@@ -900,6 +957,9 @@ impl<'m> Renderer<'_, 'm> {
                         .params
                         .iter()
                         .any(|(parameter, ty)| parameter == name && matches!(ty, Type::List(_)))
+            }
+            Expr::Proj(ty, field, _) => {
+                matches!(self.projection_field_type(ty, field), Some(Type::List(_)))
             }
             _ => false,
         }
@@ -1004,6 +1064,27 @@ impl<'m> Renderer<'_, 'm> {
                     }
                     (Mode::Value, _) => Ok(format!("{}({})", name, rendered.join(", "))),
                 }
+            }
+
+            // A list field already has owned storage in its enclosing value.
+            // Copy its elements into the caller-provided buffer, just as a
+            // top-level borrowed list parameter is copied.  `clone_from_slice`
+            // preserves the generic generated-type contract without requiring
+            // list elements to be `Copy`, and performs no allocation.
+            Expr::Proj(ty, field, _) if matches!(mode, Mode::Builder { .. }) => {
+                if !matches!(self.projection_field_type(ty, field), Some(Type::List(_))) {
+                    return Err(Error::UnsupportedList(format!(
+                        "`{}.{}` is not a list field",
+                        ty, field
+                    )));
+                }
+                let Mode::Builder { out, .. } = mode else {
+                    unreachable!()
+                };
+                let source = self.value(expr)?;
+                Ok(format!(
+                    "{{ let __source = &({source}); if __source.len() > ({out}).len() {{ Err(crate::ComputeError::OutputTooSmall) }} else {{ let __len = __source.len(); ({out})[..__len].clone_from_slice(__source); Ok(__len) }} }}"
+                ))
             }
 
             // An unresolved callee: refuse it outright rather than rendering
@@ -1235,16 +1316,18 @@ impl<'m> Renderer<'_, 'm> {
                 }
             }
             Expr::Proj(ty, field, e) => {
-                if let Some(decl) = self.types.get(ty.as_str()) {
-                    let declared = decl
-                        .ctors
-                        .iter()
-                        .any(|c| c.fields.iter().any(|(name, _)| name == field));
-                    if !declared {
-                        return Err(Error::UnknownField(ty.clone(), field.clone()));
-                    }
+                let field_type = self.projection_field_type(ty, field);
+                if self.types.contains_key(ty.as_str()) && field_type.is_none() {
+                    return Err(Error::UnknownField(ty.clone(), field.clone()));
                 }
-                Ok(format!("({}).{}", self.value(e)?, rust_ident(field)))
+                let projection = format!("({}).{}", self.value(e)?, rust_ident(field));
+                if field_type.is_some_and(|field_type| {
+                    !copy_type(field_type, self.types, &mut BTreeSet::new())
+                }) {
+                    Ok(format!("&{projection}"))
+                } else {
+                    Ok(projection)
+                }
             }
             Expr::Jp { name, body, .. } => {
                 if self.ctx.jmp_count(name) == 0 {

@@ -91,4 +91,17 @@ if grep -F -- 'matchedCallee.match_' "$scratch/matched-callee/roots.json" >/dev/
   exit 1
 fi
 
+# A root's user type can itself contain another user type (including through
+# List/Option). The generated IR must carry that complete type graph so the
+# Rust generator never receives an undeclared nested field type.
+lake exe prod-export --module Conformance.BadRoots \
+  --root Conformance.BadRoots.nestedOwnerMembers \
+  --ir-module NestedOwner --out "$scratch/nested-owner"
+grep -F -- '(type "Conformance.BadRoots.NestedMember"' \
+  "$scratch/nested-owner/kernel.ir" >/dev/null
+cd "$repo_root/rust"
+cargo run -p prod-cli -- validate "$scratch/nested-owner/kernel.ir"
+cargo run -p prod-cli -- gen "$scratch/nested-owner/kernel.ir" \
+  --output "$scratch/nested-owner/generated.rs"
+
 echo "named-export conformance passed"

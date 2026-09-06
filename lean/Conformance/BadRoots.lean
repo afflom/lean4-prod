@@ -23,4 +23,12 @@ public def matchedCallee : List Nat → Bool
   | [] => true
   | value :: rest => belowLimit value && matchedCallee rest
 
+public structure NestedMember where
+  value : Nat
+
+public structure NestedOwner where
+  members : List NestedMember
+
+public def nestedOwnerMembers (owner : NestedOwner) : List NestedMember := owner.members
+
 end Conformance.BadRoots

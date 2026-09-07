@@ -78,4 +78,17 @@ expect_failure "root Conformance.BadRoots.typeValuedRoot does not generate code"
   lake exe prod-export --module Conformance.BadRoots \
     --root Conformance.BadRoots.typeValuedRoot --ir-module Bad --out "$scratch/bad"
 
+# The kernel body of a pattern-matching definition refers first to a generated
+# matcher. Named closure discovery must scan that internal helper so its public
+# callees are included, while keeping the matcher itself out of the public IR.
+lake exe prod-export --module Conformance.BadRoots \
+  --root Conformance.BadRoots.matchedCallee \
+  --ir-module MatchedCallee --out "$scratch/matched-callee"
+grep -F -- 'Conformance.BadRoots.belowLimit' \
+  "$scratch/matched-callee/roots.json" >/dev/null
+if grep -F -- 'matchedCallee.match_' "$scratch/matched-callee/roots.json" >/dev/null; then
+  echo "generated matcher leaked into named export closure" >&2
+  exit 1
+fi
+
 echo "named-export conformance passed"

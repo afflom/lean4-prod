@@ -104,4 +104,26 @@ cargo run -p prod-cli -- validate "$scratch/nested-owner/kernel.ir"
 cargo run -p prod-cli -- gen "$scratch/nested-owner/kernel.ir" \
   --output "$scratch/nested-owner/generated.rs"
 
+# Structure projections are expressions plus owner type metadata, never free
+# exported functions. Same-spelled fields on distinct structures must compile
+# without duplicate Rust items.
+cd "$repo_root/lean"
+lake exe prod-export --module Conformance.BadRoots \
+  --root Conformance.BadRoots.sumProjectionIds \
+  --ir-module ProjectionFields --out "$scratch/projection-fields"
+if grep -F -- 'Conformance.BadRoots.ProjectionLeft.id' \
+  "$scratch/projection-fields/roots.json" >/dev/null; then
+  echo "structure projection leaked into named export closure" >&2
+  exit 1
+fi
+cd "$repo_root/rust"
+cargo run -p prod-cli -- validate "$scratch/projection-fields/kernel.ir"
+cargo run -p prod-cli -- gen "$scratch/projection-fields/kernel.ir" \
+  --output "$scratch/projection-fields/generated.rs"
+if grep -E -- '^pub fn (id|ProjectionLeft\.id|ProjectionRight\.id)\(' \
+  "$scratch/projection-fields/generated.rs" >/dev/null; then
+  echo "structure projection rendered as a free Rust function" >&2
+  exit 1
+fi
+
 echo "named-export conformance passed"

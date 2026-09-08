@@ -176,6 +176,13 @@ def namedClosure (roots : Array Name) : CoreM (Array Name × Array Name) := do
       if dependencyInfo.isTheorem then
         erased := erased.push dependency
         continue
+      -- Structure field projections are lowered from `LCNF.Projection` nodes
+      -- using the owning type declaration. They are not callable source
+      -- definitions: exporting `Artifact.id`, `Component.id`, and every other
+      -- same-spelled field as free functions would collide in Rust and would
+      -- duplicate the projection already present in the expression IR.
+      if env.isProjectionFn dependency then
+        continue
       -- Compiler-generated equation/matcher helpers are internal details of
       -- the owning declaration. The LCNF simplifier internalizes them while
       -- extracting that owner; exporting them as public closure roots would

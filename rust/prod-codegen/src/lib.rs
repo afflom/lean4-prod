@@ -83,11 +83,11 @@
 //!   - `Type::Tuple` renders as a Rust tuple type, so
 //!     `(Tuple Nat (Tuple Nat Nat))` becomes `(u64, (u64, u64))`.
 //!   - `Unreachable` renders as `unreachable!()`.
-//!   - **Jp/Jmp policy**: a join point with exactly one `jmp` caller that is
-//!     not inside its own body is inlined at the jump site as
+//!   - **Jp/Jmp policy**: an acyclic join point with one or more `jmp` callers
+//!     is inlined independently at every jump site as
 //!     `{ let p = arg; ...; <jp body> }`, and the declaration site renders as
 //!     `()`. A join point with no callers renders its body in place. Anything
-//!     else — cyclic, or several callers — is rejected as
+//!     cyclic is rejected as
 //!     [`Error::UnsupportedJoinPoint`], because it would need real control
 //!     flow. This used to emit a `loop {}` skeleton with a "manual port
 //!     required" comment, which did not compile: the join point's parameters
@@ -158,9 +158,8 @@ pub enum Error {
     /// A projection names a field the declared type does not have. Catches a
     /// declaration and a projection disagreeing within one IR file.
     UnknownField(String, String),
-    /// A join point with several callers, or one that jumps to itself. Only
-    /// the single-caller form has a lowering (it inlines at its jump site);
-    /// the rest would need real control flow.
+    /// A join point that jumps to itself. Acyclic join points are duplicated
+    /// at their call sites; cycles would need real control flow.
     UnsupportedJoinPoint(String),
 }
 
@@ -840,9 +839,13 @@ impl<'a> JpContext<'a> {
         }
     }
 
-    /// Inlineable: exactly one caller, and not self-referential.
+    /// Inlineable: at least one caller, and not self-referential.
+    ///
+    /// LCNF uses multi-caller join points as shared continuations for ordinary
+    /// matches. Duplicating an acyclic pure continuation at each jump is
+    /// allocation-free and preserves the expression result.
     fn is_inlineable(&self, name: &str) -> bool {
-        self.jmp_count(name) == 1 && !self.is_cyclic(name)
+        self.jmp_count(name) > 0 && !self.is_cyclic(name)
     }
 }
 
@@ -1341,7 +1344,7 @@ impl<'m> Renderer<'_, 'm> {
                     // Inlined at its single jump site; nothing to emit here.
                     Ok(format!("/* jp \"{}\" inlined at its jump site */ ()", name))
                 } else {
-                    // Cyclic or multi-caller. This used to emit a `loop {}`
+                    // Cyclic. This used to emit a `loop {}`
                     // skeleton with a "manual port required" comment, which is
                     // not Rust that compiles: the join point's parameters are
                     // never bound, and each jump site has type `()` where the

@@ -944,10 +944,10 @@ fn test_cyclic_join_point_is_rejected() {
 }
 
 #[test]
-fn test_multi_caller_join_point_is_rejected() {
-    // Two `jmp` sites for one `jp`. LCNF produces this from something as
-    // ordinary as a `match` whose arms both feed a shared continuation, so it
-    // is not an exotic corner — see `Conformance.c_ctor_body_only`.
+fn test_multi_caller_acyclic_join_point_is_inlined_at_every_jump() {
+    // LCNF produces this shape when multiple match arms feed one pure
+    // continuation. Each branch gets its own parameter binding and checked
+    // addition, with no runtime allocation or unbound join parameter.
     let ir = r#"
 (module M
   (def f ((c Nat) (x Nat)) Nat
@@ -955,10 +955,11 @@ fn test_multi_caller_join_point_is_rejected() {
       (if (lt c 1) (jmp g x) (jmp g c))))
 )
 "#;
-    assert_eq!(
-        generate_err(ir),
-        Error::UnsupportedJoinPoint("g".to_string())
-    );
+    let out = generate(ir);
+    assert_eq!(out.matches("let a =").count(), 2);
+    assert_eq!(out.matches("checked_add(1)").count(), 2);
+    assert!(out.contains("let a = x"));
+    assert!(out.contains("let a = c"));
 }
 
 #[test]

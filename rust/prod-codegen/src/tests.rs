@@ -1094,6 +1094,84 @@ fn test_generate_struct_from_single_ctor_type() {
 }
 
 #[test]
+fn test_shared_owned_lcnf_values_are_cloned_for_record_fields_and_compile() {
+    let ir = r#"
+(module M
+  (type "M.Bundle"
+    (ctor "M.Bundle.mk"
+      (left String)
+      (right String)
+      (first (List Nat))
+      (second (List Nat))
+      (names (List String))))
+  (def shared () (named "M.Bundle")
+    (let text (string "shared")
+      (let empty (ctor "List.nil")
+        (let values (ctor "List.cons" 7 empty)
+          (ctor "M.Bundle.mk" text text values values empty)))))
+)
+"#;
+    let out = generate(ir);
+    assert_eq!(
+        out.matches("alloc::string::String::from(\"shared\")")
+            .count(),
+        2
+    );
+    assert_eq!(out.matches("values.clone()").count(), 2);
+    assert!(!out.contains("let empty ="));
+
+    // Parsing generated text is insufficient for ownership defects: the old
+    // output was valid Rust syntax but moved the same String/Vec twice.
+    let directory = std::env::temp_dir().join(std::format!(
+        "prod-codegen-shared-owned-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("lib.rs");
+    let library = directory.join("libshared_owned.rlib");
+    std::fs::write(
+        &source,
+        std::format!(
+            r#"#![no_std]
+extern crate alloc;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeError {{ OutputTooSmall }}
+{out}
+"#
+        ),
+    )
+    .unwrap();
+    let compiled = std::process::Command::new("rustc")
+        .args(["--edition", "2021", "--crate-type", "lib"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .status()
+        .unwrap();
+    assert!(compiled.success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn test_string_predicates_borrow_inputs_and_literals_without_allocating() {
+    let ir = r#"
+(module M
+  (def equalsToken ((value String)) Bool
+    (eq value (string "token")))
+  (def delegates ((value String)) Bool
+    (call equalsToken value))
+)
+"#;
+    let out = generate(ir);
+    assert!(out.contains("pub fn equalsToken(value: &str) -> bool"));
+    assert!(out.contains("value == \"token\""));
+    assert!(out.contains("pub fn delegates(value: &str) -> bool"));
+    assert!(out.contains("equalsToken((value).as_ref())"));
+    assert!(!out.contains("alloc::string::String::from(\"token\")"));
+}
+
+#[test]
 fn test_generate_enum_from_multi_ctor_type() {
     let ir = r#"
 (module M

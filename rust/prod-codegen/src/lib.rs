@@ -571,6 +571,182 @@ fn is_fallible(expr: &Expr, shapes: &Signatures) -> bool {
     here || expr.children().any(|child| is_fallible(child, shapes))
 }
 
+fn count_var_uses(expr: &Expr, name: &str) -> usize {
+    let here = usize::from(matches!(expr, Expr::Var(candidate) if candidate == name));
+    here + expr
+        .children()
+        .map(|child| count_var_uses(child, name))
+        .sum::<usize>()
+}
+
+/// Whether a binding expression produces a known non-`Copy` Rust value.
+///
+/// This deliberately answers `false` when the type is not recoverable from
+/// the typed IR node. The exporter emits constructors, calls, projections,
+/// and literals for the shared values this analysis targets; those cases all
+/// retain enough type information for an exact answer.
+fn expression_is_non_copy(
+    expr: &Expr,
+    definitions: &[Definition],
+    table: &TypeTable<'_>,
+    non_copy_locals: &BTreeSet<String>,
+) -> bool {
+    let non_copy_type = |ty: &Type| !copy_type(ty, table, &mut BTreeSet::new());
+    match expr {
+        Expr::String(_) => true,
+        Expr::Var(name) => non_copy_locals.contains(name),
+        Expr::Call(name, _) => definitions
+            .iter()
+            .find(|definition| definition.name == *name)
+            .is_some_and(|definition| non_copy_type(&definition.ret)),
+        Expr::Proj(owner, field, _) => table
+            .get(owner.as_str())
+            .and_then(|declaration| {
+                declaration
+                    .ctors
+                    .iter()
+                    .flat_map(|constructor| constructor.fields.iter())
+                    .find_map(|(candidate, ty)| (candidate == field).then_some(ty))
+            })
+            .is_some_and(non_copy_type),
+        Expr::Ctor(name, _)
+            if matches!(
+                name.as_str(),
+                "List.nil"
+                    | "List.cons"
+                    | "Option.none"
+                    | "Option.some"
+                    | "Except.ok"
+                    | "Except.error"
+            ) =>
+        {
+            true
+        }
+        Expr::Ctor(name, _) => table.values().any(|declaration| {
+            declaration
+                .ctors
+                .iter()
+                .any(|constructor| constructor.name == *name)
+                && non_copy_type(&Type::Named(declaration.name.clone()))
+        }),
+        // These operations have an owned string/byte/list-shaped result.
+        Expr::Append(..)
+        | Expr::Utf8Encode(..)
+        | Expr::Utf8Decode(..)
+        | Expr::SplitExact(..)
+        | Expr::Join(..)
+        | Expr::FormatDecimal(..) => true,
+        Expr::Let(name, value, body) => {
+            let mut nested = non_copy_locals.clone();
+            if expression_is_non_copy(value, definitions, table, non_copy_locals) {
+                nested.insert(name.clone());
+            }
+            expression_is_non_copy(body, definitions, table, &nested)
+        }
+        Expr::If(_, then_value, else_value) => {
+            expression_is_non_copy(then_value, definitions, table, non_copy_locals)
+                || expression_is_non_copy(else_value, definitions, table, non_copy_locals)
+        }
+        _ => false,
+    }
+}
+
+fn repeated_non_copy_locals(
+    expr: &Expr,
+    definitions: &[Definition],
+    table: &TypeTable<'_>,
+    params: &[(String, Type)],
+    returns_boolean: bool,
+) -> BTreeSet<String> {
+    fn walk(
+        expr: &Expr,
+        definitions: &[Definition],
+        table: &TypeTable<'_>,
+        non_copy_locals: &BTreeSet<String>,
+        output: &mut BTreeSet<String>,
+    ) {
+        match expr {
+            Expr::Let(name, value, body) => {
+                walk(value, definitions, table, non_copy_locals, output);
+                let mut nested = non_copy_locals.clone();
+                if expression_is_non_copy(value, definitions, table, non_copy_locals) {
+                    nested.insert(name.clone());
+                    // Projections of non-Copy fields are already borrows and
+                    // may be reused without cloning the underlying value.
+                    if !matches!(value.as_ref(), Expr::Proj(..)) && count_var_uses(body, name) > 1 {
+                        output.insert(name.clone());
+                    }
+                }
+                walk(body, definitions, table, &nested, output);
+            }
+            Expr::Match { .. } => {
+                for child in expr.children() {
+                    walk(child, definitions, table, non_copy_locals, output);
+                }
+            }
+            Expr::Jp {
+                params: join_params,
+                body,
+                ..
+            } => {
+                for parameter in join_params {
+                    if count_var_uses(body, parameter) > 1 {
+                        output.insert(parameter.clone());
+                    }
+                }
+                walk(body, definitions, table, non_copy_locals, output);
+            }
+            _ => {
+                for child in expr.children() {
+                    walk(child, definitions, table, non_copy_locals, output);
+                }
+            }
+        }
+    }
+
+    let mut output = BTreeSet::new();
+    for (name, ty) in params {
+        if !borrowed_parameter(ty, table, returns_boolean)
+            && !copy_type(ty, table, &mut BTreeSet::new())
+            && count_var_uses(expr, name) > 1
+        {
+            output.insert(name.clone());
+        }
+    }
+    walk(expr, definitions, table, &BTreeSet::new(), &mut output);
+    output
+}
+
+fn inline_bindings(expr: &Expr) -> BTreeMap<String, &Expr> {
+    fn walk<'a>(expr: &'a Expr, output: &mut BTreeMap<String, &'a Expr>) {
+        if let Expr::Let(name, value, _) = expr {
+            if matches!(value.as_ref(), Expr::String(_))
+                || matches!(
+                    value.as_ref(),
+                    Expr::Ctor(constructor, arguments)
+                        if arguments.is_empty()
+                            && matches!(constructor.as_str(), "List.nil" | "Option.none")
+                )
+            {
+                // `List.nil` and `Option.none` are polymorphic in Lean. LCNF
+                // can CSE one closed value across uses with different element
+                // types, but one Rust local cannot have several monomorphic
+                // types. String literals are also inlined so borrowed
+                // comparison/call positions stay allocation-free while owned
+                // record fields still materialize a String at their use.
+                output.insert(name.clone(), value);
+            }
+        }
+        for child in expr.children() {
+            walk(child, output);
+        }
+    }
+
+    let mut output = BTreeMap::new();
+    walk(expr, &mut output);
+    output
+}
+
 fn generate_def_in<'m>(
     def: &'m Definition,
     definitions: &'m [Definition],
@@ -587,6 +763,14 @@ fn generate_def_in<'m>(
         params: &def.params,
         ctx: JpContext::collect(&def.body),
         types: table,
+        clone_locals: repeated_non_copy_locals(
+            &def.body,
+            definitions,
+            table,
+            &def.params,
+            def.ret == Type::Bool,
+        ),
+        inline_values: inline_bindings(&def.body),
     };
 
     let mut params = String::new();
@@ -597,7 +781,7 @@ fn generate_def_in<'m>(
         params.push_str(&format!(
             "{}: {}",
             rust_local_ident(name),
-            param_type_to_rust(ty, table)?
+            param_type_to_rust(ty, table, def.ret == Type::Bool)?
         ));
     }
     check_named_type(&def.ret, table)?;
@@ -737,10 +921,16 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
 /// return types are not fields, so [`check_field_type`] never sees them, and
 /// without this check an undeclared `(named ...)` in a signature would
 /// silently render as `crate::Whatever` instead of being rejected.
-fn param_type_to_rust(ty: &Type, table: &TypeTable) -> Result<String, Error> {
+fn param_type_to_rust(
+    ty: &Type,
+    table: &TypeTable,
+    returns_boolean: bool,
+) -> Result<String, Error> {
     check_named_type(ty, table)?;
-    if borrowed_parameter(ty, table) {
+    if borrowed_parameter(ty, table, returns_boolean) {
         match ty {
+            Type::String => Ok(String::from("&str")),
+            Type::Bytes => Ok(String::from("&[u8]")),
             Type::List(inner) => Ok(format!("&[{}]", type_to_rust(inner)?)),
             _ => Ok(format!("&{}", type_to_rust(ty)?)),
         }
@@ -749,9 +939,10 @@ fn param_type_to_rust(ty: &Type, table: &TypeTable) -> Result<String, Error> {
     }
 }
 
-fn borrowed_parameter(ty: &Type, table: &TypeTable) -> bool {
+fn borrowed_parameter(ty: &Type, table: &TypeTable, returns_boolean: bool) -> bool {
     matches!(ty, Type::List(_))
         || matches!(ty, Type::Named(_)) && !copy_type(ty, table, &mut BTreeSet::new())
+        || returns_boolean && matches!(ty, Type::String | Type::Bytes)
 }
 
 /// A `(named ...)` type occurring in a definition's signature must be
@@ -887,11 +1078,60 @@ struct Renderer<'s, 'm> {
     params: &'m [(String, Type)],
     ctx: JpContext<'m>,
     types: &'s TypeTable<'m>,
+    /// Non-`Copy` LCNF `let` bindings referenced more than once.
+    ///
+    /// Lean values are immutable and may be shared freely. Rust record
+    /// construction consumes owned fields, so an LCNF common subexpression
+    /// such as one `String` used by two fields must be cloned at each use.
+    /// Restricting this to repeated, known non-`Copy` locals keeps the
+    /// allocation-free scalar/slice profile unchanged.
+    clone_locals: BTreeSet<String>,
+    /// Closed polymorphic empty constructors cannot share one inferred Rust
+    /// local across differently monomorphized uses.
+    inline_values: BTreeMap<String, &'m Expr>,
 }
 
 impl<'m> Renderer<'_, 'm> {
     fn value(&self, expr: &'m Expr) -> Result<String, Error> {
         self.render(expr, &Mode::Value)
+    }
+
+    fn resolved_inline(&self, expr: &'m Expr) -> &'m Expr {
+        match expr {
+            Expr::Var(name) => self
+                .inline_values
+                .get(name)
+                .map_or(expr, |value| self.resolved_inline(value)),
+            _ => expr,
+        }
+    }
+
+    fn is_empty_list(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Ctor(name, arguments) => name == "List.nil" && arguments.is_empty(),
+            Expr::Var(name) => self
+                .inline_values
+                .get(name)
+                .is_some_and(|value| self.is_empty_list(value)),
+            _ => false,
+        }
+    }
+
+    fn list_head_is_copy(&self, scrutinee: &Expr) -> bool {
+        let Expr::Var(name) = scrutinee else {
+            return true;
+        };
+        self.params
+            .iter()
+            .find_map(|(parameter, ty)| {
+                (parameter == name).then_some(ty).and_then(|ty| match ty {
+                    Type::List(element) => {
+                        Some(copy_type(element, self.types, &mut BTreeSet::new()))
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or(true)
     }
 
     /// The declaration of a constructor, by its full Lean name.
@@ -932,14 +1172,30 @@ impl<'m> Renderer<'_, 'm> {
         args.iter()
             .enumerate()
             .map(|(index, argument)| {
-                let rendered = self.value(argument)?;
-                if definition
-                    .and_then(|definition| definition.params.get(index))
-                    .is_some_and(|(_, ty)| borrowed_parameter(ty, self.types))
-                {
-                    Ok(format!("&({rendered})"))
-                } else {
-                    Ok(rendered)
+                let argument = self.resolved_inline(argument);
+                match definition.and_then(|definition| {
+                    definition.params.get(index).map(|(_, ty)| {
+                        (
+                            ty,
+                            borrowed_parameter(ty, self.types, definition.ret == Type::Bool),
+                        )
+                    })
+                }) {
+                    Some((Type::String, true)) if matches!(argument, Expr::String(_)) => {
+                        let Expr::String(value) = argument else {
+                            unreachable!()
+                        };
+                        Ok(format!("{value:?}"))
+                    }
+                    Some((Type::String | Type::Bytes, true)) => {
+                        let rendered = self.value(argument)?;
+                        Ok(format!("({rendered}).as_ref()"))
+                    }
+                    Some((_, true)) => {
+                        let rendered = self.value(argument)?;
+                        Ok(format!("&({rendered})"))
+                    }
+                    _ => self.value(argument),
                 }
             })
             .collect()
@@ -977,6 +1233,15 @@ impl<'m> Renderer<'_, 'm> {
                 self.render(t, mode)?,
                 self.render(f, mode)?
             )),
+            Expr::Let(name, _, body) if self.inline_values.contains_key(name) => {
+                self.render(body, mode)
+            }
+            Expr::Let(name, value, body)
+                if count_var_uses(body, name) == 0
+                    && !matches!(value.as_ref(), Expr::Jp { .. }) =>
+            {
+                self.render(body, mode)
+            }
             Expr::Let(name, val, body) => match mode {
                 Mode::Builder { out, env, depth } if self.is_list_valued(val, env) => {
                     // A list binding has no runtime representation to emit;
@@ -1017,6 +1282,9 @@ impl<'m> Renderer<'_, 'm> {
                 Mode::Builder { out, env, depth } => {
                     self.render_cons(&args[0], &args[1], out, env, *depth)
                 }
+                Mode::Value if self.is_empty_list(&args[1]) => {
+                    Ok(format!("alloc::vec![{}]", self.value(&args[0])?))
+                }
                 Mode::Value => Ok(format!(
                     "{{ let mut __list = alloc::vec![{}]; __list.extend({}); __list }}",
                     self.value(&args[0])?,
@@ -1025,6 +1293,9 @@ impl<'m> Renderer<'_, 'm> {
             },
 
             // ---- everything else ----
+            Expr::Var(name) if self.inline_values.contains_key(name) => {
+                self.render(self.inline_values[name], mode)
+            }
             Expr::Var(name) => match mode {
                 Mode::Builder { out, env, .. } => match lookup(env, name) {
                     Some(bound) => self.render(bound, mode),
@@ -1042,6 +1313,9 @@ impl<'m> Renderer<'_, 'm> {
                         name
                     ))),
                 },
+                Mode::Value if self.clone_locals.contains(name) => {
+                    Ok(format!("{}.clone()", rust_local_ident(name)))
+                }
                 Mode::Value => Ok(rust_local_ident(name)),
             },
             Expr::Call(name, args) => {
@@ -1252,7 +1526,15 @@ impl<'m> Renderer<'_, 'm> {
             Expr::Pow(a, b) => {
                 self.checked_exponent_op(a, b, "checked_pow", "PowExponentTooLarge", "PowOverflow")
             }
-            Expr::Eq(a, b) => self.binop(a, b, "=="),
+            Expr::Eq(a, b) => match (
+                self.resolved_inline(a.as_ref()),
+                self.resolved_inline(b.as_ref()),
+            ) {
+                (other, Expr::String(value)) | (Expr::String(value), other) => {
+                    Ok(format!("{} == {value:?}", self.value(other)?))
+                }
+                _ => self.binop(a, b, "=="),
+            },
             Expr::Lt(a, b) => self.binop(a, b, "<"),
             Expr::Le(a, b) => self.binop(a, b, "<="),
             Expr::Gt(a, b) => self.binop(a, b, ">"),
@@ -1426,6 +1708,7 @@ impl<'m> Renderer<'_, 'm> {
         default: Option<&'m Expr>,
         mode: &Mode<'_, 'm>,
     ) -> Result<String, Error> {
+        let head_is_copy = self.list_head_is_copy(scrut);
         let scrut = self.value(scrut)?;
         let mut out = format!("match {} {{\n", scrut);
         for alt in alts {
@@ -1448,12 +1731,18 @@ impl<'m> Renderer<'_, 'm> {
                 // Match ergonomics bind the head by reference; rebind it by
                 // value so arithmetic on it needs no dereference syntax.
                 ("List.nil", 0) => format!("        [] => {},\n", body),
-                ("List.cons", 2) => format!(
+                ("List.cons", 2) if head_is_copy => format!(
                     "        [{}, {} @ ..] => {{ let {} = {}.clone(); {} }},\n",
                     rust_local_ident(&alt.binders[0]),
                     rust_local_ident(&alt.binders[1]),
                     rust_local_ident(&alt.binders[0]),
                     rust_local_ident(&alt.binders[0]),
+                    body
+                ),
+                ("List.cons", 2) => format!(
+                    "        [{}, {} @ ..] => {},\n",
+                    rust_local_ident(&alt.binders[0]),
+                    rust_local_ident(&alt.binders[1]),
                     body
                 ),
                 ("Bool.true", 0) => format!("        true => {},\n", body),

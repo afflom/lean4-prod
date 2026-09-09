@@ -656,7 +656,7 @@ fn repeated_non_copy_locals(
     definitions: &[Definition],
     table: &TypeTable<'_>,
     params: &[(String, Type)],
-    returns_boolean: bool,
+    returns_copy: bool,
 ) -> BTreeSet<String> {
     fn walk(
         expr: &Expr,
@@ -706,7 +706,7 @@ fn repeated_non_copy_locals(
 
     let mut output = BTreeSet::new();
     for (name, ty) in params {
-        if !borrowed_parameter(ty, table, returns_boolean)
+        if !internal_borrowed_parameter(ty, table, returns_copy)
             && !copy_type(ty, table, &mut BTreeSet::new())
             && count_var_uses(expr, name) > 1
         {
@@ -757,6 +757,14 @@ fn generate_def_in<'m>(
         .get(def.name.as_str())
         .copied()
         .unwrap_or(Shape::Value);
+    let returns_copy = copy_type(&def.ret, table, &mut BTreeSet::new());
+    let helper = needs_borrowed_helper(def, table);
+    let generated_name = if helper {
+        borrowed_helper_name(def, definitions)
+    } else {
+        def.name.clone()
+    };
+    let visibility = if helper { "" } else { "pub " };
     let renderer = Renderer {
         shapes,
         definitions,
@@ -768,7 +776,7 @@ fn generate_def_in<'m>(
             definitions,
             table,
             &def.params,
-            def.ret == Type::Bool,
+            returns_copy,
         ),
         inline_values: inline_bindings(&def.body),
     };
@@ -781,7 +789,11 @@ fn generate_def_in<'m>(
         params.push_str(&format!(
             "{}: {}",
             rust_local_ident(name),
-            param_type_to_rust(ty, table, def.ret == Type::Bool)?
+            param_type_to_rust(
+                ty,
+                table,
+                internal_borrowed_parameter(ty, table, returns_copy),
+            )?
         ));
     }
     check_named_type(&def.ret, table)?;
@@ -791,7 +803,7 @@ fn generate_def_in<'m>(
         type_to_rust(&def.ret)?
     };
 
-    match shape {
+    let implementation = match shape {
         Shape::StaticList => {
             let elem = list_element(&def.ret)?;
             if is_fallible(&def.body, shapes) {
@@ -803,8 +815,8 @@ fn generate_def_in<'m>(
             let mut items = Vec::new();
             renderer.static_list(&def.body, &[], &mut items)?;
             Ok(format!(
-                "pub fn {}() -> &'static [{}] {{\n    &[{}]\n}}\n",
-                def.name,
+                "{visibility}fn {}() -> &'static [{}] {{\n    &[{}]\n}}\n",
+                generated_name,
                 type_to_rust(elem)?,
                 items.join(", ")
             ))
@@ -824,25 +836,66 @@ fn generate_def_in<'m>(
                 },
             )?;
             Ok(format!(
-                "pub fn {}({}) -> Result<usize, crate::ComputeError> {{\n    {}\n}}\n",
-                def.name, params, body
+                "{visibility}fn {}({}) -> Result<usize, crate::ComputeError> {{\n    {}\n}}\n",
+                generated_name, params, body
             ))
         }
         Shape::Fallible => Ok(format!(
-            "pub fn {}({}) -> Result<{}, crate::ComputeError> {{\n    Ok({})\n}}\n",
-            def.name,
+            "{visibility}fn {}({}) -> Result<{}, crate::ComputeError> {{\n    Ok({})\n}}\n",
+            generated_name,
             params,
             return_type,
             renderer.value(&def.body)?
         )),
         Shape::Value => Ok(format!(
-            "pub fn {}({}) -> {} {{\n    {}\n}}\n",
-            def.name,
+            "{visibility}fn {}({}) -> {} {{\n    {}\n}}\n",
+            generated_name,
             params,
             return_type,
             renderer.value(&def.body)?
         )),
+    }?;
+
+    if !helper {
+        return Ok(implementation);
     }
+
+    let mut public_params = Vec::with_capacity(def.params.len());
+    let mut arguments = Vec::with_capacity(def.params.len());
+    for (name, ty) in &def.params {
+        let local = rust_local_ident(name);
+        let public_borrowed = public_borrowed_parameter(ty, table, def.ret == Type::Bool);
+        let internal_borrowed = internal_borrowed_parameter(ty, table, returns_copy);
+        public_params.push(format!(
+            "{local}: {}",
+            param_type_to_rust(ty, table, public_borrowed)?
+        ));
+        arguments.push(if internal_borrowed && !public_borrowed {
+            if matches!(ty, Type::String | Type::Bytes) {
+                format!("{local}.as_ref()")
+            } else {
+                format!("&{local}")
+            }
+        } else {
+            local
+        });
+    }
+    let public_return = match shape {
+        Shape::Value => return_type,
+        Shape::Fallible => format!("Result<{return_type}, crate::ComputeError>"),
+        Shape::Buffer | Shape::StaticList => {
+            unreachable!("list results do not use borrowed helpers")
+        }
+    };
+    Ok(format!(
+        "pub fn {}({}) -> {} {{\n    {}({})\n}}\n\n{}",
+        def.name,
+        public_params.join(", "),
+        public_return,
+        generated_name,
+        arguments.join(", "),
+        implementation
+    ))
 }
 
 /// Whether a definition is the compiler-generated shape of an accessor for a
@@ -921,13 +974,9 @@ fn type_to_rust(ty: &Type) -> Result<String, Error> {
 /// return types are not fields, so [`check_field_type`] never sees them, and
 /// without this check an undeclared `(named ...)` in a signature would
 /// silently render as `crate::Whatever` instead of being rejected.
-fn param_type_to_rust(
-    ty: &Type,
-    table: &TypeTable,
-    returns_boolean: bool,
-) -> Result<String, Error> {
+fn param_type_to_rust(ty: &Type, table: &TypeTable, borrowed: bool) -> Result<String, Error> {
     check_named_type(ty, table)?;
-    if borrowed_parameter(ty, table, returns_boolean) {
+    if borrowed {
         match ty {
             Type::String => Ok(String::from("&str")),
             Type::Bytes => Ok(String::from("&[u8]")),
@@ -939,10 +988,31 @@ fn param_type_to_rust(
     }
 }
 
-fn borrowed_parameter(ty: &Type, table: &TypeTable, returns_boolean: bool) -> bool {
+fn public_borrowed_parameter(ty: &Type, table: &TypeTable, returns_boolean: bool) -> bool {
     matches!(ty, Type::List(_))
         || matches!(ty, Type::Named(_)) && !copy_type(ty, table, &mut BTreeSet::new())
         || returns_boolean && matches!(ty, Type::String | Type::Bytes)
+}
+
+fn internal_borrowed_parameter(ty: &Type, table: &TypeTable, returns_copy: bool) -> bool {
+    public_borrowed_parameter(ty, table, false)
+        || returns_copy && !copy_type(ty, table, &mut BTreeSet::new())
+}
+
+fn needs_borrowed_helper(definition: &Definition, table: &TypeTable) -> bool {
+    let returns_copy = copy_type(&definition.ret, table, &mut BTreeSet::new());
+    definition.params.iter().any(|(_, ty)| {
+        internal_borrowed_parameter(ty, table, returns_copy)
+            != public_borrowed_parameter(ty, table, definition.ret == Type::Bool)
+    })
+}
+
+fn borrowed_helper_name(definition: &Definition, definitions: &[Definition]) -> String {
+    let mut candidate = format!("__prod_borrowed_{}", definition.name);
+    while definitions.iter().any(|row| row.name == candidate) {
+        candidate.push('_');
+    }
+    candidate
 }
 
 /// A `(named ...)` type occurring in a definition's signature must be
@@ -1177,7 +1247,11 @@ impl<'m> Renderer<'_, 'm> {
                     definition.params.get(index).map(|(_, ty)| {
                         (
                             ty,
-                            borrowed_parameter(ty, self.types, definition.ret == Type::Bool),
+                            internal_borrowed_parameter(
+                                ty,
+                                self.types,
+                                copy_type(&definition.ret, self.types, &mut BTreeSet::new()),
+                            ),
                         )
                     })
                 }) {
@@ -1199,6 +1273,15 @@ impl<'m> Renderer<'_, 'm> {
                 }
             })
             .collect()
+    }
+
+    fn call_name(&self, name: &str) -> String {
+        self.definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .filter(|definition| needs_borrowed_helper(definition, self.types))
+            .map(|definition| borrowed_helper_name(definition, self.definitions))
+            .unwrap_or_else(|| String::from(name))
     }
 
     /// Is this expression a list value (and therefore only renderable in
@@ -1320,13 +1403,14 @@ impl<'m> Renderer<'_, 'm> {
             },
             Expr::Call(name, args) => {
                 let rendered = self.render_call_args(name, args)?;
+                let call_name = self.call_name(name);
                 match (mode, self.shape_of(name)) {
                     (Mode::Builder { out, .. }, Some(Shape::Buffer)) => {
                         // The callee writes straight into our remaining buffer
                         // and reports how much of it it used.
                         let mut all = rendered;
                         all.push((*out).to_string());
-                        Ok(format!("{}({})", name, all.join(", ")))
+                        Ok(format!("{}({})", call_name, all.join(", ")))
                     }
                     (Mode::Builder { .. }, _) => Err(Error::UnsupportedList(format!(
                         "`{}` does not build its list into a caller buffer",
@@ -1337,9 +1421,9 @@ impl<'m> Renderer<'_, 'm> {
                         name
                     ))),
                     (Mode::Value, Some(Shape::Fallible)) => {
-                        Ok(format!("{}({})?", name, rendered.join(", ")))
+                        Ok(format!("{}({})?", call_name, rendered.join(", ")))
                     }
-                    (Mode::Value, _) => Ok(format!("{}({})", name, rendered.join(", "))),
+                    (Mode::Value, _) => Ok(format!("{}({})", call_name, rendered.join(", "))),
                 }
             }
 

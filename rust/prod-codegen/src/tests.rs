@@ -1172,6 +1172,69 @@ fn test_string_predicates_borrow_inputs_and_literals_without_allocating() {
 }
 
 #[test]
+fn test_copy_results_borrow_projected_owned_inputs() {
+    let ir = r#"
+(module M
+  (type "M.Row"
+    (ctor "M.Row.mk" (id String) (optional (Option String))))
+  (def count ((value String)) Nat 1)
+  (def optionalMember ((value (Option String))) Bool true)
+  (def validates ((row (named "M.Row"))) Bool
+    (let id (proj "M.Row" "id" row)
+      (let optional (proj "M.Row" "optional" row)
+        (if (eq (call count id) 1)
+            (call optionalMember optional)
+            false))))
+)
+"#;
+    let out = generate(ir);
+    assert!(out.contains("pub fn count(value: alloc::string::String) -> u64"));
+    assert!(out.contains("fn __prod_borrowed_count(value: &str) -> u64"));
+    assert!(out.contains("pub fn optionalMember(value: Option<alloc::string::String>) -> bool"));
+    assert!(out.contains(
+        "fn __prod_borrowed_optionalMember(value: &Option<alloc::string::String>) -> bool"
+    ));
+    assert!(
+        out.contains("__prod_borrowed_count((id).as_ref())"),
+        "{out}"
+    );
+    assert!(
+        out.contains("__prod_borrowed_optionalMember(&(optional))"),
+        "{out}"
+    );
+
+    let directory = std::env::temp_dir().join(std::format!(
+        "prod-codegen-copy-result-borrows-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("lib.rs");
+    let library = directory.join("libcopy_result_borrows.rlib");
+    std::fs::write(
+        &source,
+        std::format!(
+            r#"#![no_std]
+extern crate alloc;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeError {{ OutputTooSmall }}
+{out}
+"#
+        ),
+    )
+    .unwrap();
+    let compiled = std::process::Command::new("rustc")
+        .args(["--edition", "2021", "--crate-type", "lib"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .status()
+        .unwrap();
+    assert!(compiled.success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn test_generate_enum_from_multi_ctor_type() {
     let ir = r#"
 (module M

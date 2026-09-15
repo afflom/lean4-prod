@@ -1172,6 +1172,126 @@ fn test_string_predicates_borrow_inputs_and_literals_without_allocating() {
 }
 
 #[test]
+fn test_borrowed_constructor_fields_and_scalar_match_binders_execute() {
+    let ir = r#"
+(module M
+  (type "M.Source" (ctor "M.Source.mk" (bytes (List UInt8)) (name String)))
+  (type "M.Target" (ctor "M.Target.mk" (bytes (List UInt8)) (duplicate (List UInt8)) (name String)))
+  (type "M.Origin"
+    (ctor "M.Origin.local")
+    (ctor "M.Origin.inherited" (provider Nat) (evidence (List UInt8))))
+  (def copyFields ((source (named "M.Source"))) (named "M.Target")
+    (let bytes (proj "M.Source" "bytes" source)
+      (let alias bytes
+        (let name (proj "M.Source" "name" source)
+          (ctor "M.Target.mk" alias alias name)))))
+  (def nameAccessor ((source (named "M.Source"))) String
+    (let result (proj "M.Source" "name" source) result))
+  (def copyDirect ((source (named "M.Source"))) (named "M.Target")
+    (ctor "M.Target.mk" (proj "M.Source" "bytes" source)
+      (proj "M.Source" "bytes" source) (call nameAccessor source)))
+  (def copyIf ((source (named "M.Source")) (flag Bool)) (named "M.Target")
+    (let chosen (if flag (proj "M.Source" "bytes" source) (proj "M.Source" "bytes" source))
+      (ctor "M.Target.mk" chosen chosen (call nameAccessor source))))
+  (def copyMatch ((source (named "M.Source")) (flag Bool)) (named "M.Target")
+    (let chosen (cases flag
+      (alt "Bool.true" () (proj "M.Source" "bytes" source))
+      (alt "Bool.false" () (proj "M.Source" "bytes" source)))
+      (ctor "M.Target.mk" chosen chosen (call nameAccessor source))))
+  (def copyMixedIf ((source (named "M.Source")) (flag Bool)) (named "M.Target")
+    (let chosen (if flag (proj "M.Source" "bytes" source) (ctor "List.nil"))
+      (ctor "M.Target.mk" chosen chosen (call nameAccessor source))))
+  (def copyMixedMatch ((source (named "M.Source")) (flag Bool)) (named "M.Target")
+    (let chosen (cases flag
+      (alt "Bool.true" () (proj "M.Source" "bytes" source))
+      (alt "Bool.false" () (ctor "List.nil")))
+      (ctor "M.Target.mk" chosen chosen (call nameAccessor source))))
+  (def rebuild ((origin (named "M.Origin"))) (named "M.Origin")
+    (cases origin
+      (alt "M.Origin.local" () (ctor "M.Origin.local"))
+      (alt "M.Origin.inherited" (provider evidence)
+        (ctor "M.Origin.inherited" provider evidence))))
+  (def scalar ((number Nat)) Bool (eq number 7))
+  (def validates ((origin (named "M.Origin"))) Bool
+    (cases origin
+      (alt "M.Origin.local" () false)
+      (alt "M.Origin.inherited" (provider evidence) (call scalar provider))))
+)
+"#;
+    let out = generate(ir);
+    let predicate = out.split("pub fn validates").nth(1).unwrap();
+    assert!(!predicate.contains("ToOwned"));
+    assert!(!predicate.contains("evidence.clone()"));
+    let directory = loop {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let candidate = std::env::temp_dir().join(std::format!(
+            "prod-codegen-borrowed-constructors-{}-{nonce}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("cannot create isolated codegen regression directory: {error}"),
+        }
+    };
+    let source = directory.join("main.rs");
+    let executable = directory.join("borrowed-constructors");
+    std::fs::write(
+        &source,
+        std::format!(
+            r#"extern crate alloc;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeError {{ OutputTooSmall }}
+{out}
+fn main() {{
+    let source = Source {{ bytes: vec![1, 2, 3], name: String::from("source") }};
+    let target = copyFields(&source);
+    assert_eq!(target.bytes, source.bytes);
+    assert_eq!(target.duplicate, source.bytes);
+    assert_eq!(target.name, source.name);
+    assert_ne!(target.bytes.as_ptr(), source.bytes.as_ptr());
+    assert_ne!(target.bytes.as_ptr(), target.duplicate.as_ptr());
+    assert_eq!(copyDirect(&source), target);
+    for flag in [false, true] {{
+        assert_eq!(copyIf(&source, flag), target);
+        assert_eq!(copyMatch(&source, flag), target);
+        let expected = if flag {{ source.bytes.clone() }} else {{ vec![] }};
+        assert_eq!(copyMixedIf(&source, flag).bytes, expected);
+        assert_eq!(copyMixedMatch(&source, flag).bytes, expected);
+    }}
+    let inherited = Origin::inherited {{ provider: 7, evidence: vec![9] }};
+    assert_eq!(rebuild(&inherited), inherited);
+    assert!(validates(&Origin::inherited {{ provider: 7, evidence: vec![9] }}));
+    assert!(!validates(&Origin::inherited {{ provider: 8, evidence: vec![9] }}));
+    assert!(!validates(&Origin::local));
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let compiled = std::process::Command::new("rustc")
+        .args(["--edition", "2021"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        std::string::String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(std::process::Command::new(&executable)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn test_copy_results_borrow_projected_owned_inputs() {
     let ir = r#"
 (module M

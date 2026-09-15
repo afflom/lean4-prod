@@ -647,6 +647,13 @@ fn expression_is_non_copy(
             expression_is_non_copy(then_value, definitions, table, non_copy_locals)
                 || expression_is_non_copy(else_value, definitions, table, non_copy_locals)
         }
+        Expr::Match { alts, default, .. } => {
+            alts.iter()
+                .any(|alt| expression_is_non_copy(&alt.body, definitions, table, non_copy_locals))
+                || default.as_ref().is_some_and(|value| {
+                    expression_is_non_copy(value, definitions, table, non_copy_locals)
+                })
+        }
         _ => false,
     }
 }
@@ -747,6 +754,106 @@ fn inline_bindings(expr: &Expr) -> BTreeMap<String, &Expr> {
     output
 }
 
+/// Whether value-mode rendering borrows an existing owner. This is separate
+/// from non-Copy analysis: an owned constructor must copy a borrowed field even
+/// when it uses that field only once, while predicates must keep borrowing.
+fn expression_is_borrowed(
+    expr: &Expr,
+    definitions: &[Definition],
+    table: &TypeTable<'_>,
+    locals: &BTreeSet<String>,
+) -> bool {
+    match expr {
+        Expr::Var(name) => locals.contains(name),
+        Expr::Proj(..) => expression_is_non_copy(expr, definitions, table, &BTreeSet::new()),
+        Expr::Call(name, _) => definitions
+            .iter()
+            .find(|definition| definition.name == *name)
+            .is_some_and(|definition| {
+                returns_borrowed_projection(&definition.body, &definition.ret, table)
+                    || definition.params.is_empty() && matches!(definition.ret, Type::List(_))
+            }),
+        Expr::Let(_, _, body) => expression_is_borrowed(body, definitions, table, locals),
+        Expr::If(_, then_value, else_value) => {
+            expression_is_borrowed(then_value, definitions, table, locals)
+                && expression_is_borrowed(else_value, definitions, table, locals)
+        }
+        Expr::Match { alts, default, .. } => {
+            (!alts.is_empty() || default.is_some())
+                && alts
+                    .iter()
+                    .all(|alt| expression_is_borrowed(&alt.body, definitions, table, locals))
+                && default
+                    .as_ref()
+                    .is_none_or(|value| expression_is_borrowed(value, definitions, table, locals))
+        }
+        _ => false,
+    }
+}
+
+fn borrowed_locals(
+    definition: &Definition,
+    definitions: &[Definition],
+    table: &TypeTable<'_>,
+) -> BTreeSet<String> {
+    fn walk(
+        expr: &Expr,
+        definitions: &[Definition],
+        table: &TypeTable<'_>,
+        locals: &mut BTreeSet<String>,
+    ) {
+        match expr {
+            Expr::Let(name, value, body) => {
+                walk(value, definitions, table, locals);
+                if expression_is_borrowed(value, definitions, table, locals) {
+                    locals.insert(name.clone());
+                }
+                walk(body, definitions, table, locals);
+            }
+            Expr::Match {
+                scrut,
+                alts,
+                default,
+            } => {
+                walk(scrut, definitions, table, locals);
+                let borrowed = expression_is_borrowed(scrut, definitions, table, locals);
+                for alt in alts {
+                    if borrowed {
+                        if let Some(constructor) = table.values().find_map(|declaration| {
+                            declaration.ctors.iter().find(|row| row.name == alt.ctor)
+                        }) {
+                            for ((_, ty), binder) in constructor.fields.iter().zip(&alt.binders) {
+                                // Copy fields are rebound by value in render_match.
+                                if !copy_type(ty, table, &mut BTreeSet::new()) {
+                                    locals.insert(binder.clone());
+                                }
+                            }
+                        }
+                    }
+                    walk(&alt.body, definitions, table, locals);
+                }
+                if let Some(default) = default {
+                    walk(default, definitions, table, locals);
+                }
+            }
+            _ => {
+                for child in expr.children() {
+                    walk(child, definitions, table, locals);
+                }
+            }
+        }
+    }
+    let returns_copy = copy_type(&definition.ret, table, &mut BTreeSet::new());
+    let mut locals = definition
+        .params
+        .iter()
+        .filter(|(_, ty)| internal_borrowed_parameter(ty, table, returns_copy))
+        .map(|(name, _)| name.clone())
+        .collect();
+    walk(&definition.body, definitions, table, &mut locals);
+    locals
+}
+
 fn generate_def_in<'m>(
     def: &'m Definition,
     definitions: &'m [Definition],
@@ -779,6 +886,7 @@ fn generate_def_in<'m>(
             returns_copy,
         ),
         inline_values: inline_bindings(&def.body),
+        borrowed_locals: borrowed_locals(def, definitions, table),
     };
 
     let mut params = String::new();
@@ -1159,11 +1267,25 @@ struct Renderer<'s, 'm> {
     /// Closed polymorphic empty constructors cannot share one inferred Rust
     /// local across differently monomorphized uses.
     inline_values: BTreeMap<String, &'m Expr>,
+    /// Locals that borrow a field/parameter rather than owning its value.
+    borrowed_locals: BTreeSet<String>,
 }
 
 impl<'m> Renderer<'_, 'm> {
     fn value(&self, expr: &'m Expr) -> Result<String, Error> {
         self.render(expr, &Mode::Value)
+    }
+
+    fn owned_value(&self, expr: &'m Expr) -> Result<String, Error> {
+        let rendered = self.value(expr)?;
+        if expression_is_borrowed(expr, self.definitions, self.types, &self.borrowed_locals) {
+            // Use the fully qualified alloc trait: generated no_std modules
+            // need no extra imports. This also turns borrowed str/slices into
+            // their owned String/Vec representation at this owned boundary.
+            Ok(format!("alloc::borrow::ToOwned::to_owned({rendered})"))
+        } else {
+            Ok(rendered)
+        }
     }
 
     fn resolved_inline(&self, expr: &'m Expr) -> &'m Expr {
@@ -1269,6 +1391,7 @@ impl<'m> Renderer<'_, 'm> {
                         let rendered = self.value(argument)?;
                         Ok(format!("&({rendered})"))
                     }
+                    Some((_, false)) => self.owned_value(argument),
                     _ => self.value(argument),
                 }
             })
@@ -1310,6 +1433,29 @@ impl<'m> Renderer<'_, 'm> {
     fn render(&self, expr: &'m Expr, mode: &Mode<'_, 'm>) -> Result<String, Error> {
         match expr {
             // ---- control flow: identical in both modes ----
+            Expr::If(cond, t, f)
+                if matches!(mode, Mode::Value)
+                    && expression_is_borrowed(
+                        t,
+                        self.definitions,
+                        self.types,
+                        &self.borrowed_locals,
+                    ) != expression_is_borrowed(
+                        f,
+                        self.definitions,
+                        self.types,
+                        &self.borrowed_locals,
+                    ) =>
+            {
+                // Rust branches must agree on ownership. Keep a borrowed
+                // result when both arms borrow; a mixed result owns both arms.
+                Ok(format!(
+                    "if {} {{ {} }} else {{ {} }}",
+                    self.value(cond)?,
+                    self.owned_value(t)?,
+                    self.owned_value(f)?
+                ))
+            }
             Expr::If(cond, t, f) => Ok(format!(
                 "if {} {{ {} }} else {{ {} }}",
                 self.value(cond)?,
@@ -1396,7 +1542,9 @@ impl<'m> Renderer<'_, 'm> {
                         name
                     ))),
                 },
-                Mode::Value if self.clone_locals.contains(name) => {
+                Mode::Value
+                    if self.clone_locals.contains(name) && !self.borrowed_locals.contains(name) =>
+                {
                     Ok(format!("{}.clone()", rust_local_ident(name)))
                 }
                 Mode::Value => Ok(rust_local_ident(name)),
@@ -1623,7 +1771,8 @@ impl<'m> Renderer<'_, 'm> {
             Expr::Le(a, b) => self.binop(a, b, "<="),
             Expr::Gt(a, b) => self.binop(a, b, ">"),
             Expr::Ctor(name, args) => {
-                let args = self.render_args(args)?;
+                let args = args.iter().map(|argument| self.owned_value(argument))
+                    .collect::<Result<Vec<_>, _>>()?;
                 if name == "Prod.mk" {
                     Ok(format!("({})", args.join(", ")))
                 } else if name == "Bool.true" && args.is_empty() {
@@ -1793,10 +1942,27 @@ impl<'m> Renderer<'_, 'm> {
         mode: &Mode<'_, 'm>,
     ) -> Result<String, Error> {
         let head_is_copy = self.list_head_is_copy(scrut);
+        let scrut_is_borrowed =
+            expression_is_borrowed(scrut, self.definitions, self.types, &self.borrowed_locals);
+        let branch_borrows = alts
+            .iter()
+            .map(|alt| &alt.body)
+            .chain(default)
+            .map(|body| {
+                expression_is_borrowed(body, self.definitions, self.types, &self.borrowed_locals)
+            })
+            .collect::<Vec<_>>();
+        let normalize_results = matches!(mode, Mode::Value)
+            && branch_borrows.iter().any(|borrowed| *borrowed)
+            && branch_borrows.iter().any(|borrowed| !borrowed);
         let scrut = self.value(scrut)?;
         let mut out = format!("match {} {{\n", scrut);
         for alt in alts {
-            let body = self.render(&alt.body, mode)?;
+            let body = if normalize_results {
+                self.owned_value(&alt.body)?
+            } else {
+                self.render(&alt.body, mode)?
+            };
             let arm = match (alt.ctor.as_str(), alt.binders.len()) {
                 // LCNF structural recursion on Nat cases: `Nat.zero` is the
                 // literal `0`; `Nat.succ k` binds the predecessor. Since the
@@ -1862,15 +2028,37 @@ impl<'m> Renderer<'_, 'm> {
                             format!("        {} => {},\n", path, body)
                         } else {
                             let mut bound = Vec::with_capacity(alt.binders.len());
-                            for ((field, _), binder) in cdecl.fields.iter().zip(alt.binders.iter())
+                            let mut copies = String::new();
+                            for ((field, ty), binder) in cdecl.fields.iter().zip(alt.binders.iter())
                             {
                                 bound.push(format!(
                                     "{}: {}",
                                     rust_ident(field),
                                     rust_local_ident(binder)
                                 ));
+                                if scrut_is_borrowed
+                                    && copy_type(ty, self.types, &mut BTreeSet::new())
+                                {
+                                    let binder = rust_local_ident(binder);
+                                    copies.push_str(&format!("let {binder} = {binder}.clone(); "));
+                                }
                             }
-                            format!("        {} {{ {} }} => {},\n", path, bound.join(", "), body)
+                            if copies.is_empty() {
+                                format!(
+                                    "        {} {{ {} }} => {},\n",
+                                    path,
+                                    bound.join(", "),
+                                    body
+                                )
+                            } else {
+                                format!(
+                                    "        {} {{ {} }} => {{ {}{} }},\n",
+                                    path,
+                                    bound.join(", "),
+                                    copies,
+                                    body
+                                )
+                            }
                         }
                     }
                     // Declared, but the alt's binder count does not match the
@@ -1906,7 +2094,12 @@ impl<'m> Renderer<'_, 'm> {
             out.push_str(&arm);
         }
         if let Some(d) = default {
-            out.push_str(&format!("        _ => {},\n", self.render(d, mode)?));
+            let body = if normalize_results {
+                self.owned_value(d)?
+            } else {
+                self.render(d, mode)?
+            };
+            out.push_str(&format!("        _ => {},\n", body));
         }
         out.push_str("    }");
         Ok(out)
@@ -1943,10 +2136,6 @@ impl<'m> Renderer<'_, 'm> {
                 "zero-argument list definitions must be constant cons chains".to_string(),
             )),
         }
-    }
-
-    fn render_args(&self, args: &'m [Expr]) -> Result<Vec<String>, Error> {
-        args.iter().map(|a| self.value(a)).collect()
     }
 
     fn binop(&self, a: &'m Expr, b: &'m Expr, op: &str) -> Result<String, Error> {

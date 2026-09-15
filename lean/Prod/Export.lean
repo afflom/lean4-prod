@@ -39,6 +39,14 @@ def collectTypeDecls (ctx : LowerCtx) (extracted : Array ExtractedDef)
         if !isPortableBuiltinTypeName n && !wanted.contains n then
           if (env.find? n).isSome then
             wanted := wanted.push n
+  let mut cursor := 0
+  while cursor < wanted.size do
+    let typeName := wanted[cursor]!
+    cursor := cursor + 1
+    let (dependencies, _) ← (((typeDeclTypeNames env typeName).run ctx).run {})
+    for dependency in dependencies do
+      if !isPortableBuiltinTypeName dependency && !wanted.contains dependency then
+        wanted := wanted.push dependency
   let sorted := wanted.qsort fun a b => Name.quickCmp a b == .lt
   let mut out : Array String := #[]
   for n in sorted do
@@ -167,6 +175,13 @@ def namedClosure (roots : Array Name) : CoreM (Array Name × Array Name) := do
       let some dependencyInfo := env.find? dependency | continue
       if dependencyInfo.isTheorem then
         erased := erased.push dependency
+        continue
+      -- Structure field projections are lowered from `LCNF.Projection` nodes
+      -- using the owning type declaration. They are not callable source
+      -- definitions: exporting `Artifact.id`, `Component.id`, and every other
+      -- same-spelled field as free functions would collide in Rust and would
+      -- duplicate the projection already present in the expression IR.
+      if env.isProjectionFn dependency then
         continue
       -- Compiler-generated equation/matcher helpers are internal details of
       -- the owning declaration. The LCNF simplifier internalizes them while

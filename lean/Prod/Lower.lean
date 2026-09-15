@@ -641,4 +641,33 @@ def declTypeNames (env : Environment) (d : Decl .pure) : Array Name := Id.run do
   | .code c => return out ++ codeTypeNames env c
   | _ => return out
 
+/-- User inductive types referenced by the constructor signatures of a named
+    type. This is the edge relation for the transitive generated-type graph:
+    a structure field such as `List Child` must pull `Child` into the IR even
+    when no exported function mentions `Child` directly. -/
+def typeDeclTypeNames (env : Environment) (typeName : Name) : LowerM (Array Name) := do
+  let mut out : Array Name := #[]
+  let some (.inductInfo inductiveInfo) := env.find? typeName | return out
+  if inductiveInfo.numParams != 0 || inductiveInfo.numIndices != 0 ||
+      inductiveInfo.all.length != 1 || inductiveInfo.isRec then
+    return out
+  for ctorName in inductiveInfo.ctors do
+    let some (.ctorInfo ctor) := env.find? ctorName | continue
+    let mut ty := ctor.type
+    let mut index := 0
+    while index < ctor.numFields do
+      match ty with
+      | .forallE _ fieldTy rest _ =>
+        if !(← isPropType fieldTy) then
+          for dependency in fieldTy.getUsedConstants do
+            match env.find? dependency with
+            | some (.inductInfo _) =>
+              if !out.contains dependency then
+                out := out.push dependency
+            | _ => pure ()
+        ty := rest
+        index := index + 1
+      | _ => index := ctor.numFields
+  return out
+
 end Prod

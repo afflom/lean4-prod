@@ -944,10 +944,10 @@ fn test_cyclic_join_point_is_rejected() {
 }
 
 #[test]
-fn test_multi_caller_join_point_is_rejected() {
-    // Two `jmp` sites for one `jp`. LCNF produces this from something as
-    // ordinary as a `match` whose arms both feed a shared continuation, so it
-    // is not an exotic corner — see `Conformance.c_ctor_body_only`.
+fn test_multi_caller_acyclic_join_point_is_inlined_at_every_jump() {
+    // LCNF produces this shape when multiple match arms feed one pure
+    // continuation. Each branch gets its own parameter binding and checked
+    // addition, with no runtime allocation or unbound join parameter.
     let ir = r#"
 (module M
   (def f ((c Nat) (x Nat)) Nat
@@ -955,10 +955,11 @@ fn test_multi_caller_join_point_is_rejected() {
       (if (lt c 1) (jmp g x) (jmp g c))))
 )
 "#;
-    assert_eq!(
-        generate_err(ir),
-        Error::UnsupportedJoinPoint("g".to_string())
-    );
+    let out = generate(ir);
+    assert_eq!(out.matches("let a =").count(), 2);
+    assert_eq!(out.matches("checked_add(1)").count(), 2);
+    assert!(out.contains("let a = x"));
+    assert!(out.contains("let a = c"));
 }
 
 #[test]
@@ -1090,6 +1091,267 @@ fn test_generate_struct_from_single_ctor_type() {
         "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n"
     ));
     assert!(out.contains("pub fn stride(i: crate::Instance) -> u64 {"));
+}
+
+#[test]
+fn test_shared_owned_lcnf_values_are_cloned_for_record_fields_and_compile() {
+    let ir = r#"
+(module M
+  (type "M.Bundle"
+    (ctor "M.Bundle.mk"
+      (left String)
+      (right String)
+      (first (List Nat))
+      (second (List Nat))
+      (names (List String))))
+  (def shared () (named "M.Bundle")
+    (let text (string "shared")
+      (let empty (ctor "List.nil")
+        (let values (ctor "List.cons" 7 empty)
+          (ctor "M.Bundle.mk" text text values values empty)))))
+)
+"#;
+    let out = generate(ir);
+    assert_eq!(
+        out.matches("alloc::string::String::from(\"shared\")")
+            .count(),
+        2
+    );
+    assert_eq!(out.matches("values.clone()").count(), 2);
+    assert!(!out.contains("let empty ="));
+
+    // Parsing generated text is insufficient for ownership defects: the old
+    // output was valid Rust syntax but moved the same String/Vec twice.
+    let directory = std::env::temp_dir().join(std::format!(
+        "prod-codegen-shared-owned-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("lib.rs");
+    let library = directory.join("libshared_owned.rlib");
+    std::fs::write(
+        &source,
+        std::format!(
+            r#"#![no_std]
+extern crate alloc;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeError {{ OutputTooSmall }}
+{out}
+"#
+        ),
+    )
+    .unwrap();
+    let compiled = std::process::Command::new("rustc")
+        .args(["--edition", "2021", "--crate-type", "lib"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .status()
+        .unwrap();
+    assert!(compiled.success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn test_string_predicates_borrow_inputs_and_literals_without_allocating() {
+    let ir = r#"
+(module M
+  (def equalsToken ((value String)) Bool
+    (eq value (string "token")))
+  (def delegates ((value String)) Bool
+    (call equalsToken value))
+)
+"#;
+    let out = generate(ir);
+    assert!(out.contains("pub fn equalsToken(value: &str) -> bool"));
+    assert!(out.contains("value == \"token\""));
+    assert!(out.contains("pub fn delegates(value: &str) -> bool"));
+    assert!(out.contains("equalsToken((value).as_ref())"));
+    assert!(!out.contains("alloc::string::String::from(\"token\")"));
+}
+
+#[test]
+fn test_borrowed_constructor_fields_and_scalar_match_binders_execute() {
+    let ir = r#"
+(module M
+  (type "M.Source" (ctor "M.Source.mk" (bytes (List UInt8)) (name String)))
+  (type "M.Target" (ctor "M.Target.mk" (bytes (List UInt8)) (duplicate (List UInt8)) (name String)))
+  (type "M.Origin"
+    (ctor "M.Origin.local")
+    (ctor "M.Origin.inherited" (provider Nat) (evidence (List UInt8))))
+  (def copyFields ((source (named "M.Source"))) (named "M.Target")
+    (let bytes (proj "M.Source" "bytes" source)
+      (let alias bytes
+        (let name (proj "M.Source" "name" source)
+          (ctor "M.Target.mk" alias alias name)))))
+  (def nameAccessor ((source (named "M.Source"))) String
+    (let result (proj "M.Source" "name" source) result))
+  (def copyDirect ((source (named "M.Source"))) (named "M.Target")
+    (ctor "M.Target.mk" (proj "M.Source" "bytes" source)
+      (proj "M.Source" "bytes" source) (call nameAccessor source)))
+  (def copyIf ((source (named "M.Source")) (flag Bool)) (named "M.Target")
+    (let chosen (if flag (proj "M.Source" "bytes" source) (proj "M.Source" "bytes" source))
+      (ctor "M.Target.mk" chosen chosen (call nameAccessor source))))
+  (def copyMatch ((source (named "M.Source")) (flag Bool)) (named "M.Target")
+    (let chosen (cases flag
+      (alt "Bool.true" () (proj "M.Source" "bytes" source))
+      (alt "Bool.false" () (proj "M.Source" "bytes" source)))
+      (ctor "M.Target.mk" chosen chosen (call nameAccessor source))))
+  (def copyMixedIf ((source (named "M.Source")) (flag Bool)) (named "M.Target")
+    (let chosen (if flag (proj "M.Source" "bytes" source) (ctor "List.nil"))
+      (ctor "M.Target.mk" chosen chosen (call nameAccessor source))))
+  (def copyMixedMatch ((source (named "M.Source")) (flag Bool)) (named "M.Target")
+    (let chosen (cases flag
+      (alt "Bool.true" () (proj "M.Source" "bytes" source))
+      (alt "Bool.false" () (ctor "List.nil")))
+      (ctor "M.Target.mk" chosen chosen (call nameAccessor source))))
+  (def rebuild ((origin (named "M.Origin"))) (named "M.Origin")
+    (cases origin
+      (alt "M.Origin.local" () (ctor "M.Origin.local"))
+      (alt "M.Origin.inherited" (provider evidence)
+        (ctor "M.Origin.inherited" provider evidence))))
+  (def scalar ((number Nat)) Bool (eq number 7))
+  (def validates ((origin (named "M.Origin"))) Bool
+    (cases origin
+      (alt "M.Origin.local" () false)
+      (alt "M.Origin.inherited" (provider evidence) (call scalar provider))))
+)
+"#;
+    let out = generate(ir);
+    let predicate = out.split("pub fn validates").nth(1).unwrap();
+    assert!(!predicate.contains("ToOwned"));
+    assert!(!predicate.contains("evidence.clone()"));
+    let directory = loop {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let candidate = std::env::temp_dir().join(std::format!(
+            "prod-codegen-borrowed-constructors-{}-{nonce}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("cannot create isolated codegen regression directory: {error}"),
+        }
+    };
+    let source = directory.join("main.rs");
+    let executable = directory.join("borrowed-constructors");
+    std::fs::write(
+        &source,
+        std::format!(
+            r#"extern crate alloc;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeError {{ OutputTooSmall }}
+{out}
+fn main() {{
+    let source = Source {{ bytes: vec![1, 2, 3], name: String::from("source") }};
+    let target = copyFields(&source);
+    assert_eq!(target.bytes, source.bytes);
+    assert_eq!(target.duplicate, source.bytes);
+    assert_eq!(target.name, source.name);
+    assert_ne!(target.bytes.as_ptr(), source.bytes.as_ptr());
+    assert_ne!(target.bytes.as_ptr(), target.duplicate.as_ptr());
+    assert_eq!(copyDirect(&source), target);
+    for flag in [false, true] {{
+        assert_eq!(copyIf(&source, flag), target);
+        assert_eq!(copyMatch(&source, flag), target);
+        let expected = if flag {{ source.bytes.clone() }} else {{ vec![] }};
+        assert_eq!(copyMixedIf(&source, flag).bytes, expected);
+        assert_eq!(copyMixedMatch(&source, flag).bytes, expected);
+    }}
+    let inherited = Origin::inherited {{ provider: 7, evidence: vec![9] }};
+    assert_eq!(rebuild(&inherited), inherited);
+    assert!(validates(&Origin::inherited {{ provider: 7, evidence: vec![9] }}));
+    assert!(!validates(&Origin::inherited {{ provider: 8, evidence: vec![9] }}));
+    assert!(!validates(&Origin::local));
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let compiled = std::process::Command::new("rustc")
+        .args(["--edition", "2021"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        std::string::String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(std::process::Command::new(&executable)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn test_copy_results_borrow_projected_owned_inputs() {
+    let ir = r#"
+(module M
+  (type "M.Row"
+    (ctor "M.Row.mk" (id String) (optional (Option String))))
+  (def count ((value String)) Nat 1)
+  (def optionalMember ((value (Option String))) Bool true)
+  (def validates ((row (named "M.Row"))) Bool
+    (let id (proj "M.Row" "id" row)
+      (let optional (proj "M.Row" "optional" row)
+        (if (eq (call count id) 1)
+            (call optionalMember optional)
+            false))))
+)
+"#;
+    let out = generate(ir);
+    assert!(out.contains("pub fn count(value: alloc::string::String) -> u64"));
+    assert!(out.contains("fn __prod_borrowed_count(value: &str) -> u64"));
+    assert!(out.contains("pub fn optionalMember(value: Option<alloc::string::String>) -> bool"));
+    assert!(out.contains(
+        "fn __prod_borrowed_optionalMember(value: &Option<alloc::string::String>) -> bool"
+    ));
+    assert!(
+        out.contains("__prod_borrowed_count((id).as_ref())"),
+        "{out}"
+    );
+    assert!(
+        out.contains("__prod_borrowed_optionalMember(&(optional))"),
+        "{out}"
+    );
+
+    let directory = std::env::temp_dir().join(std::format!(
+        "prod-codegen-copy-result-borrows-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("lib.rs");
+    let library = directory.join("libcopy_result_borrows.rlib");
+    std::fs::write(
+        &source,
+        std::format!(
+            r#"#![no_std]
+extern crate alloc;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeError {{ OutputTooSmall }}
+{out}
+"#
+        ),
+    )
+    .unwrap();
+    let compiled = std::process::Command::new("rustc")
+        .args(["--edition", "2021", "--crate-type", "lib"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .status()
+        .unwrap();
+    assert!(compiled.success());
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

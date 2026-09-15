@@ -223,9 +223,14 @@ pub fn generate_cargo_package(
         root_dependencies,
         dependency_packages,
     );
-    let source = format!(
+    let mut source = format!(
         "#![cfg_attr(not(feature = \"std\"), no_std)]\n#![allow(dead_code, non_snake_case, unused_parens, unused_variables)]\nextern crate alloc;\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum ComputeError {{\n    AddOverflow,\n    MulOverflow,\n    ShiftExponentTooLarge,\n    ShiftOverflow,\n    PowExponentTooLarge,\n    PowOverflow,\n    OutputTooSmall,\n}}\n\n{generated}"
     );
+    // Module rendering separates declarations with blank lines. The complete
+    // package file has exactly one final newline, including for empty modules;
+    // normalize before the file hashes below bind its published bytes.
+    source.truncate(source.trim_end_matches('\n').len());
+    source.push('\n');
 
     let mut files = vec![
         file("Cargo.lock", lock),

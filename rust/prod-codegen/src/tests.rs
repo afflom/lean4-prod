@@ -75,6 +75,36 @@ fn test_generate_publishable_cargo_package_is_closed_and_deterministic() {
     assert!(generation.contains(
         "\"dependencies\":[{\"checksum\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"default_features\":false,\"features\":[],\"name\":\"generated-runtime\",\"version\":\"0.1.0\"}]"
     ));
+    // The package boundary owns canonical source termination, including empty
+    // modules. Its manifest must hash the final bytes, not the pre-normalized
+    // module output. Caller-owned license/readme bytes must remain untouched.
+    for ir in [
+        "(module Empty)",
+        "(module Single (def value () Bool true))",
+        "(module Multiple (def first () Bool true) (def second () Bool false))",
+    ] {
+        use sha2::{Digest, Sha256};
+
+        let (_, module) = parse_module(ir).unwrap();
+        let package = generate_cargo_package(&module, &spec).unwrap();
+        let source = package_file(&package, "src/lib.rs");
+        assert!(source.ends_with(b"}\n"), "{ir}: noncanonical source EOF");
+        let digest = format!("{:x}", Sha256::digest(source));
+        let generation =
+            core::str::from_utf8(package_file(&package, "generation-manifest.json")).unwrap();
+        assert!(generation.contains(&format!(
+            "{{\"path\":\"src/lib.rs\",\"sha256\":\"{digest}\"}}"
+        )));
+        assert_eq!(
+            package_file(&package, "LICENSE-MIT"),
+            spec.license_mit.as_bytes()
+        );
+        assert_eq!(
+            package_file(&package, "LICENSE-APACHE"),
+            spec.license_apache.as_bytes()
+        );
+        assert_eq!(package_file(&package, "README.md"), spec.readme.as_bytes());
+    }
 }
 
 #[test]

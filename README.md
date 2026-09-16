@@ -323,6 +323,92 @@ command fails. Those composite values need an explicit buffer/ownership and
 layout contract before they can safely cross a C ABI. The header and wrapper
 are generated artifacts; do not hand-edit either file.
 
+## Closed byte literals
+
+The portable `Bytes` ABI also accepts closed Lean `ByteArray` literals, including
+empty data and non-UTF-8 bytes. The lowerer folds only the typed
+`Array UInt8` literal construction chain consumed by `ByteArray.mk` into a
+`(bytes 0 128 255)` IR leaf. Arbitrary runtime Arrays and dynamic byte-array
+construction remain rejected; this does not widen the Array language subset.
+Owned literal results use the existing `Vec<u8>` ABI and materialize once at
+that boundary. Borrowed literal comparisons and calls use static byte slices.
+`just portable-package` executes literal returns, nested branches, append and
+decode-then-reuse in both `std` and `no_std + alloc`, alongside rejection probes.
+
+Composition through byte-length wrappers accepts the typed `ByteArray.size`
+builtin. Specialized byte append is recognized only from Lean's complete
+retained mono-LCNF body: copy all of the right input to the end of the left
+input, with no other computation or control flow. This is not general
+`ByteArray.copySlice` support. Altered copy operands, additional work, and
+unknown callable runtime helpers fail closed; runtime namespace membership
+does not authorize replacing semantic results with erased dictionary values.
+
+## Closed text Views
+
+`prod_codegen::generate_text_view_v1(&TextViewV1, &TextBrowserAdapterBinding)`
+projects `prism.text-view/1` into a browser wasm-bindgen adapter and a Hologram
+intent View. The original `generate_view_v1` numeric projection retains its
+modeled arithmetic and byte protocol; its generated assets also enforce the
+initialization privacy contract described below.
+The seven modeled strings are title, heading, input label, submit label, output
+label, input error and response error; none accepts markup, callbacks or URLs.
+Positive `u32` input/output caps count UTF-8 bytes, not characters. Empty request
+and response values are permitted. Metadata also binds the model, View model
+and generated core SHA-256 identities.
+
+The browser adapter exports `invoke_bytes`, forwards owned bytes to the named
+generated `Vec<u8> -> Vec<u8>` core function, and validates UTF-8 and copy limits.
+It uses exact js-sys 0.3.99 and wasm-bindgen 0.2.122 dependencies. It does not
+parse application documents or implement application semantics. The core's own
+execution and allocation limits remain obligations of its authoritative model:
+checking a returned byte length cannot prevent an allocation already made by
+that core. Likewise, browser/network internals may allocate before delivering
+their bounded inputs to the adapter.
+
+Hologram uses the existing `application.invoke` intent envelope and displays its
+single text output without domain parsing. Its transport JSON is streamed and
+bounded to `6 * max_output_bytes + 256` bytes before parsing, allowing JSON's
+worst-case string escaping plus bounded envelope overhead. Browser input rejects
+unpaired UTF-16 before encoding; both transports reject malformed UTF-8 rather
+than replacing it. A leading U+FEFF remains application data. Output uses
+`textContent` and a labeled polite live region. Invalid input receives focus;
+Ctrl/Command+Enter submits a multiline request without consuming ordinary Enter
+or IME composition. Native form controls retain their normal keyboard behavior.
+Native form navigation is never an application transport: both projections emit
+an early CSP `form-action 'none'` policy, omit a successful named draft field,
+and keep submit disabled until the cancellation handler is installed. The
+modeled response-error text is present without JavaScript and is cleared only
+after transport initialization succeeds, without erasing newer input errors.
+Browser binding modules load through a caught dynamic import; failed module or
+Wasm initialization cannot fall back to sending draft content in a URL.
+
+The closed `lean4-prod/text-view-projection/1` manifest hashes both three-file
+projections, the exact HOLOVIEW v1 bundle and the complete browser adapter file
+set. `lean4-prod/text-browser-adapter/1` separately binds its core dependency,
+entrypoint, caps, identities and generated files. Neither changes Holo/1.
+
+`just text-view` (included in `just ci`) checks deterministic generation and exact
+manifest/bundle closure, executes generated JavaScript against controlled DOM
+and transport ports, then compiles and executes real generated Wasm probes for
+echo, invalid UTF-8 output and output overflow. The DOM harness tests focus,
+keyboard, concurrency and failures; it is not a browser layout test. The normal
+gate also runs actual Chromium over the exact generated assets and compiled
+Wasm, checking disabled JavaScript, blocked application/binding modules, native
+submission blocked independently of button state, delayed initialization,
+keyboard recovery, invalid responses and absence of draft network/navigation
+leaks. The compiler devcontainer owns locked Playwright 1.62.1 and its Chromium
+revision; missing browser tools fail the gate. These synthetic IR fixtures test
+compiler transport behavior, not application proofs.
+
+`just view` also runs eight real Chromium cases over the generated numeric
+View and its compiled fixture Wasm. Both numeric projections prohibit native
+form navigation with their own early CSP, omit named operand/operation fields,
+and enable submit only after cancellation is installed. The modeled input-error
+text is the no-JavaScript/initialization-failure fallback; a caught dynamic
+binding import lets pending submissions wait locally for Wasm without losing
+input. These security changes intentionally change numeric View asset bytes,
+not arithmetic or the generated core.
+
 ## Roots (proof-graph analysis)
 
 Every theorem is a root. `Roots.lean` exports each root's dependency edges,

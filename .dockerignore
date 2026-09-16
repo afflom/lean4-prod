@@ -1,0 +1,8 @@
+# The devcontainer image only copies its pinned browser-tool manifests.
+**
+!.devcontainer/
+!.devcontainer/Dockerfile
+!scripts/
+!scripts/browser-tests/
+!scripts/browser-tests/package.json
+!scripts/browser-tests/package-lock.json

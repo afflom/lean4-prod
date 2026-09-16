@@ -57,5 +57,7 @@ wasm="$adapter/target/wasm32-unknown-unknown/release/fixture_browser_adapter.was
 test -f "$scratch/web/fixture.js"
 test -f "$scratch/web/fixture_bg.wasm"
 grep -F 'export function calculate' "$scratch/web/fixture.js" >/dev/null
+"$CARGO_HOME/bin/wasm-bindgen" --target web --out-dir "$first/browser" --out-name fixture_core "$wasm"
+node "$fixture/view_browser_test.mjs" "$first/browser"
 
 echo "Foundation.View.V1 generation, reproducibility, adapter, and Wasm checks passed"

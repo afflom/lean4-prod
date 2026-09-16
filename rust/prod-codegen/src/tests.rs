@@ -75,6 +75,36 @@ fn test_generate_publishable_cargo_package_is_closed_and_deterministic() {
     assert!(generation.contains(
         "\"dependencies\":[{\"checksum\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"default_features\":false,\"features\":[],\"name\":\"generated-runtime\",\"version\":\"0.1.0\"}]"
     ));
+    // The package boundary owns canonical source termination, including empty
+    // modules. Its manifest must hash the final bytes, not the pre-normalized
+    // module output. Caller-owned license/readme bytes must remain untouched.
+    for ir in [
+        "(module Empty)",
+        "(module Single (def value () Bool true))",
+        "(module Multiple (def first () Bool true) (def second () Bool false))",
+    ] {
+        use sha2::{Digest, Sha256};
+
+        let (_, module) = parse_module(ir).unwrap();
+        let package = generate_cargo_package(&module, &spec).unwrap();
+        let source = package_file(&package, "src/lib.rs");
+        assert!(source.ends_with(b"}\n"), "{ir}: noncanonical source EOF");
+        let digest = format!("{:x}", Sha256::digest(source));
+        let generation =
+            core::str::from_utf8(package_file(&package, "generation-manifest.json")).unwrap();
+        assert!(generation.contains(&format!(
+            "{{\"path\":\"src/lib.rs\",\"sha256\":\"{digest}\"}}"
+        )));
+        assert_eq!(
+            package_file(&package, "LICENSE-MIT"),
+            spec.license_mit.as_bytes()
+        );
+        assert_eq!(
+            package_file(&package, "LICENSE-APACHE"),
+            spec.license_apache.as_bytes()
+        );
+        assert_eq!(package_file(&package, "README.md"), spec.readme.as_bytes());
+    }
 }
 
 #[test]
@@ -240,7 +270,7 @@ fn test_view_v1_projects_both_transports_without_raw_content() {
             .bytes,
     )
     .unwrap();
-    assert!(browser.contains("calculate(Number(operation.value),a,b)"));
+    assert!(browser.contains("calculate(selected,a,b)"));
     assert!(browser.contains("const MIN=-9223372036854775808n"));
     assert!(browser.contains("/^(?:0|-[1-9][0-9]*|[1-9][0-9]*)$/"));
     assert!(!browser.contains("value.replace"));
@@ -250,6 +280,30 @@ fn test_view_v1_projects_both_transports_without_raw_content() {
     assert!(cargo.contains("prism-calculator = \"=0.1.0\""));
     assert!(!cargo.contains("path ="));
     assert!(!cargo.contains("git ="));
+}
+
+#[test]
+fn test_view_v1_never_uses_native_form_submission() {
+    let (view, binding) = view_fixture();
+    let generated = generate_view_v1(&view, &binding).unwrap();
+    for assets in [&generated.browser_assets, &generated.hologram_assets] {
+        let index = core::str::from_utf8(&assets[2].bytes).unwrap();
+        assert!(index.find("form-action 'none'").unwrap() < index.find("<form").unwrap());
+        for name in ["left", "right", "operation"] {
+            assert!(!index.contains(&format!("name=\"{name}\"")));
+        }
+        assert!(index.contains("id=\"submit\" type=\"submit\" disabled"));
+        assert!(index.contains(&format!(">{}</output>", view.input_error)));
+        let script = core::str::from_utf8(&assets[1].bytes).unwrap();
+        assert!(
+            script.find("event.preventDefault()").unwrap()
+                < script.find("submit.disabled=false").unwrap()
+        );
+    }
+    let script = core::str::from_utf8(&generated.browser_assets[1].bytes).unwrap();
+    assert!(script.contains("import('./prism_calculator.js')"));
+    assert!(!script.starts_with("import "));
+    assert!(script.contains(".catch(()=>{show(INPUT_ERROR);return null;})"));
 }
 
 #[test]
@@ -1169,6 +1223,91 @@ fn test_string_predicates_borrow_inputs_and_literals_without_allocating() {
     assert!(out.contains("pub fn delegates(value: &str) -> bool"));
     assert!(out.contains("equalsToken((value).as_ref())"));
     assert!(!out.contains("alloc::string::String::from(\"token\")"));
+}
+
+#[test]
+fn test_byte_literals_preserve_arbitrary_bytes_and_borrow_in_predicates() {
+    let ir = r#"
+(module M
+  (type "M.Record" (ctor "M.Record.mk" (data Bytes)))
+  (def arbitrary () Bytes (bytes 0 128 255))
+  (def empty () Bytes (bytes))
+  (def equalsBytes ((value Bytes)) Bool (let token (bytes 0 128 255) (eq value token)))
+  (def getter ((value (named "M.Record"))) Bytes (let result (proj "M.Record" "data" value) result))
+  (def equalsField ((value (named "M.Record"))) Bool (eq (proj "M.Record" "data" value) (bytes 0 128 255)))
+  (def equalsGetter ((value (named "M.Record"))) Bool (eq (bytes 0 128 255) (call getter value)))
+  (def equalsAlias ((value (named "M.Record")) (flag Bool)) Bool
+    (let data (if flag (proj "M.Record" "data" value) (call getter value))
+      (eq data (bytes 0 128 255))))
+  (def literalCall () Bool (call equalsBytes (bytes 0 128 255)))
+  (def literalEqual () Bool (eq (bytes) (bytes))))
+"#;
+    let out = generate(ir);
+    assert!(out.contains("alloc::vec![0, 128, 255]"));
+    assert!(out.contains("alloc::vec![]"));
+    assert!(out.contains("pub fn equalsBytes(value: &[u8]) -> bool"));
+    assert!(out.contains("core::convert::AsRef::<[u8]>::as_ref(&(value)) == &[0, 128, 255]"));
+    assert!(out.contains("equalsBytes(&[0, 128, 255])"));
+    assert_eq!(out.matches("alloc::vec!").count(), 2);
+    let directory = loop {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let candidate = std::env::temp_dir().join(std::format!(
+            "prod-codegen-byte-literals-{}-{nonce}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                panic!("cannot create isolated byte-literal regression directory: {error}")
+            }
+        }
+    };
+    let source = directory.join("main.rs");
+    let executable = directory.join("byte-literals");
+    std::fs::write(
+        &source,
+        std::format!(
+            r#"extern crate alloc;
+{out}
+fn main() {{
+    assert_eq!(arbitrary(), vec![0, 128, 255]);
+    assert_eq!(empty(), Vec::<u8>::new());
+    assert!(literalCall());
+    assert!(literalEqual());
+    for data in [vec![0, 128, 255], vec![], vec![255, 128, 0]] {{
+        let expected = data == [0, 128, 255];
+        let record = Record {{ data }};
+        assert_eq!(equalsBytes(&record.data), expected);
+        assert_eq!(equalsField(&record), expected);
+        assert_eq!(equalsGetter(&record), expected);
+        for flag in [false, true] {{ assert_eq!(equalsAlias(&record, flag), expected); }}
+    }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let compiled = std::process::Command::new("rustc")
+        .args(["--edition", "2021"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        std::string::String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(std::process::Command::new(&executable)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

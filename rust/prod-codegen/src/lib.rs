@@ -108,6 +108,7 @@ mod c_abi;
 mod core_wasm;
 mod package;
 mod sdk;
+mod text_view;
 mod view;
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -123,6 +124,7 @@ pub use package::{
     generate_cargo_package, CargoDependency, CargoPackageSpec, GeneratedPackage, PackageFile,
 };
 pub use sdk::{generate_sdks, SdkBindings};
+pub use text_view::{generate_text_view_v1, TextBrowserAdapterBinding, TextViewV1};
 pub use view::{
     generate_holoview_bundle, generate_view_v1, BrowserAdapterBinding, EvaluatedViewV1,
     GeneratedViewV1, ViewOperation,

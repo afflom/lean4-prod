@@ -64,14 +64,14 @@ pub struct GeneratedViewV1 {
     pub view_manifest: PackageFile,
 }
 
-fn file(path: &str, text: String) -> PackageFile {
+pub(crate) fn file(path: &str, text: String) -> PackageFile {
     PackageFile {
         path: path.to_string(),
         bytes: text.into_bytes(),
     }
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -143,7 +143,7 @@ pub fn generate_holoview_bundle(files: &[PackageFile]) -> Result<PackageFile, Er
     })
 }
 
-fn valid_ident(value: &str) -> bool {
+pub(crate) fn valid_ident(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value.bytes().enumerate().all(|(index, byte)| {
@@ -151,7 +151,7 @@ fn valid_ident(value: &str) -> bool {
         })
 }
 
-fn valid_package(value: &str) -> bool {
+pub(crate) fn valid_package(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value.bytes().all(|byte| {
@@ -160,7 +160,7 @@ fn valid_package(value: &str) -> bool {
         && value.as_bytes()[0].is_ascii_lowercase()
 }
 
-fn valid_version(value: &str) -> bool {
+pub(crate) fn valid_version(value: &str) -> bool {
     let fields: Vec<&str> = value.split('.').collect();
     fields.len() == 3
         && fields.iter().all(|field| {
@@ -170,14 +170,14 @@ fn valid_version(value: &str) -> bool {
         })
 }
 
-fn valid_digest(value: &str) -> bool {
+pub(crate) fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn html(value: &str) -> String {
+pub(crate) fn html(value: &str) -> String {
     let mut out = String::new();
     for character in value.chars() {
         match character {
@@ -192,7 +192,7 @@ fn html(value: &str) -> String {
     out
 }
 
-fn json(value: &str) -> String {
+pub(crate) fn json(value: &str) -> String {
     let mut out = String::from("\"");
     for character in value.chars() {
         match character {

@@ -323,6 +323,48 @@ command fails. Those composite values need an explicit buffer/ownership and
 layout contract before they can safely cross a C ABI. The header and wrapper
 are generated artifacts; do not hand-edit either file.
 
+## Closed text Views
+
+`prod_codegen::generate_text_view_v1(&TextViewV1, &TextBrowserAdapterBinding)`
+projects `prism.text-view/1` into a browser wasm-bindgen adapter and a Hologram
+intent View. The original `generate_view_v1` calculator projection is unchanged.
+The seven modeled strings are title, heading, input label, submit label, output
+label, input error and response error; none accepts markup, callbacks or URLs.
+Positive `u32` input/output caps count UTF-8 bytes, not characters. Empty request
+and response values are permitted. Metadata also binds the model, View model
+and generated core SHA-256 identities.
+
+The browser adapter exports `invoke_bytes`, forwards owned bytes to the named
+generated `Vec<u8> -> Vec<u8>` core function, and validates UTF-8 and copy limits.
+It uses exact js-sys 0.3.99 and wasm-bindgen 0.2.122 dependencies. It does not
+parse application documents or implement application semantics. The core's own
+execution and allocation limits remain obligations of its authoritative model:
+checking a returned byte length cannot prevent an allocation already made by
+that core. Likewise, browser/network internals may allocate before delivering
+their bounded inputs to the adapter.
+
+Hologram uses the existing `application.invoke` intent envelope and displays its
+single text output without domain parsing. Its transport JSON is streamed and
+bounded to `6 * max_output_bytes + 256` bytes before parsing, allowing JSON's
+worst-case string escaping plus bounded envelope overhead. Browser input rejects
+unpaired UTF-16 before encoding; both transports reject malformed UTF-8 rather
+than replacing it. A leading U+FEFF remains application data. Output uses
+`textContent` and a labeled polite live region. Invalid input receives focus;
+Ctrl/Command+Enter submits a multiline request without consuming ordinary Enter
+or IME composition. Native form controls retain their normal keyboard behavior.
+
+The closed `lean4-prod/text-view-projection/1` manifest hashes both three-file
+projections, the exact HOLOVIEW v1 bundle and the complete browser adapter file
+set. `lean4-prod/text-browser-adapter/1` separately binds its core dependency,
+entrypoint, caps, identities and generated files. Neither changes Holo/1.
+
+`just text-view` (included in `just ci`) checks deterministic generation and exact
+manifest/bundle closure, executes generated JavaScript against controlled DOM
+and transport ports, then compiles and executes real generated Wasm probes for
+echo, invalid UTF-8 output and output overflow. The DOM harness tests focus,
+keyboard, concurrency and failures; it is not a browser layout test. Its
+synthetic IR fixtures test compiler transport behavior, not application proofs.
+
 ## Roots (proof-graph analysis)
 
 Every theorem is a root. `Roots.lean` exports each root's dependency edges,

@@ -335,6 +335,14 @@ that boundary. Borrowed literal comparisons and calls use static byte slices.
 `just portable-package` executes literal returns, nested branches, append and
 decode-then-reuse in both `std` and `no_std + alloc`, alongside rejection probes.
 
+Composition through byte-length wrappers accepts the typed `ByteArray.size`
+builtin. Specialized byte append is recognized only from Lean's complete
+retained mono-LCNF body: copy all of the right input to the end of the left
+input, with no other computation or control flow. This is not general
+`ByteArray.copySlice` support. Altered copy operands, additional work, and
+unknown callable runtime helpers fail closed; runtime namespace membership
+does not authorize replacing semantic results with erased dictionary values.
+
 ## Closed text Views
 
 `prod_codegen::generate_text_view_v1(&TextViewV1, &TextBrowserAdapterBinding)`

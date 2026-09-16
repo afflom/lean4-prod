@@ -71,6 +71,8 @@ structure LowerState where
       become runtime Arrays: only an exact ByteArray.mk may consume them. -/
   literalNats : Std.HashMap Name Nat := {}
   literalByteArrays : Std.HashMap Name (Array UInt8) := {}
+  /-- Source types for exact compiler-intrinsic boundary checks. -/
+  fvarTypes : Std.HashMap Name Expr := {}
   counter : Nat := 0
   opaques : Array String := #[]            -- opaque markers emitted
   externs : Array String := #[]            -- non-tagged, non-whitelisted calls
@@ -306,8 +308,56 @@ private def byteLiteral? (value : LetValue .pure) : LowerM (Option String) := do
   let some bytes := (← get).literalByteArrays[input.name]? | return none
   return some ("(bytes" ++ spaced (bytes.map (fun byte => toString byte.toNat)) ++ ")")
 
-def lowerLetValue (v : LetValue .pure) : LowerM String := do
+/-- A specialized append is recognized from Lean's retained typed mono LCNF,
+    never from a specialization suffix. These five bindings are exactly a copy
+    of all right bytes at the end of left, with no extra call or control flow. -/
+private def isExactByteAppend (decl : Decl .pure) : Bool := Id.run do
+  let #[left, right] := decl.params | return false
+  if left.type != mkConst ``ByteArray || right.type != mkConst ``ByteArray then return false
+  let .forallE _ _ (.forallE _ _ (.const ``ByteArray _) _) _ := decl.type | return false
+  let .code (.let zero (.let leftSize (.let rightSize (.let flag (.let result (.return output)))))) := decl.value
+    | return false
+  let .lit (.nat 0) := zero.value | return false
+  let .const ``ByteArray.size _ #[.fvar l] := leftSize.value | return false
+  let .const ``ByteArray.size _ #[.fvar r] := rightSize.value | return false
+  let .const ``Bool.false _ #[] := flag.value | return false
+  let .const ``ByteArray.copySlice _ #[.fvar source, .fvar start, .fvar target,
+      .fvar offset, .fvar count, .fvar exact] := result.value | return false
+  return zero.type == mkConst ``Nat && leftSize.type == mkConst ``Nat &&
+    rightSize.type == mkConst ``Nat && flag.type == mkConst ``Bool &&
+    result.type == mkConst ``ByteArray && l == left.fvarId && r == right.fvarId &&
+    source == right.fvarId && start == zero.fvarId && target == left.fvarId &&
+    offset == leftSize.fvarId && count == rightSize.fvarId && exact == flag.fvarId &&
+    output == result.fvarId
+
+private def specializedByteAppend? (value : LetValue .pure)
+    (resultType : Option Expr) : LowerM (Option String) := do
+  let some (.const ``ByteArray _) := resultType | return none
+  let .const name _ #[.fvar left, .fvar right] := value | return none
+  if !isLexLeanRuntimeName name then return none
+  let types := (← get).fvarTypes
+  if types[left.name]? != some (mkConst ``ByteArray) ||
+      types[right.name]? != some (mkConst ``ByteArray) then return none
+  let some decl ← getMonoDecl? name | return none
+  if !isExactByteAppend decl then return none
+  return some s!"(append {← lookupFVar left} {← lookupFVar right})"
+
+private def isDictionaryResult (resultType : Option Expr) : LowerM Bool := do
+  let some type := resultType | return false
+  let some name ← liftM (Lean.Meta.MetaM.run' (Lean.Meta.isClass? type)) | return false
+  if [``BEq, ``Decidable, ``ToString, ``Sub, ``Mul, ``Neg].contains name then return true
+  return isLexLeanRuntimeName name &&
+    ["ToMathInt", "Fixed", "Quotient", "Appendable", "Lengthable", "Indexable", "Sliceable", "Decimal"].contains (lastComponent name)
+
+def lowerLetValue (v : LetValue .pure) (resultType : Option Expr := none) : LowerM String := do
   if let some literal ← byteLiteral? v then return literal
+  if let some append ← specializedByteAppend? v resultType then return append
+  -- Lean can simplify a call through a byte-length wrapper to this builtin.
+  -- Admit only its exact Bytes -> Nat shape, not a name-only external escape.
+  if let .const ``ByteArray.size _ #[.fvar input] := v then
+    if let some (.const ``Nat _) := resultType then
+      if let some (.const ``ByteArray _) := (← get).fvarTypes[input.name]? then
+        return s!"(length {← lookupFVar input})"
   match v with
   | .lit (.nat n) => return toString n
   | .lit (.uint8 n) => return toString n
@@ -345,14 +395,14 @@ def lowerLetValue (v : LetValue .pure) : LowerM String := do
         return s!"({op}{spaced values})"
       modify fun st => { st with externs := st.externs.push s!"{declName} (wrong semantic primitive arity)" }
       return s!"(extern \"{declName}\"{spaced args'})"
-    if isLexLeanRuntimeName declName then
+    if isLexLeanRuntimeName declName && (← isDictionaryResult resultType) then
       -- Typeclass dictionaries and helper records are implementation inputs
       -- to a following primitive call. Their semantic effect is captured by
       -- the primitive opcode and fixed operand/result types, so the target IR
       -- deliberately erases the dictionary value.
       modify fun st => { st with dropped := st.dropped + 1 }
       return "0"
-    if isErasedPortableDictionary declName then
+    if isErasedPortableDictionary declName && (← isDictionaryResult resultType) then
       modify fun st => { st with dropped := st.dropped + 1 }
       return "0"
     if lastComponent declName == "neg" &&
@@ -448,6 +498,7 @@ def decideOf? (decl : LetDecl .pure) (k : Code .pure)
 partial def lowerCode : Code .pure → LowerM String
   | .let decl k => do
     let nm ← registerFVar decl.fvarId decl.binderName
+    modify fun st => { st with fvarTypes := st.fvarTypes.insert decl.fvarId.name decl.type }
     if let some literal ← literalNat? decl.value then
       modify fun st => { st with literalNats := st.literalNats.insert decl.fvarId.name literal }
     if let some bytes ← literalByteArray? decl then
@@ -481,7 +532,7 @@ partial def lowerCode : Code .pure → LowerM String
         modify fun st => { st with knownOps := st.knownOps.insert nm op }
         lowerCode k
       else
-        let val ← lowerLetValue value
+        let val ← lowerLetValue value (some decl.type)
         let body ← lowerCode k
         return s!"(let {nm} {val} {body})"
   | .fun (.mk fid bn _ _ _) k => do
@@ -491,7 +542,9 @@ partial def lowerCode : Code .pure → LowerM String
     return s!"(let {nm} {val} {body})"
   | .jp (.mk fid bn ps _ v) k => do
     let nm ← registerFVar fid bn
-    let pnames ← ps.mapM fun p => registerFVar p.fvarId p.binderName
+    let pnames ← ps.mapM fun p => do
+      modify fun st => { st with fvarTypes := st.fvarTypes.insert p.fvarId.name p.type }
+      registerFVar p.fvarId p.binderName
     let jpBody ← lowerCode v
     let body ← lowerCode k
     -- The IR `jp` node is an expression with no continuation slot; the LCNF
@@ -507,7 +560,9 @@ partial def lowerCode : Code .pure → LowerM String
     for a in alts do
       match a with
       | .alt ctorName ps c =>
-        let pnames ← ps.mapM fun p => registerFVar p.fvarId p.binderName
+        let pnames ← ps.mapM fun p => do
+          modify fun st => { st with fvarTypes := st.fvarTypes.insert p.fvarId.name p.type }
+          registerFVar p.fvarId p.binderName
         let body ← lowerCode c
         parts := parts.push s!"(alt \"{ctorName}\" ({String.intercalate " " pnames.toList}) {body})"
       | .default c =>
@@ -569,6 +624,7 @@ def lowerDecl (ctx : LowerCtx) (d : Decl .pure) : CoreM (String × LowerState) :
     let mut ps : Array String := #[]
     for p in d.params do
       let nm ← registerFVar p.fvarId p.binderName
+      modify fun st => { st with fvarTypes := st.fvarTypes.insert p.fvarId.name p.type }
       let ty ← lowerType p.type
       ps := ps.push s!"({nm} {ty})"
     let ret ← lowerType (stripForalls d.params.size d.type)

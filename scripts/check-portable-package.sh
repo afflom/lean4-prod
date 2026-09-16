@@ -9,8 +9,10 @@ cd "$repo_root/lean"
 lake build Conformance.LexLeanPortable
 lake exe prod-export \
   --module Conformance.LexLeanPortable \
+  --root SemanticFixture.Portable.aliasedAppendBytes \
   --root SemanticFixture.Portable.andUInt64 \
   --root SemanticFixture.Portable.appendBytes \
+  --root SemanticFixture.Portable.boundedReuseByteFixture \
   --root SemanticFixture.Portable.byteAt \
   --root SemanticFixture.Portable.byteFixture \
   --root SemanticFixture.Portable.byteLength \
@@ -39,6 +41,8 @@ lake exe prod-export \
   --root SemanticFixture.Portable.sliceBytes \
   --root SemanticFixture.Portable.splitBounded \
   --root SemanticFixture.Portable.unicodeFixture \
+  --root SemanticFixture.Portable.wrappedAppendBytes \
+  --root SemanticFixture.Portable.wrappedByteLength \
   --root SemanticFixture.Portable.xorUInt64 \
   --ir-module PortableExpanded \
   --out "$scratch/export"
@@ -106,4 +110,22 @@ for rejected in unsupportedArrayFixture unsupportedDynamicByteFixture; do
   rg -q 'prod-export failed: closed byte-array literal builder used outside ByteArray.mk' "$scratch/$rejected.stderr"
 done
 
-echo "real LexLean portable Cargo package and mathematical-Int rejection passed"
+for rejected in unsupportedRuntimeNatFixture unsupportedAlteredByteCopy unsupportedExtraByteCopy; do
+  if lake exe prod-export \
+      --module Conformance.LexLeanPortable \
+      --root "SemanticFixture.Portable.$rejected" \
+      --ir-module RejectedRuntimeCallable \
+      --out "$scratch/$rejected" \
+      >"$scratch/$rejected.stdout" 2>"$scratch/$rejected.stderr"; then
+    echo "unrecognized runtime callable unexpectedly accepted: $rejected" >&2
+    exit 1
+  fi
+  case "$rejected" in
+    unsupportedRuntimeNatFixture) helper=fakeNatHelper ;;
+    unsupportedAlteredByteCopy) helper=alteredByteCopy ;;
+    unsupportedExtraByteCopy) helper=extraByteCopy ;;
+  esac
+  rg -Fq "prod-export failed: exportNames: unresolved external call in SemanticFixture.Portable.$rejected: [SemanticFixture.Portable.LexLeanRuntime.$helper]" "$scratch/$rejected.stderr"
+done
+
+echo "real LexLean portable Cargo package, mathematical-Int, Array and runtime-callable rejection passed"

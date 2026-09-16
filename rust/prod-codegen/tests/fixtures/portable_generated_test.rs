@@ -38,6 +38,31 @@ fn real_lexlean_portable_operations_execute_with_exact_rust_semantics() {
     assert_eq!(portable_expanded::reuseByteFixture(vec![0xc3, 0xa9]), vec![0, 128, 255, 0xc3, 0xa9]);
     assert_eq!(portable_expanded::reuseByteFixture(vec![0xff]), vec![255, 0]);
     assert_eq!(portable_expanded::reuseByteFixture(vec![]), vec![0, 128, 255]);
+    assert_eq!(portable_expanded::wrappedByteLength(vec![0, 128, 255]), 3);
+    assert_eq!(portable_expanded::wrappedByteLength(vec![]), 0);
+    for (left, right) in [
+        (vec![], vec![]),
+        (vec![], vec![0, 128, 255]),
+        (vec![255, 128, 0], vec![]),
+        (vec![255, 128, 0], vec![0, 128, 255]),
+    ] {
+        let mut expected = left.clone();
+        expected.extend_from_slice(&right);
+        assert_eq!(portable_expanded::wrappedAppendBytes(left, right), expected);
+    }
+    for value in [vec![], vec![0, 128, 255]] {
+        let mut expected = value.clone();
+        expected.extend_from_slice(&value);
+        assert_eq!(portable_expanded::aliasedAppendBytes(value), expected);
+    }
+    for value in [vec![], vec![0xff], vec![b'a'; 65]] {
+        assert_eq!(portable_expanded::boundedReuseByteFixture(value), vec![255, 0]);
+    }
+    for value in [vec![0xc3, 0xa9], vec![b'a'; 64]] {
+        let mut expected = vec![0, 128, 255];
+        expected.extend_from_slice(&value);
+        assert_eq!(portable_expanded::boundedReuseByteFixture(value), expected);
+    }
 
     let text = String::from("portable ✓");
     let encoded = portable_expanded::encodeUtf8(text.clone());

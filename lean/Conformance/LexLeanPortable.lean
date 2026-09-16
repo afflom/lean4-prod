@@ -284,6 +284,16 @@ public instance {α : Type} [Fixed α] [ToString α] : Decimal α where
 @[noinline] public def parseDecimal {α : Type} [Decimal α] (value : String) : Option α := Decimal.parse value
 @[noinline] public def formatDecimal {α : Type} [Decimal α] (value : α) : String := Decimal.format value
 
+-- Runtime namespace membership never authorizes an unknown semantic callable.
+@[noinline] public def fakeNatHelper (value : Nat) : Nat := value + 1
+
+-- The exact append recognizer must reject altered operands and additional work.
+@[noinline] public def alteredByteCopy (left right : ByteArray) : ByteArray :=
+  ByteArray.copySlice right 0 left right.size left.size false
+
+@[noinline] public def extraByteCopy (left right : ByteArray) : ByteArray :=
+  ByteArray.copySlice right 0 left (left.size + 1) right.size false
+
 end LexLeanRuntime
 
 public structure PortableContainers where
@@ -387,6 +397,31 @@ public structure PortableContainers where
 @[expose] public def sliceBytes (value : ByteArray) (start : Nat) (count : Nat) : Option (ByteArray) := (LexLeanRuntime.slice (value) (start) (count) : Option (ByteArray))
 
 @[expose] public def compareByteStrings (left : ByteArray) (right : ByteArray) : Ordering := (LexLeanRuntime.compareBytes (left) (right) : Ordering)
+
+-- Lean may simplify composition of the stdlib wrappers to ByteArray.size.
+@[expose] public def wrappedByteLength (value : ByteArray) : Nat := byteLength value
+
+@[expose] public def wrappedAppendBytes (left right : ByteArray) : ByteArray :=
+  appendBytes left right
+
+@[expose] public def aliasedAppendBytes (value : ByteArray) : ByteArray :=
+  appendBytes value value
+
+@[expose] public def unsupportedRuntimeNatFixture (value : Nat) : Nat :=
+  LexLeanRuntime.fakeNatHelper value
+
+@[expose] public def unsupportedAlteredByteCopy (left right : ByteArray) : ByteArray :=
+  LexLeanRuntime.alteredByteCopy left right
+
+@[expose] public def unsupportedExtraByteCopy (left right : ByteArray) : ByteArray :=
+  LexLeanRuntime.extraByteCopy left right
+
+@[expose] public def boundedReuseByteFixture (value : ByteArray) : ByteArray :=
+  if byteLength value == 0 then ByteArray.mk #[255, 0]
+  else if 64 < byteLength value then ByteArray.mk #[255, 0]
+  else match decodeUtf8 value with
+    | none => ByteArray.mk #[255, 0]
+    | some _ => appendBytes (ByteArray.mk #[0, 128, 255]) value
 
 @[expose] public def splitBounded (value : String) (delimiter : String) (maximum : UInt32) : Option (List (String)) := (LexLeanRuntime.splitExact (value) (delimiter) (maximum) : Option (List (String)))
 

@@ -8,8 +8,21 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes \
         build-essential ca-certificates clang curl default-jdk-headless git kotlin \
-        libgmp10 lld node-typescript nodejs npm python3 ripgrep \
+        libgmp10 lld node-typescript nodejs npm python3 ripgrep xz-utils \
     && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSfL \
+        https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz -o /tmp/node.tar.xz \
+    && echo "d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307  /tmp/node.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/node.tar.xz --strip-components=1 -C /usr/local \
+    && rm /tmp/node.tar.xz
+
+# Browser security is part of the ordinary generated-View gate, not an optional
+# downstream test. Playwright's locked package pins its Chromium revision.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/lean4-prod/browsers
+COPY scripts/browser-tests/package.json scripts/browser-tests/package-lock.json /opt/lean4-prod/browser-tests/
+RUN npm ci --ignore-scripts --prefix /opt/lean4-prod/browser-tests \
+    && /opt/lean4-prod/browser-tests/node_modules/.bin/playwright install --with-deps chromium
 
 RUN curl --proto '=https' --tlsv1.2 -sSfL \
         https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \

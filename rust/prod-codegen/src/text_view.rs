@@ -78,10 +78,13 @@ fn validate(view: &TextViewV1, binding: &TextBrowserAdapterBinding) -> Result<()
 }
 
 fn index_html(view: &TextViewV1) -> String {
+    // Native form navigation is never a transport. The early CSP policy also
+    // enforces this when scripts are blocked, delayed, disabled, or fail.
+    // https://www.w3.org/TR/CSP3/#directive-form-action
     format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><link rel=\"stylesheet\" href=\"app.css\"></head><body><main><h1>{}</h1><form id=\"application-form\" novalidate><label for=\"request\">{}</label><textarea id=\"request\" name=\"request\" rows=\"8\" aria-describedby=\"result\"></textarea><button id=\"submit\" type=\"submit\">{}</button></form><label id=\"response-label\" for=\"result\">{}</label><output id=\"result\" for=\"request\" role=\"status\" aria-labelledby=\"response-label\" aria-live=\"polite\" aria-atomic=\"true\"></output></main><script type=\"module\" src=\"app.js\"></script></body></html>\n",
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"form-action 'none'\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><link rel=\"stylesheet\" href=\"app.css\"></head><body><main><h1>{}</h1><form id=\"application-form\" novalidate><label for=\"request\">{}</label><textarea id=\"request\" rows=\"8\" aria-describedby=\"result\"></textarea><button id=\"submit\" type=\"submit\" disabled>{}</button></form><label id=\"response-label\" for=\"result\">{}</label><output id=\"result\" for=\"request\" role=\"status\" aria-labelledby=\"response-label\" aria-live=\"polite\" aria-atomic=\"true\">{}</output></main><script type=\"module\" src=\"app.js\"></script></body></html>\n",
         html(&view.title), html(&view.heading), html(&view.input_label),
-        html(&view.submit_label), html(&view.output_label),
+        html(&view.submit_label), html(&view.output_label), html(&view.response_error),
     )
 }
 
@@ -142,7 +145,7 @@ pub fn generate_text_view_v1(
     let html = index_html(view);
     let shared = shared_javascript(view);
     let browser_js = format!(
-        "import init,{{invoke_bytes}}from'./{}.js';\n{}\n{}",
+        "const loadBinding=()=>import('./{}.js');\n{}\n{}",
         binding.core_crate_name.replace('-', "_"),
         shared,
         include_str!("text_view_browser.js")

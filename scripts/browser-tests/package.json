@@ -1,0 +1,9 @@
+{
+  "name": "lean4-prod-browser-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pinned browser engine for generated transport security tests",
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}

@@ -95,14 +95,18 @@ async function setup(target, options = {}) {
   };
   const context = vm.createContext({document: {getElementById: id => elements[id]},
     TextEncoder: Encoder, TextDecoder, Uint8Array, fetch, console});
-  const module = new vm.SourceTextModule(read(`${target}/app.js`).toString(), {context});
-  await module.link(specifier => {
+  const module = new vm.SourceTextModule(read(`${target}/app.js`).toString(), {context, importModuleDynamically: async specifier => {
     assert.equal(specifier, './text_view_core.js');
-    return new vm.SyntheticModule(['default', 'invoke_bytes'], function () {
+    if (options.importFailure) throw new Error('binding import failed');
+    const binding = new vm.SyntheticModule(['default', 'invoke_bytes'], function () {
       this.setExport('default', options.init ?? (async () => {}));
       this.setExport('invoke_bytes', invoke);
     }, {context});
-  });
+    await binding.link(() => assert.fail('unexpected binding import'));
+    await binding.evaluate();
+    return binding;
+  }});
+  await module.link(() => assert.fail('static dependencies bypass error handling'));
   await module.evaluate();
   const form = elements['application-form'];
   state.submit = async value => {
@@ -159,10 +163,15 @@ for (const answer of [null, 'not bytes', Uint8Array.of(0xff), Uint8Array.of(0xc0
 const failedInit = await setup('browser', {init: async () => { throw new Error('init failed'); }});
 await failedInit.submit('input'); assert.equal(failedInit.calls.length, 0);
 assert.equal(failedInit.elements.result.textContent, 'Invalid response');
-let release;
-const waiting = await setup('browser', {init: () => new Promise(resolve => { release = resolve; })});
+const failedImport = await setup('browser', {importFailure: true});
+await failedImport.submit('input'); assert.equal(failedImport.calls.length, 0);
+assert.equal(failedImport.elements.result.textContent, 'Invalid response');
+let release, began;
+const initialized = new Promise(resolve => { began = resolve; });
+const waiting = await setup('browser', {init: () => new Promise(resolve => { release = resolve; began(); })});
 const first = waiting.submit('first');
 await waiting.submit('second'); assert.equal(waiting.calls.length, 0);
+await initialized;
 release(); await first; assert.equal(waiting.calls.length, 1);
 assert.deepEqual(waiting.calls[0], bytes('first'));
 

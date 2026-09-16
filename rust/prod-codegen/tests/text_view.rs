@@ -43,6 +43,24 @@ fn text_view_generates_both_closed_transports_deterministically() {
 }
 
 #[test]
+fn text_view_html_fails_closed_before_any_script_executes() {
+    let (view, binding) = fixture();
+    let generated = generate_text_view_v1(&view, &binding).unwrap();
+    for assets in [&generated.browser_assets, &generated.hologram_assets] {
+        let html = String::from_utf8_lossy(&assets[2].bytes);
+        let policy = "<meta http-equiv=\"Content-Security-Policy\" content=\"form-action 'none'\">";
+        assert!(html.contains(policy));
+        assert!(html.find(policy).unwrap() < html.find("<form").unwrap());
+        assert!(html.contains("id=\"submit\" type=\"submit\" disabled"));
+        assert!(!html.contains("name=\"request\""));
+        assert!(html.contains("Invalid response</output>"));
+    }
+    let browser = String::from_utf8_lossy(&generated.browser_assets[1].bytes);
+    assert!(!browser.starts_with("import "));
+    assert!(browser.contains("import('./text_view_core.js')"));
+}
+
+#[test]
 fn text_view_rejects_zero_byte_caps_and_untrusted_adapter_identifiers() {
     let (view, binding) = fixture();
     let mut invalid = view.clone();

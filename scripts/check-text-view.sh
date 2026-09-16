@@ -19,6 +19,8 @@ for entry in invoke invalid oversized; do
   wasm="$scratch/cargo-target/wasm32-unknown-unknown/release/text_view_$entry.wasm"
   "$CARGO_HOME/bin/wasm-tools" validate "$wasm"
   "$CARGO_HOME/bin/wasm-bindgen" --target nodejs --out-dir "$scratch/$entry" --out-name adapter "$wasm"
+  "$CARGO_HOME/bin/wasm-bindgen" --target web --out-dir "$scratch/fixture/$entry/browser" --out-name text_view_core "$wasm"
 done
 node "$repo_root/rust/prod-codegen/tests/fixtures/text_view_wasm_test.cjs" "$scratch"
+node "$repo_root/rust/prod-codegen/tests/fixtures/text_view_browser_test.mjs" "$scratch/fixture"
 echo "Text View: deterministic closure, DOM transports, UTF-8 limits, and actual Wasm probes passed"

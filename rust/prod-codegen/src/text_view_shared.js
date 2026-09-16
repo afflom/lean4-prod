@@ -6,6 +6,7 @@ const encoder = new TextEncoder();
 // Preserve a leading U+FEFF: it is application data, not a transport BOM.
 const decoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true});
 let busy = false;
+let displayed = false;
 
 // Validate before TextEncoder allocates; never replace malformed UTF-16.
 function boundedText(value, limit) {
@@ -28,15 +29,13 @@ function boundedText(value, limit) {
   return true;
 }
 
-function show(value) { result.textContent = value; }
+function show(value) { displayed = true; result.textContent = value; }
+// A delayed initialization must not erase a validation error already shown.
+function clearInitialStatus() { if (!displayed) result.textContent = ''; }
 
 function attach(invoke) {
-  request.addEventListener('keydown', event => {
-    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) {
-      event.preventDefault();
-      if (!busy) form.requestSubmit();
-    }
-  });
+  // Install cancellation before any path can submit. HTML stays disabled if
+  // this module never executes; CSP independently denies native navigation.
   form.addEventListener('submit', async event => {
     event.preventDefault();
     if (busy) return;
@@ -63,4 +62,11 @@ function attach(invoke) {
       form.removeAttribute('aria-busy');
     }
   });
+  request.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) {
+      event.preventDefault();
+      if (!busy) form.requestSubmit();
+    }
+  });
+  submit.disabled = false;
 }

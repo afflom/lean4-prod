@@ -1,7 +1,8 @@
 {
   "name": "lean4-prod",
   "build": {
-    "dockerfile": "Dockerfile"
+    "dockerfile": "Dockerfile",
+    "context": ".."
   },
   "remoteUser": "vscode",
   "customizations": {

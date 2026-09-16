@@ -44,3 +44,4 @@ attach(async value => {
   }
   return answer.outputs[0];
 });
+clearInitialStatus();

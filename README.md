@@ -372,6 +372,13 @@ than replacing it. A leading U+FEFF remains application data. Output uses
 `textContent` and a labeled polite live region. Invalid input receives focus;
 Ctrl/Command+Enter submits a multiline request without consuming ordinary Enter
 or IME composition. Native form controls retain their normal keyboard behavior.
+Native form navigation is never an application transport: both projections emit
+an early CSP `form-action 'none'` policy, omit a successful named draft field,
+and keep submit disabled until the cancellation handler is installed. The
+modeled response-error text is present without JavaScript and is cleared only
+after transport initialization succeeds, without erasing newer input errors.
+Browser binding modules load through a caught dynamic import; failed module or
+Wasm initialization cannot fall back to sending draft content in a URL.
 
 The closed `lean4-prod/text-view-projection/1` manifest hashes both three-file
 projections, the exact HOLOVIEW v1 bundle and the complete browser adapter file
@@ -382,8 +389,14 @@ entrypoint, caps, identities and generated files. Neither changes Holo/1.
 manifest/bundle closure, executes generated JavaScript against controlled DOM
 and transport ports, then compiles and executes real generated Wasm probes for
 echo, invalid UTF-8 output and output overflow. The DOM harness tests focus,
-keyboard, concurrency and failures; it is not a browser layout test. Its
-synthetic IR fixtures test compiler transport behavior, not application proofs.
+keyboard, concurrency and failures; it is not a browser layout test. The normal
+gate also runs actual Chromium over the exact generated assets and compiled
+Wasm, checking disabled JavaScript, blocked application/binding modules, native
+submission blocked independently of button state, delayed initialization,
+keyboard recovery, invalid responses and absence of draft network/navigation
+leaks. The compiler devcontainer owns locked Playwright 1.62.1 and its Chromium
+revision; missing browser tools fail the gate. These synthetic IR fixtures test
+compiler transport behavior, not application proofs.
 
 ## Roots (proof-graph analysis)
 

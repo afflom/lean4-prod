@@ -285,7 +285,7 @@ fn index_html(view: &EvaluatedViewV1) -> String {
         .collect::<Vec<_>>()
         .join("");
     format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><link rel=\"stylesheet\" href=\"app.css\"></head><body><main><h1>{}</h1><form id=\"application-form\" novalidate><div class=\"field\"><label for=\"left\">{}</label><input id=\"left\" name=\"left\" inputmode=\"numeric\" autocomplete=\"off\"></div><div class=\"field\"><label for=\"operation\">{}</label><select id=\"operation\" name=\"operation\">{}</select></div><div class=\"field\"><label for=\"right\">{}</label><input id=\"right\" name=\"right\" inputmode=\"numeric\" autocomplete=\"off\"></div><button id=\"submit\" type=\"submit\">{}</button></form><output id=\"result\" role=\"status\" aria-live=\"polite\" aria-atomic=\"true\"></output></main><script type=\"module\" src=\"app.js\"></script></body></html>\n",
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"form-action 'none'\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><link rel=\"stylesheet\" href=\"app.css\"></head><body><main><h1>{}</h1><form id=\"application-form\" novalidate><div class=\"field\"><label for=\"left\">{}</label><input id=\"left\" inputmode=\"numeric\" autocomplete=\"off\"></div><div class=\"field\"><label for=\"operation\">{}</label><select id=\"operation\">{}</select></div><div class=\"field\"><label for=\"right\">{}</label><input id=\"right\" inputmode=\"numeric\" autocomplete=\"off\"></div><button id=\"submit\" type=\"submit\" disabled>{}</button></form><output id=\"result\" role=\"status\" aria-live=\"polite\" aria-atomic=\"true\">{}</output></main><script type=\"module\" src=\"app.js\"></script></body></html>\n",
         html(&view.title),
         html(&view.heading),
         html(&view.left_label),
@@ -293,6 +293,7 @@ fn index_html(view: &EvaluatedViewV1) -> String {
         options,
         html(&view.right_label),
         html(&view.submit_label),
+        html(&view.input_error),
     )
 }
 
@@ -302,7 +303,7 @@ fn css() -> String {
 
 fn shared_javascript(view: &EvaluatedViewV1) -> String {
     format!(
-        "const form=document.getElementById('application-form');const left=document.getElementById('left');const right=document.getElementById('right');const operation=document.getElementById('operation');const result=document.getElementById('result');const INPUT_ERROR={};const DIVISION_ERROR={};const OVERFLOW_ERROR={};const MIN=-9223372036854775808n;const MAX=9223372036854775807n;function operand(value){{if(!/^(?:0|-[1-9][0-9]*|[1-9][0-9]*)$/.test(value))return null;const parsed=BigInt(value);return parsed<MIN||parsed>MAX?null:value;}}function show(value){{result.textContent=value;}}",
+        "const form=document.getElementById('application-form');const left=document.getElementById('left');const right=document.getElementById('right');const operation=document.getElementById('operation');const submit=document.getElementById('submit');const result=document.getElementById('result');const INPUT_ERROR={};const DIVISION_ERROR={};const OVERFLOW_ERROR={};const MIN=-9223372036854775808n;const MAX=9223372036854775807n;let displayed=false;function operand(value){{if(!/^(?:0|-[1-9][0-9]*|[1-9][0-9]*)$/.test(value))return null;const parsed=BigInt(value);return parsed<MIN||parsed>MAX?null:value;}}function show(value){{displayed=true;result.textContent=value;}}function clearInitialStatus(){{if(!displayed)result.textContent='';}}",
         json(&view.input_error),
         json(&view.division_by_zero_error),
         json(&view.overflow_error),
@@ -311,7 +312,7 @@ fn shared_javascript(view: &EvaluatedViewV1) -> String {
 
 fn hologram_javascript(view: &EvaluatedViewV1) -> String {
     format!(
-        "{}form.addEventListener('submit',async event=>{{event.preventDefault();const a=operand(left.value),b=operand(right.value);if(a===null||b===null){{show(INPUT_ERROR);return;}}const request='1\\t'+operation.selectedOptions[0].dataset.request+'\\t'+a+'\\t'+b;try{{const response=await fetch('/_hologram/intent',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{version:1,name:'application.invoke',payload:request}})}});const envelope=await response.json();if(!response.ok||envelope.version!==1||!Array.isArray(envelope.outputs)||envelope.outputs.length!==1)throw new Error('intent');const fields=envelope.outputs[0].split('\\t');if(fields.length!==3||fields[0]!=='1')throw new Error('protocol');if(fields[1]==='ok'&&operand(fields[2])===fields[2])show(fields[2]);else if(fields[1]==='error'&&fields[2]==='division-by-zero')show(DIVISION_ERROR);else if(fields[1]==='error'&&fields[2]==='overflow')show(OVERFLOW_ERROR);else throw new Error('protocol');}}catch(_){{show(INPUT_ERROR);}}}});\n",
+        "{}form.addEventListener('submit',async event=>{{event.preventDefault();const a=operand(left.value),b=operand(right.value);if(a===null||b===null){{show(INPUT_ERROR);return;}}const request='1\\t'+operation.selectedOptions[0].dataset.request+'\\t'+a+'\\t'+b;try{{const response=await fetch('/_hologram/intent',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{version:1,name:'application.invoke',payload:request}})}});const envelope=await response.json();if(!response.ok||envelope.version!==1||!Array.isArray(envelope.outputs)||envelope.outputs.length!==1)throw new Error('intent');const fields=envelope.outputs[0].split('\\t');if(fields.length!==3||fields[0]!=='1')throw new Error('protocol');if(fields[1]==='ok'&&operand(fields[2])===fields[2])show(fields[2]);else if(fields[1]==='error'&&fields[2]==='division-by-zero')show(DIVISION_ERROR);else if(fields[1]==='error'&&fields[2]==='overflow')show(OVERFLOW_ERROR);else throw new Error('protocol');}}catch(_){{show(INPUT_ERROR);}}}});submit.disabled=false;clearInitialStatus();\n",
         shared_javascript(view)
     )
 }
@@ -319,7 +320,36 @@ fn hologram_javascript(view: &EvaluatedViewV1) -> String {
 fn browser_javascript(view: &EvaluatedViewV1, binding: &BrowserAdapterBinding) -> String {
     let module = binding.core_crate_name.replace('-', "_");
     format!(
-        "import init,{{calculate}}from'./{module}.js';{}await init();form.addEventListener('submit',event=>{{event.preventDefault();const a=operand(left.value),b=operand(right.value);if(a===null||b===null){{show(INPUT_ERROR);return;}}const answer=calculate(Number(operation.value),a,b);if(answer.kind==='ok')show(answer.value);else if(answer.error==='division-by-zero')show(DIVISION_ERROR);else if(answer.error==='overflow')show(OVERFLOW_ERROR);else show(INPUT_ERROR);}});\n",
+        r#"{}
+// A failed static import would prevent cancellation and error handling.
+const ready=Promise.resolve().then(()=>import('./{module}.js')).then(async binding=>{{
+  if(typeof binding.default!=='function'||typeof binding.calculate!=='function')throw new Error('binding exports');
+  await binding.default();
+  clearInitialStatus();
+  return binding.calculate;
+}}).catch(()=>{{show(INPUT_ERROR);return null;}});
+let busy=false;
+form.addEventListener('submit',async event=>{{
+  event.preventDefault();
+  if(busy)return;
+  const a=operand(left.value),b=operand(right.value),selected=Number(operation.value);
+  if(a===null||b===null){{show(INPUT_ERROR);return;}}
+  busy=true;
+  submit.disabled=true;
+  try{{
+    const calculate=await ready;
+    if(calculate===null)throw new Error('initialization');
+    const answer=calculate(selected,a,b);
+    if(answer.kind==='ok')show(answer.value);
+    else if(answer.error==='division-by-zero')show(DIVISION_ERROR);
+    else if(answer.error==='overflow')show(OVERFLOW_ERROR);
+    else show(INPUT_ERROR);
+  }}catch(_){{show(INPUT_ERROR);}}
+  finally{{busy=false;submit.disabled=false;}}
+}});
+// Enable only after cancellation is installed, even while Wasm is pending.
+submit.disabled=false;
+"#,
         shared_javascript(view),
     )
 }

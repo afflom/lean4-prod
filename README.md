@@ -347,7 +347,9 @@ does not authorize replacing semantic results with erased dictionary values.
 
 `prod_codegen::generate_text_view_v1(&TextViewV1, &TextBrowserAdapterBinding)`
 projects `prism.text-view/1` into a browser wasm-bindgen adapter and a Hologram
-intent View. The original `generate_view_v1` calculator projection is unchanged.
+intent View. The original `generate_view_v1` numeric projection retains its
+modeled arithmetic and byte protocol; its generated assets also enforce the
+initialization privacy contract described below.
 The seven modeled strings are title, heading, input label, submit label, output
 label, input error and response error; none accepts markup, callbacks or URLs.
 Positive `u32` input/output caps count UTF-8 bytes, not characters. Empty request
@@ -397,6 +399,15 @@ keyboard recovery, invalid responses and absence of draft network/navigation
 leaks. The compiler devcontainer owns locked Playwright 1.62.1 and its Chromium
 revision; missing browser tools fail the gate. These synthetic IR fixtures test
 compiler transport behavior, not application proofs.
+
+`just view` also runs eight real Chromium cases over the generated numeric
+View and its compiled fixture Wasm. Both numeric projections prohibit native
+form navigation with their own early CSP, omit named operand/operation fields,
+and enable submit only after cancellation is installed. The modeled input-error
+text is the no-JavaScript/initialization-failure fallback; a caught dynamic
+binding import lets pending submissions wait locally for Wasm without losing
+input. These security changes intentionally change numeric View asset bytes,
+not arithmetic or the generated core.
 
 ## Roots (proof-graph analysis)
 

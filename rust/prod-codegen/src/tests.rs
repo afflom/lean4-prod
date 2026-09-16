@@ -270,7 +270,7 @@ fn test_view_v1_projects_both_transports_without_raw_content() {
             .bytes,
     )
     .unwrap();
-    assert!(browser.contains("calculate(Number(operation.value),a,b)"));
+    assert!(browser.contains("calculate(selected,a,b)"));
     assert!(browser.contains("const MIN=-9223372036854775808n"));
     assert!(browser.contains("/^(?:0|-[1-9][0-9]*|[1-9][0-9]*)$/"));
     assert!(!browser.contains("value.replace"));
@@ -280,6 +280,30 @@ fn test_view_v1_projects_both_transports_without_raw_content() {
     assert!(cargo.contains("prism-calculator = \"=0.1.0\""));
     assert!(!cargo.contains("path ="));
     assert!(!cargo.contains("git ="));
+}
+
+#[test]
+fn test_view_v1_never_uses_native_form_submission() {
+    let (view, binding) = view_fixture();
+    let generated = generate_view_v1(&view, &binding).unwrap();
+    for assets in [&generated.browser_assets, &generated.hologram_assets] {
+        let index = core::str::from_utf8(&assets[2].bytes).unwrap();
+        assert!(index.find("form-action 'none'").unwrap() < index.find("<form").unwrap());
+        for name in ["left", "right", "operation"] {
+            assert!(!index.contains(&format!("name=\"{name}\"")));
+        }
+        assert!(index.contains("id=\"submit\" type=\"submit\" disabled"));
+        assert!(index.contains(&format!(">{}</output>", view.input_error)));
+        let script = core::str::from_utf8(&assets[1].bytes).unwrap();
+        assert!(
+            script.find("event.preventDefault()").unwrap()
+                < script.find("submit.disabled=false").unwrap()
+        );
+    }
+    let script = core::str::from_utf8(&generated.browser_assets[1].bytes).unwrap();
+    assert!(script.contains("import('./prism_calculator.js')"));
+    assert!(!script.starts_with("import "));
+    assert!(script.contains(".catch(()=>{show(INPUT_ERROR);return null;})"));
 }
 
 #[test]

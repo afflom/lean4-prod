@@ -320,6 +320,30 @@ public structure PortableContainers where
 
 @[expose] public def byteFixture : ByteArray := ByteArray.mk #[170, 187, 127, 255]
 
+-- Closed literal boundaries exercised by the actual portable-package gate.
+@[expose] public def emptyByteFixture : ByteArray := ByteArray.mk #[]
+
+@[expose] public def byteLiteralEquals (value : ByteArray) : Bool :=
+  LexLeanRuntime.equal value (ByteArray.mk #[0, 128, 255])
+
+@[expose] public def emptyByteLiteralEquals : Bool :=
+  LexLeanRuntime.equal (ByteArray.mk #[]) (ByteArray.mk #[])
+
+@[expose] public def nestedByteFixture (choose : Bool) (value : ByteArray) : ByteArray :=
+  if choose then LexLeanRuntime.append (ByteArray.mk #[0, 128, 255]) value
+  else ByteArray.mk #[255, 0]
+
+@[expose] public def reuseByteFixture (value : ByteArray) : ByteArray :=
+  match LexLeanRuntime.utf8Decode value with
+  | none => ByteArray.mk #[255, 0]
+  | some _ => LexLeanRuntime.append (ByteArray.mk #[0, 128, 255]) value
+
+-- Literal support must not silently widen the supported Array subset.
+@[expose] public def unsupportedArrayFixture : Array UInt8 := #[0, 255]
+
+@[expose] public def unsupportedDynamicByteFixture (value : UInt8) : ByteArray :=
+  ByteArray.mk #[value]
+
 @[expose] public def encodeUtf8 (value : String) : ByteArray := (LexLeanRuntime.utf8Encode (value) : ByteArray)
 
 @[expose] public def decodeUtf8 (value : ByteArray) : Option (String) := (LexLeanRuntime.utf8Decode (value) : Option (String))

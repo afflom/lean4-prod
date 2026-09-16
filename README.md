@@ -323,6 +323,18 @@ command fails. Those composite values need an explicit buffer/ownership and
 layout contract before they can safely cross a C ABI. The header and wrapper
 are generated artifacts; do not hand-edit either file.
 
+## Closed byte literals
+
+The portable `Bytes` ABI also accepts closed Lean `ByteArray` literals, including
+empty data and non-UTF-8 bytes. The lowerer folds only the typed
+`Array UInt8` literal construction chain consumed by `ByteArray.mk` into a
+`(bytes 0 128 255)` IR leaf. Arbitrary runtime Arrays and dynamic byte-array
+construction remain rejected; this does not widen the Array language subset.
+Owned literal results use the existing `Vec<u8>` ABI and materialize once at
+that boundary. Borrowed literal comparisons and calls use static byte slices.
+`just portable-package` executes literal returns, nested branches, append and
+decode-then-reuse in both `std` and `no_std + alloc`, alongside rejection probes.
+
 ## Closed text Views
 
 `prod_codegen::generate_text_view_v1(&TextViewV1, &TextBrowserAdapterBinding)`

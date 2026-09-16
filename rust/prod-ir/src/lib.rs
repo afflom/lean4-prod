@@ -78,6 +78,8 @@ pub enum Expr {
     Nat(u64),
     Int(i64),
     String(String),
+    /// Closed arbitrary byte literal; not a UTF-8 string or a dynamic Array.
+    Bytes(Vec<u8>),
     Bool(bool),
     Var(String),
     Param(usize), // De Bruijn-style parameter index
@@ -252,6 +254,7 @@ impl Expr {
             Expr::Nat(_)
             | Expr::Int(_)
             | Expr::String(_)
+            | Expr::Bytes(_)
             | Expr::Bool(_)
             | Expr::Var(_)
             | Expr::Param(_)
@@ -317,6 +320,7 @@ mod tests {
         "BitOr",
         "BitXor",
         "Bool",
+        "Bytes",
         "Call",
         "CheckedAdd",
         "CheckedConvert",
@@ -372,6 +376,7 @@ mod tests {
             Expr::Nat(_) => "Nat",
             Expr::Int(_) => "Int",
             Expr::String(_) => "String",
+            Expr::Bytes(_) => "Bytes",
             Expr::Bool(_) => "Bool",
             Expr::Var(_) => "Var",
             Expr::Param(_) => "Param",
@@ -446,6 +451,7 @@ mod tests {
             (Expr::Nat(1), vec![]),
             (Expr::Int(-1), vec![]),
             (Expr::String(String::from("text")), vec![]),
+            (Expr::Bytes(vec![0, 128, 255]), vec![]),
             (Expr::Bool(true), vec![]),
             (v("x"), vec![]),
             (Expr::Param(0), vec![]),

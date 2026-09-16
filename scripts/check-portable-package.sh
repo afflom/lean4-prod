@@ -12,7 +12,9 @@ lake exe prod-export \
   --root SemanticFixture.Portable.andUInt64 \
   --root SemanticFixture.Portable.appendBytes \
   --root SemanticFixture.Portable.byteAt \
+  --root SemanticFixture.Portable.byteFixture \
   --root SemanticFixture.Portable.byteLength \
+  --root SemanticFixture.Portable.byteLiteralEquals \
   --root SemanticFixture.Portable.checkedAddInt64 \
   --root SemanticFixture.Portable.checkedMultiplyInt64 \
   --root SemanticFixture.Portable.checkedNegateInt64 \
@@ -20,14 +22,18 @@ lake exe prod-export \
   --root SemanticFixture.Portable.checkedSubtractInt64 \
   --root SemanticFixture.Portable.compareByteStrings \
   --root SemanticFixture.Portable.decodeUtf8 \
+  --root SemanticFixture.Portable.emptyByteFixture \
+  --root SemanticFixture.Portable.emptyByteLiteralEquals \
   --root SemanticFixture.Portable.encodeUtf8 \
   --root SemanticFixture.Portable.formatInt64 \
   --root SemanticFixture.Portable.isZeroInt64 \
   --root SemanticFixture.Portable.joinStrings \
   --root SemanticFixture.Portable.maximumUInt64 \
+  --root SemanticFixture.Portable.nestedByteFixture \
   --root SemanticFixture.Portable.notUInt64 \
   --root SemanticFixture.Portable.orUInt64 \
   --root SemanticFixture.Portable.parseInt64 \
+  --root SemanticFixture.Portable.reuseByteFixture \
   --root SemanticFixture.Portable.shiftRightUInt64 \
   --root SemanticFixture.Portable.shiftUInt64 \
   --root SemanticFixture.Portable.sliceBytes \
@@ -86,5 +92,18 @@ if "$repo_root/rust/target/debug/prod" cargo "$scratch/int-export/kernel.ir" \
   exit 1
 fi
 rg -q 'mathematical Lean `Int` is unbounded and cannot be represented by a fixed-width Rust integer' "$scratch/int.stderr"
+
+for rejected in unsupportedArrayFixture unsupportedDynamicByteFixture; do
+  if lake exe prod-export \
+      --module Conformance.LexLeanPortable \
+      --root "SemanticFixture.Portable.$rejected" \
+      --ir-module RejectedArray \
+      --out "$scratch/$rejected" \
+      >"$scratch/$rejected.stdout" 2>"$scratch/$rejected.stderr"; then
+    echo "unsupported Array export unexpectedly accepted: $rejected" >&2
+    exit 1
+  fi
+  rg -q 'prod-export failed: closed byte-array literal builder used outside ByteArray.mk' "$scratch/$rejected.stderr"
+done
 
 echo "real LexLean portable Cargo package and mathematical-Int rejection passed"

@@ -29,6 +29,7 @@
 //!            | "(" "unreachable" ")"
 //!            | "(" "extern" '"' ident '"' expr* ")"        ; unresolved callee
 //!            | portable-op | "(" "string" json-string ")"
+//!            | "(" "bytes" byte* ")"                     ; closed u8 literals
 //! alt      ::= "(" "alt" '"' ident '"' "(" ident* ")" expr ")"
 //! default  ::= "(" "default" expr ")"
 //! comment  ::= ";;" ... end-of-line                       ; skipped as whitespace
@@ -42,7 +43,7 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take_till, take_while1},
     character::complete::{char, digit1, multispace1},
-    combinator::{map, map_res, opt, value},
+    combinator::{map, map_res, opt, peek, value},
     error::{Error as NomError, ErrorKind},
     multi::many0,
     sequence::{delimited, preceded, terminated, tuple},
@@ -494,6 +495,13 @@ fn parse_paren_expr(input: &str) -> IResult<&str, Expr> {
                 map(tuple((tag("string"), ws(quoted_string))), |(_, value)| {
                     Expr::String(value)
                 }),
+                map(
+                    preceded(
+                        terminated(tag("bytes"), peek(alt((multispace1, tag(")"), tag(";;"))))),
+                        many0(ws(map_res(digit1, str::parse::<u8>))),
+                    ),
+                    Expr::Bytes,
+                ),
             )),
         ))),
         ws(char(')')),
@@ -696,6 +704,24 @@ mod tests {
             parse_expr(r#"(string "portable ✓\n\"ok\"")"#).unwrap().1,
             Expr::String("portable ✓\n\"ok\"".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_closed_byte_literals() {
+        assert_eq!(parse_expr("(bytes)").unwrap().1, Expr::Bytes(vec![]));
+        assert_eq!(
+            parse_expr("(bytes 0 127 128 255)").unwrap().1,
+            Expr::Bytes(vec![0, 127, 128, 255])
+        );
+        for invalid in [
+            "(bytes 256)",
+            "(bytes -1)",
+            "(bytes value)",
+            "(bytes0)",
+            "(bytes 1.2)",
+        ] {
+            assert!(parse_expr(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]

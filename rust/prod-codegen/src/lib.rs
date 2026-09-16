@@ -595,7 +595,7 @@ fn expression_is_non_copy(
 ) -> bool {
     let non_copy_type = |ty: &Type| !copy_type(ty, table, &mut BTreeSet::new());
     match expr {
-        Expr::String(_) => true,
+        Expr::String(_) | Expr::Bytes(_) => true,
         Expr::Var(name) => non_copy_locals.contains(name),
         Expr::Call(name, _) => definitions
             .iter()
@@ -729,7 +729,7 @@ fn repeated_non_copy_locals(
 fn inline_bindings(expr: &Expr) -> BTreeMap<String, &Expr> {
     fn walk<'a>(expr: &'a Expr, output: &mut BTreeMap<String, &'a Expr>) {
         if let Expr::Let(name, value, _) = expr {
-            if matches!(value.as_ref(), Expr::String(_))
+            if matches!(value.as_ref(), Expr::String(_) | Expr::Bytes(_))
                 || matches!(
                     value.as_ref(),
                     Expr::Ctor(constructor, arguments)
@@ -740,9 +740,9 @@ fn inline_bindings(expr: &Expr) -> BTreeMap<String, &Expr> {
                 // `List.nil` and `Option.none` are polymorphic in Lean. LCNF
                 // can CSE one closed value across uses with different element
                 // types, but one Rust local cannot have several monomorphic
-                // types. String literals are also inlined so borrowed
+                // types. String/byte literals are also inlined so borrowed
                 // comparison/call positions stay allocation-free while owned
-                // record fields still materialize a String at their use.
+                // record fields still materialize an owned value at their use.
                 output.insert(name.clone(), value);
             }
         }
@@ -1385,6 +1385,12 @@ impl<'m> Renderer<'_, 'm> {
                         };
                         Ok(format!("{value:?}"))
                     }
+                    Some((Type::Bytes, true)) if matches!(argument, Expr::Bytes(_)) => {
+                        let Expr::Bytes(value) = argument else {
+                            unreachable!()
+                        };
+                        Ok(format!("&{value:?}"))
+                    }
                     Some((Type::String | Type::Bytes, true)) => {
                         let rendered = self.value(argument)?;
                         Ok(format!("({rendered}).as_ref()"))
@@ -1620,6 +1626,10 @@ impl<'m> Renderer<'_, 'm> {
             Expr::String(value) => Ok(format!(
                 "alloc::string::String::from({value:?})"
             )),
+            // One owned allocation at the existing Bytes ABI boundary; the
+            // compiler folds Array literal builders, so no push-chain or
+            // intermediate runtime allocations are introduced.
+            Expr::Bytes(value) => Ok(format!("alloc::vec!{value:?}")),
             Expr::Bool(b) => Ok(format!("{}", b)),
             Expr::Param(index) => self
                 .params
@@ -1766,6 +1776,10 @@ impl<'m> Renderer<'_, 'm> {
             ) {
                 (other, Expr::String(value)) | (Expr::String(value), other) => {
                     Ok(format!("{} == {value:?}", self.value(other)?))
+                }
+                (Expr::Bytes(left), Expr::Bytes(right)) => Ok(format!("{}", left == right)),
+                (other, Expr::Bytes(value)) | (Expr::Bytes(value), other) => {
+                    Ok(format!("core::convert::AsRef::<[u8]>::as_ref(&({})) == &{value:?}", self.value(other)?))
                 }
                 _ => self.binop(a, b, "=="),
             },

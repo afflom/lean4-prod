@@ -27,6 +27,18 @@ fn real_lexlean_portable_operations_execute_with_exact_rust_semantics() {
     assert_eq!(portable_expanded::sliceBytes(vec![1], 1, 1), None);
     assert_eq!(portable_expanded::compareByteStrings(vec![1], vec![2]), Ordering::Less);
 
+    assert_eq!(portable_expanded::byteFixture(), vec![170, 187, 127, 255]);
+    assert_eq!(portable_expanded::emptyByteFixture(), Vec::<u8>::new());
+    assert_eq!(portable_expanded::nestedByteFixture(true, vec![0xc3, 0xa9]), vec![0, 128, 255, 0xc3, 0xa9]);
+    assert_eq!(portable_expanded::nestedByteFixture(false, vec![1, 2, 3]), vec![255, 0]);
+    assert!(portable_expanded::byteLiteralEquals(&[0, 128, 255]));
+    assert!(!portable_expanded::byteLiteralEquals(&[]));
+    assert!(!portable_expanded::byteLiteralEquals(&[0, 128, 254]));
+    assert!(portable_expanded::emptyByteLiteralEquals());
+    assert_eq!(portable_expanded::reuseByteFixture(vec![0xc3, 0xa9]), vec![0, 128, 255, 0xc3, 0xa9]);
+    assert_eq!(portable_expanded::reuseByteFixture(vec![0xff]), vec![255, 0]);
+    assert_eq!(portable_expanded::reuseByteFixture(vec![]), vec![0, 128, 255]);
+
     let text = String::from("portable ✓");
     let encoded = portable_expanded::encodeUtf8(text.clone());
     assert_eq!(portable_expanded::decodeUtf8(encoded), Some(text));

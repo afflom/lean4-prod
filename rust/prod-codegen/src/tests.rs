@@ -1202,6 +1202,91 @@ fn test_string_predicates_borrow_inputs_and_literals_without_allocating() {
 }
 
 #[test]
+fn test_byte_literals_preserve_arbitrary_bytes_and_borrow_in_predicates() {
+    let ir = r#"
+(module M
+  (type "M.Record" (ctor "M.Record.mk" (data Bytes)))
+  (def arbitrary () Bytes (bytes 0 128 255))
+  (def empty () Bytes (bytes))
+  (def equalsBytes ((value Bytes)) Bool (let token (bytes 0 128 255) (eq value token)))
+  (def getter ((value (named "M.Record"))) Bytes (let result (proj "M.Record" "data" value) result))
+  (def equalsField ((value (named "M.Record"))) Bool (eq (proj "M.Record" "data" value) (bytes 0 128 255)))
+  (def equalsGetter ((value (named "M.Record"))) Bool (eq (bytes 0 128 255) (call getter value)))
+  (def equalsAlias ((value (named "M.Record")) (flag Bool)) Bool
+    (let data (if flag (proj "M.Record" "data" value) (call getter value))
+      (eq data (bytes 0 128 255))))
+  (def literalCall () Bool (call equalsBytes (bytes 0 128 255)))
+  (def literalEqual () Bool (eq (bytes) (bytes))))
+"#;
+    let out = generate(ir);
+    assert!(out.contains("alloc::vec![0, 128, 255]"));
+    assert!(out.contains("alloc::vec![]"));
+    assert!(out.contains("pub fn equalsBytes(value: &[u8]) -> bool"));
+    assert!(out.contains("core::convert::AsRef::<[u8]>::as_ref(&(value)) == &[0, 128, 255]"));
+    assert!(out.contains("equalsBytes(&[0, 128, 255])"));
+    assert_eq!(out.matches("alloc::vec!").count(), 2);
+    let directory = loop {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let candidate = std::env::temp_dir().join(std::format!(
+            "prod-codegen-byte-literals-{}-{nonce}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                panic!("cannot create isolated byte-literal regression directory: {error}")
+            }
+        }
+    };
+    let source = directory.join("main.rs");
+    let executable = directory.join("byte-literals");
+    std::fs::write(
+        &source,
+        std::format!(
+            r#"extern crate alloc;
+{out}
+fn main() {{
+    assert_eq!(arbitrary(), vec![0, 128, 255]);
+    assert_eq!(empty(), Vec::<u8>::new());
+    assert!(literalCall());
+    assert!(literalEqual());
+    for data in [vec![0, 128, 255], vec![], vec![255, 128, 0]] {{
+        let expected = data == [0, 128, 255];
+        let record = Record {{ data }};
+        assert_eq!(equalsBytes(&record.data), expected);
+        assert_eq!(equalsField(&record), expected);
+        assert_eq!(equalsGetter(&record), expected);
+        for flag in [false, true] {{ assert_eq!(equalsAlias(&record, flag), expected); }}
+    }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let compiled = std::process::Command::new("rustc")
+        .args(["--edition", "2021"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        std::string::String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(std::process::Command::new(&executable)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn test_borrowed_constructor_fields_and_scalar_match_binders_execute() {
     let ir = r#"
 (module M

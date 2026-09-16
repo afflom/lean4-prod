@@ -67,6 +67,10 @@ structure LowerState where
   used    : Std.HashSet String := {}
   /-- Compiler-generated Nat dictionaries which are semantically operators. -/
   knownOps : Std.HashMap String String := {}
+  /-- Closed scalar literals and Array UInt8 literal builders. Builders never
+      become runtime Arrays: only an exact ByteArray.mk may consume them. -/
+  literalNats : Std.HashMap Name Nat := {}
+  literalByteArrays : Std.HashMap Name (Array UInt8) := {}
   counter : Nat := 0
   opaques : Array String := #[]            -- opaque markers emitted
   externs : Array String := #[]            -- non-tagged, non-whitelisted calls
@@ -107,7 +111,9 @@ def registerFVar (fvarId : FVarId) (binderName : Name) : LowerM String := do
 
 /-- Look up an already-registered fvarId (falls back to registering its raw
     name, which is still a valid identifier). -/
-def lookupFVar (fvarId : FVarId) : LowerM String :=
+def lookupFVar (fvarId : FVarId) : LowerM String := do
+  if (← get).literalByteArrays.contains fvarId.name then
+    throwError "closed byte-array literal builder used outside ByteArray.mk"
   registerFVar fvarId fvarId.name
 
 /-- Names used by Lean's Nat typeclass dictionaries in pure LCNF output. -/
@@ -268,7 +274,40 @@ private def isCtorName (env : Environment) (n : Name) : Bool :=
   | some (.ctorInfo _) => true
   | _ => false
 
+private def literalNat? (value : LetValue .pure) : LowerM (Option Nat) := do
+  let literals := (← get).literalNats
+  match value with
+  | .lit (.nat value) => return some value
+  | .lit (.uint8 value) => return some value.toNat
+  | .const ``UInt8.ofNat _ #[.fvar input] =>
+    return (literals[input.name]?).map (· % 256)
+  | .fvar input #[] => return literals[input.name]?
+  | _ => return none
+
+/-- Fold only Lean's literal `Array UInt8` construction chain, not arbitrary
+    Array operations or runtime byte values. The exact result type and type
+    argument are checked before ignoring the allocation-capacity hint. -/
+private def literalByteArray? (decl : LetDecl .pure) : LowerM (Option (Array UInt8)) := do
+  let .app (.const ``Array _) (.const ``UInt8 _) := decl.type | return none
+  let st ← get
+  match decl.value with
+  | .const ``Array.mkEmpty _ #[.type (.const ``UInt8 _), .fvar _] =>
+    return some #[]
+  | .const ``Array.push _ #[.type (.const ``UInt8 _), .fvar input, .fvar byte] =>
+    let some bytes := st.literalByteArrays[input.name]? | return none
+    let some value := st.literalNats[byte.name]? | return none
+    if value > 255 then return none
+    return some (bytes.push value.toUInt8)
+  | .fvar input #[] => return st.literalByteArrays[input.name]?
+  | _ => return none
+
+private def byteLiteral? (value : LetValue .pure) : LowerM (Option String) := do
+  let .const ``ByteArray.mk _ #[.fvar input] := value | return none
+  let some bytes := (← get).literalByteArrays[input.name]? | return none
+  return some ("(bytes" ++ spaced (bytes.map (fun byte => toString byte.toNat)) ++ ")")
+
 def lowerLetValue (v : LetValue .pure) : LowerM String := do
+  if let some literal ← byteLiteral? v then return literal
   match v with
   | .lit (.nat n) => return toString n
   | .lit (.uint8 n) => return toString n
@@ -409,6 +448,11 @@ def decideOf? (decl : LetDecl .pure) (k : Code .pure)
 partial def lowerCode : Code .pure → LowerM String
   | .let decl k => do
     let nm ← registerFVar decl.fvarId decl.binderName
+    if let some literal ← literalNat? decl.value then
+      modify fun st => { st with literalNats := st.literalNats.insert decl.fvarId.name literal }
+    if let some bytes ← literalByteArray? decl then
+      modify fun st => { st with literalByteArrays := st.literalByteArrays.insert decl.fvarId.name bytes }
+      return ← lowerCode k
     match decidableIf? decl k with
     | some (op, a, b, elseCode, thenCode) =>
       let a' ← lookupFVar a

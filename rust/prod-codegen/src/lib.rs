@@ -793,6 +793,28 @@ fn expression_is_borrowed(
     }
 }
 
+fn list_head_rebound_by_value(
+    scrutinee: &Expr,
+    params: &[(String, Type)],
+    table: &TypeTable<'_>,
+) -> bool {
+    // Known non-Copy parameter heads stay borrowed. Other heads retain the
+    // renderer's existing clone/rebind, including unknown nested/alias types;
+    // `true` means rebound, not a claim that an unknown element is Copy.
+    let Expr::Var(name) = scrutinee else {
+        return true;
+    };
+    params
+        .iter()
+        .find_map(|(parameter, ty)| {
+            (parameter == name).then_some(ty).and_then(|ty| match ty {
+                Type::List(element) => Some(copy_type(element, table, &mut BTreeSet::new())),
+                _ => None,
+            })
+        })
+        .unwrap_or(true)
+}
+
 fn borrowed_locals(
     definition: &Definition,
     definitions: &[Definition],
@@ -802,24 +824,34 @@ fn borrowed_locals(
         expr: &Expr,
         definitions: &[Definition],
         table: &TypeTable<'_>,
+        params: &[(String, Type)],
         locals: &mut BTreeSet<String>,
     ) {
         match expr {
             Expr::Let(name, value, body) => {
-                walk(value, definitions, table, locals);
+                walk(value, definitions, table, params, locals);
                 if expression_is_borrowed(value, definitions, table, locals) {
                     locals.insert(name.clone());
                 }
-                walk(body, definitions, table, locals);
+                walk(body, definitions, table, params, locals);
             }
             Expr::Match {
                 scrut,
                 alts,
                 default,
             } => {
-                walk(scrut, definitions, table, locals);
+                walk(scrut, definitions, table, params, locals);
                 let borrowed = expression_is_borrowed(scrut, definitions, table, locals);
                 for alt in alts {
+                    if alt.ctor == "List.cons" && alt.binders.len() == 2 {
+                        // Slice patterns always borrow their tail. Keep the
+                        // head classification identical to render_match's
+                        // optional by-value rebind, including nested matches.
+                        locals.insert(alt.binders[1].clone());
+                        if !list_head_rebound_by_value(scrut, params, table) {
+                            locals.insert(alt.binders[0].clone());
+                        }
+                    }
                     if borrowed {
                         if let Some(constructor) = table.values().find_map(|declaration| {
                             declaration.ctors.iter().find(|row| row.name == alt.ctor)
@@ -832,15 +864,15 @@ fn borrowed_locals(
                             }
                         }
                     }
-                    walk(&alt.body, definitions, table, locals);
+                    walk(&alt.body, definitions, table, params, locals);
                 }
                 if let Some(default) = default {
-                    walk(default, definitions, table, locals);
+                    walk(default, definitions, table, params, locals);
                 }
             }
             _ => {
                 for child in expr.children() {
-                    walk(child, definitions, table, locals);
+                    walk(child, definitions, table, params, locals);
                 }
             }
         }
@@ -852,7 +884,13 @@ fn borrowed_locals(
         .filter(|(_, ty)| internal_borrowed_parameter(ty, table, returns_copy))
         .map(|(name, _)| name.clone())
         .collect();
-    walk(&definition.body, definitions, table, &mut locals);
+    walk(
+        &definition.body,
+        definitions,
+        table,
+        &definition.params,
+        &mut locals,
+    );
     locals
 }
 
@@ -1311,21 +1349,8 @@ impl<'m> Renderer<'_, 'm> {
         }
     }
 
-    fn list_head_is_copy(&self, scrutinee: &Expr) -> bool {
-        let Expr::Var(name) = scrutinee else {
-            return true;
-        };
-        self.params
-            .iter()
-            .find_map(|(parameter, ty)| {
-                (parameter == name).then_some(ty).and_then(|ty| match ty {
-                    Type::List(element) => {
-                        Some(copy_type(element, self.types, &mut BTreeSet::new()))
-                    }
-                    _ => None,
-                })
-            })
-            .unwrap_or(true)
+    fn list_head_rebound_by_value(&self, scrutinee: &Expr) -> bool {
+        list_head_rebound_by_value(scrutinee, self.params, self.types)
     }
 
     /// The declaration of a constructor, by its full Lean name.
@@ -1520,12 +1545,12 @@ impl<'m> Renderer<'_, 'm> {
                     self.render_cons(&args[0], &args[1], out, env, *depth)
                 }
                 Mode::Value if self.is_empty_list(&args[1]) => {
-                    Ok(format!("alloc::vec![{}]", self.value(&args[0])?))
+                    Ok(format!("alloc::vec![{}]", self.owned_value(&args[0])?))
                 }
                 Mode::Value => Ok(format!(
                     "{{ let mut __list = alloc::vec![{}]; __list.extend({}); __list }}",
-                    self.value(&args[0])?,
-                    self.value(&args[1])?
+                    self.owned_value(&args[0])?,
+                    self.owned_value(&args[1])?
                 )),
             },
 
@@ -1679,7 +1704,7 @@ impl<'m> Renderer<'_, 'm> {
             )),
             Expr::Append(left, right) => Ok(format!(
                 "{{ let mut __value = {}; __value.extend_from_slice(&{}); __value }}",
-                self.value(left)?,
+                self.owned_value(left)?,
                 self.value(right)?
             )),
             Expr::Length(value) => Ok(format!("({}).len() as u64", self.value(value)?)),
@@ -1784,7 +1809,19 @@ impl<'m> Renderer<'_, 'm> {
                 (other, Expr::Bytes(value)) | (Expr::Bytes(value), other) => {
                     Ok(format!("core::convert::AsRef::<[u8]>::as_ref(&({})) == &{value:?}", self.value(other)?))
                 }
-                _ => self.binop(a, b, "=="),
+                _ => {
+                    let borrowed_a = expression_is_borrowed(a, self.definitions, self.types, &self.borrowed_locals);
+                    let borrowed_b = expression_is_borrowed(b, self.definitions, self.types, &self.borrowed_locals);
+                    let a = self.value(a)?;
+                    let b = self.value(b)?;
+                    // Equality borrows its operands; normalize mixed owned /
+                    // borrowed values without cloning either collection.
+                    match (borrowed_a, borrowed_b) {
+                        (false, true) => Ok(format!("(&({a}) == {b})")),
+                        (true, false) => Ok(format!("({a} == &({b}))")),
+                        _ => Ok(format!("({a} == {b})")),
+                    }
+                }
             },
             Expr::Lt(a, b) => self.binop(a, b, "<"),
             Expr::Le(a, b) => self.binop(a, b, "<="),
@@ -1960,7 +1997,7 @@ impl<'m> Renderer<'_, 'm> {
         default: Option<&'m Expr>,
         mode: &Mode<'_, 'm>,
     ) -> Result<String, Error> {
-        let head_is_copy = self.list_head_is_copy(scrut);
+        let head_rebound_by_value = self.list_head_rebound_by_value(scrut);
         let scrut_is_borrowed =
             expression_is_borrowed(scrut, self.definitions, self.types, &self.borrowed_locals);
         let branch_borrows = alts
@@ -2000,7 +2037,7 @@ impl<'m> Renderer<'_, 'm> {
                 // Match ergonomics bind the head by reference; rebind it by
                 // value so arithmetic on it needs no dereference syntax.
                 ("List.nil", 0) => format!("        [] => {},\n", body),
-                ("List.cons", 2) if head_is_copy => format!(
+                ("List.cons", 2) if head_rebound_by_value => format!(
                     "        [{}, {} @ ..] => {{ let {} = {}.clone(); {} }},\n",
                     rust_local_ident(&alt.binders[0]),
                     rust_local_ident(&alt.binders[1]),

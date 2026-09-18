@@ -137,6 +137,71 @@ fn borrowed_utf8_encoding_executes_native_no_std_and_wasm() {
                 (if (eq (call repeatedLength value) (add (length input) (length input)))
                   (if (eq (call recordLength (ctor "TextBox.mk" value)) (length input))
                     (call encodeAgain input) (bytes 254)) (bytes 254)) (bytes 254)) (bytes 254))))))"#;
+    execute_owned_fixture(ir, include_str!("fixtures/borrowed_utf8_generated_test.rs"));
+}
+
+/// Scenario: slice-pattern heads/tails remain borrowed until an owned
+/// constructor or byte result needs them; mixed ownership never changes Eq.
+#[test]
+fn borrowed_lists_and_mixed_equality_execute_native_no_std_and_wasm() {
+    let ir = r#"(module BorrowedCollections
+      (type "TextBox" (ctor "TextBox.mk" (text String)))
+      (type "TextList" (ctor "TextList.mk" (values (List String))))
+      (type "ByteBox" (ctor "ByteBox.mk" (bytes Bytes)))
+      (def firstBytes ((values (List String))) Bytes
+        (cases values (alt "List.nil" () (bytes))
+          (alt "List.cons" (head tail) (utf8-encode head))))
+      (def nestedBytes ((values (List String))) Bytes
+        (cases values (alt "List.nil" () (bytes))
+          (alt "List.cons" (head tail)
+            (cases tail (alt "List.nil" () (bytes))
+              (alt "List.cons" (second rest) (utf8-encode second))))))
+      (def firstBox ((values (List String))) (named "TextBox")
+        (cases values (alt "List.nil" () (ctor "TextBox.mk" (string "")))
+          (alt "List.cons" (head tail) (ctor "TextBox.mk" head))))
+      (def aliasBox ((values (List String))) (named "TextBox")
+        (let alias values
+          (cases alias (alt "List.nil" () (ctor "TextBox.mk" (string "")))
+            (alt "List.cons" (head tail) (ctor "TextBox.mk" head)))))
+      (def prepend ((value (named "TextList"))) (named "TextList")
+        (ctor "TextList.mk" (ctor "List.cons" (string "prefix") (proj "TextList" "values" value))))
+      (def copyHeadAndTail ((values (List String))) (named "TextList")
+        (cases values (alt "List.nil" () (ctor "TextList.mk" (ctor "List.nil")))
+          (alt "List.cons" (head tail) (ctor "TextList.mk" (ctor "List.cons" head tail)))))
+      (def boxBytes ((value (named "TextBox"))) Bytes
+        (utf8-encode (proj "TextBox" "text" value)))
+      (def sameBytes ((input Bytes) (value (named "ByteBox"))) Bool
+        (eq (call ownBytes input) (proj "ByteBox" "bytes" value)))
+      (def sameBytesReversed ((input Bytes) (value (named "ByteBox"))) Bool
+        (eq (proj "ByteBox" "bytes" value) (call ownBytes input)))
+      (def ownBytes ((input Bytes)) Bytes input)
+      (def appendMatches ((input Bytes)) Bool (eq (append input (bytes)) input))
+      (def ownString ((value String)) String value)
+      (def sameStrings ((input String) (value (named "TextBox"))) Bool
+        (eq (call ownString input) (proj "TextBox" "text" value)))
+      (def entry ((input Bytes)) Bytes
+        (cases (utf8-decode input)
+          (alt "Option.none" () (bytes 255))
+          (alt "Option.some" (text)
+            (let values (ctor "List.cons" text (ctor "List.nil"))
+              (let box (call firstBox values)
+                (let extended (call prepend (ctor "TextList.mk" values))
+                  (if (call appendMatches input)
+                   (if (eq (call boxBytes (call aliasBox values)) input)
+                    (if (eq (call firstBytes (proj "TextList" "values" (call copyHeadAndTail values))) input)
+                   (if (eq (call boxBytes box) input)
+                    (if (eq (call nestedBytes (proj "TextList" "values" extended)) input)
+                      (if (call sameBytes input (ctor "ByteBox.mk" input))
+                        (if (call sameBytesReversed input (ctor "ByteBox.mk" input))
+                          (if (call sameStrings (proj "TextBox" "text" box) box)
+                            (call firstBytes values) (bytes 254)) (bytes 254)) (bytes 254)) (bytes 254)) (bytes 254)) (bytes 254)) (bytes 254)) (bytes 254)))))))))"#;
+    execute_owned_fixture(
+        ir,
+        include_str!("fixtures/borrowed_collections_generated_test.rs"),
+    );
+}
+
+fn execute_owned_fixture(ir: &str, native_test: &str) {
     let (remaining, module) = parse_module(ir).unwrap();
     assert!(remaining.trim().is_empty());
     let input_sha256 = format!("{:x}", Sha256::digest(ir.as_bytes()));
@@ -179,11 +244,7 @@ fn borrowed_utf8_encoding_executes_native_no_std_and_wasm() {
     }
     let native = fixture.0.join("native");
     fs::create_dir(native.join("tests")).unwrap();
-    fs::write(
-        native.join("tests/utf8.rs"),
-        include_str!("fixtures/borrowed_utf8_generated_test.rs"),
-    )
-    .unwrap();
+    fs::write(native.join("tests/utf8.rs"), native_test).unwrap();
     for features in [None, Some("--no-default-features")] {
         let mut command = Command::new("cargo");
         command

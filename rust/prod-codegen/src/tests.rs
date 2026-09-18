@@ -938,6 +938,7 @@ fn test_every_error_variant_is_published_in_rejections() {
         Error::UnresolvedCall(s()),
         Error::UnknownField(s(), s()),
         Error::UnsupportedJoinPoint(s()),
+        Error::DuplicateBinding(s()),
     ];
 
     for error in &all {
@@ -955,6 +956,7 @@ fn test_every_error_variant_is_published_in_rejections() {
             Error::UnresolvedCall(_) => "UnresolvedCall",
             Error::UnknownField(..) => "UnknownField",
             Error::UnsupportedJoinPoint(_) => "UnsupportedJoinPoint",
+            Error::DuplicateBinding(_) => "DuplicateBinding",
         };
         assert!(
             REJECTIONS.iter().any(|(variant, _)| *variant == name),

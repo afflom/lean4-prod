@@ -106,6 +106,7 @@ extern crate alloc;
 
 mod c_abi;
 mod core_wasm;
+mod naming;
 mod ownership;
 mod package;
 mod sdk;
@@ -165,6 +166,9 @@ pub enum Error {
     /// A join point that jumps to itself. Acyclic join points are duplicated
     /// at their call sites; cycles would need real control flow.
     UnsupportedJoinPoint(String),
+    /// Two simultaneous parameters or pattern fields bind the same name.
+    /// Ordinary nested shadowing and sibling name reuse remain supported.
+    DuplicateBinding(String),
 }
 
 impl fmt::Display for Error {
@@ -212,6 +216,11 @@ impl fmt::Display for Error {
             Error::UnsupportedJoinPoint(name) => write!(
                 f,
                 "join point `{}` has several callers or jumps to itself; only the single-caller form has a lowering",
+                name
+            ),
+            Error::DuplicateBinding(name) => write!(
+                f,
+                "simultaneous parameters or pattern fields repeat binding `{}`",
                 name
             ),
         }
@@ -275,6 +284,10 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     (
         "UnsupportedJoinPoint",
         "a join point with several callers, or one that jumps to itself; only the single-caller form, which inlines at its jump site, has a lowering",
+    ),
+    (
+        "DuplicateBinding",
+        "simultaneous parameters or pattern fields repeat a name; nested shadowing and sibling name reuse remain supported",
     ),
 ];
 
@@ -1024,6 +1037,14 @@ fn generate_def_in<'m>(
     shapes: &Signatures<'m>,
     table: &TypeTable<'m>,
 ) -> Result<String, Error> {
+    // Ownership and inline-value tables are keyed by local name. Preserve
+    // lexical scopes at the public IR boundary before building those tables.
+    let normalized = naming::normalize_definition(
+        def,
+        &|name| emitted_call_name(name, definitions, table),
+        table,
+    )?;
+    let def = &normalized;
     let shape = shapes
         .get(def.name.as_str())
         .copied()
@@ -1287,6 +1308,15 @@ fn borrowed_helper_name(definition: &Definition, definitions: &[Definition]) -> 
         candidate.push('_');
     }
     candidate
+}
+
+fn emitted_call_name(name: &str, definitions: &[Definition], table: &TypeTable<'_>) -> String {
+    definitions
+        .iter()
+        .find(|definition| definition.name == name)
+        .filter(|definition| needs_borrowed_helper(definition, table))
+        .map(|definition| borrowed_helper_name(definition, definitions))
+        .unwrap_or_else(|| String::from(name))
 }
 
 /// A `(named ...)` type occurring in a definition's signature must be
@@ -1585,12 +1615,7 @@ impl<'m> Renderer<'_, 'm> {
     }
 
     fn call_name(&self, name: &str) -> String {
-        self.definitions
-            .iter()
-            .find(|definition| definition.name == name)
-            .filter(|definition| needs_borrowed_helper(definition, self.types))
-            .map(|definition| borrowed_helper_name(definition, self.definitions))
-            .unwrap_or_else(|| String::from(name))
+        emitted_call_name(name, self.definitions, self.types)
     }
 
     /// Is this expression a list value (and therefore only renderable in

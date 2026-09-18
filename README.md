@@ -168,6 +168,14 @@ Rust side:
 prod_macros::prod_defs! { ir = "kernel.ir" }   // typed, zero-cost Rust fns
 ```
 
+The Rust code-generation APIs, including Cargo and Core-Wasm packages, preserve
+lexical parameter, let, match, and join-point scopes. Colliding local names are
+normalized deterministically before ownership analysis; already hygienic names
+retain their output bytes.
+Positional parameters still refer to the original formal parameters under
+shadowing. Duplicate names within one parameter or pattern-binding group are
+rejected as `DuplicateBinding`, rather than choosing an ambiguous binding.
+
 ### C headers and foreign-function calls
 
 The CLI can generate both sides of a small, explicit C ABI: a header for C

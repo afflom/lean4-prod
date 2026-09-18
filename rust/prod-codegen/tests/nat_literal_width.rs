@@ -15,7 +15,12 @@ const IR: &str = r#"(module WideNat
   (def mul_wide ((x Nat)) Nat (let bound 4294967295 (mul bound x)))
   (def shl_wide ((x Nat)) Nat (let bound 2147483648 (shl bound x)))
   (def shr_wide ((x Nat)) Nat (let bound 9223372036854775808 (shr bound x)))
-  (def pow_wide ((x Nat)) Nat (let bound 2147483648 (pow bound x))))"#;
+  (def pow_wide ((x Nat)) Nat (let bound 2147483648 (pow bound x)))
+  (def shift_exponent ((x Nat)) Nat (let bound 4294967296 (shl x bound)))
+  (def power_exponent ((x Nat)) Nat (let bound 4294967296 (pow x bound)))
+  (def right_exponent ((x Nat)) Nat (let bound 18446744073709551615 (shr x bound)))
+  (def contextual32 ((x UInt32)) UInt32
+    (let bound 4294967295 (if (eq x 0) bound x))))"#;
 
 const RUNNER: &str = r#"use wide_nat_fixture::*;
 fn main() {
@@ -40,6 +45,13 @@ fn main() {
     }
     assert_eq!(shl_wide(u64::MAX), Err(ComputeError::ShiftExponentTooLarge));
     assert_eq!(pow_wide(u64::MAX), Err(ComputeError::PowExponentTooLarge));
+    assert_eq!(shift_exponent(1), Err(ComputeError::ShiftExponentTooLarge));
+    assert_eq!(power_exponent(1), Err(ComputeError::PowExponentTooLarge));
+    assert_eq!(right_exponent(u64::MAX), 0);
+    assert_eq!(contextual32(0), u32::MAX);
+    for x in [1, i32::MAX as u32, 2147483648, u32::MAX] {
+        assert_eq!(contextual32(x), x);
+    }
 }
 "#;
 

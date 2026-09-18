@@ -1328,6 +1328,33 @@ impl<'m> Renderer<'_, 'm> {
         }
     }
 
+    fn parse_decimal(&self, value: &'m Expr, target: Option<&Type>) -> Result<String, Error> {
+        let parse = match target {
+            None => String::from("parse()"),
+            Some(
+                ty @ (Type::Int8
+                | Type::Int16
+                | Type::Int32
+                | Type::Int64
+                | Type::UInt8
+                | Type::UInt16
+                | Type::UInt32
+                | Type::UInt64),
+            ) => {
+                format!("parse::<{}>()", type_to_rust(ty)?)
+            }
+            Some(Type::Int) => return Err(Error::UnboundedInt),
+            Some(ty) => return Err(Error::OpaqueType(format!("parse-decimal-as target {ty:?}"))),
+        };
+        // Retain an owned temporary for the whole parse while borrowing an
+        // exact str view of String, &String, or &str. The explicit target on
+        // new IR prevents Rust inference from changing the source width.
+        Ok(format!(
+            "{{ let __input = &({}); let __text: &str = core::convert::AsRef::<str>::as_ref(__input); __text.{parse}.ok().filter(|__value| alloc::string::ToString::to_string(__value) == __text) }}",
+            self.value(value)?
+        ))
+    }
+
     fn resolved_inline(&self, expr: &'m Expr) -> &'m Expr {
         match expr {
             Expr::Var(name) => self
@@ -1743,10 +1770,8 @@ impl<'m> Renderer<'_, 'm> {
                 self.value(values)?,
                 self.value(delimiter)?
             )),
-            Expr::ParseDecimal(value) => Ok(format!(
-                "{{ let __text = {}; __text.parse().ok().filter(|__value| alloc::string::ToString::to_string(__value) == __text) }}",
-                self.value(value)?
-            )),
+            Expr::ParseDecimal(value) => self.parse_decimal(value, None),
+            Expr::ParseDecimalAs(target, value) => self.parse_decimal(value, Some(target)),
             Expr::FormatDecimal(value) => {
                 Ok(format!("alloc::format!(\"{{}}\", {})", self.value(value)?))
             }

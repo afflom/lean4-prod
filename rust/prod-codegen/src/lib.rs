@@ -106,6 +106,7 @@ extern crate alloc;
 
 mod c_abi;
 mod core_wasm;
+mod ownership;
 mod package;
 mod sdk;
 mod text_view;
@@ -116,6 +117,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
+use ownership::{expression_type, pattern_types, LocalTypes};
 use prod_ir::{Alt, CtorDecl, Definition, Expr, Module, Type, TypeDecl};
 
 pub use c_abi::{generate_c_bindings, CAbiError, CBindings};
@@ -581,6 +583,37 @@ fn count_var_uses(expr: &Expr, name: &str) -> usize {
         .sum::<usize>()
 }
 
+/// Alternatives are exclusive: a binder used once in either branch can still
+/// transfer its owner without a clone. Sequential uses remain additive.
+fn count_path_uses(expr: &Expr, name: &str) -> usize {
+    match expr {
+        Expr::If(condition, yes, no) => {
+            count_path_uses(condition, name)
+                + count_path_uses(yes, name).max(count_path_uses(no, name))
+        }
+        Expr::Match {
+            scrut,
+            alts,
+            default,
+        } => {
+            count_path_uses(scrut, name)
+                + alts
+                    .iter()
+                    .map(|alt| count_path_uses(&alt.body, name))
+                    .chain(default.iter().map(|value| count_path_uses(value, name)))
+                    .max()
+                    .unwrap_or(0)
+        }
+        _ => {
+            usize::from(matches!(expr, Expr::Var(candidate) if candidate == name))
+                + expr
+                    .children()
+                    .map(|child| count_path_uses(child, name))
+                    .sum::<usize>()
+        }
+    }
+}
+
 /// Whether a binding expression produces a known non-`Copy` Rust value.
 ///
 /// This deliberately answers `false` when the type is not recoverable from
@@ -666,19 +699,48 @@ fn repeated_non_copy_locals(
     table: &TypeTable<'_>,
     params: &[(String, Type)],
     returns_copy: bool,
+    borrowed_bindings: &BTreeSet<String>,
 ) -> BTreeSet<String> {
+    struct Context<'a, 'm> {
+        definitions: &'a [Definition],
+        table: &'a TypeTable<'m>,
+        parameters: &'a [(String, Type)],
+        borrowed_bindings: &'a BTreeSet<String>,
+    }
+
     fn walk(
         expr: &Expr,
-        definitions: &[Definition],
-        table: &TypeTable<'_>,
+        context: &Context<'_, '_>,
         non_copy_locals: &BTreeSet<String>,
+        local_types: &LocalTypes,
         output: &mut BTreeSet<String>,
     ) {
+        let Context {
+            definitions,
+            table,
+            parameters,
+            borrowed_bindings,
+        } = *context;
         match expr {
             Expr::Let(name, value, body) => {
-                walk(value, definitions, table, non_copy_locals, output);
+                walk(value, context, non_copy_locals, local_types, output);
                 let mut nested = non_copy_locals.clone();
-                if expression_is_non_copy(value, definitions, table, non_copy_locals) {
+                nested.remove(name);
+                let mut nested_types = local_types.clone();
+                let value_type =
+                    expression_type(value, definitions, table, local_types, parameters);
+                if let Some(ty) = value_type.clone() {
+                    nested_types.insert(name.clone(), ty);
+                } else {
+                    nested_types.remove(name);
+                }
+                if value_type
+                    .as_ref()
+                    .map(|ty| !copy_type(ty, table, &mut BTreeSet::new()))
+                    .unwrap_or_else(|| {
+                        expression_is_non_copy(value, definitions, table, non_copy_locals)
+                    })
+                {
                     nested.insert(name.clone());
                     // Projections of non-Copy fields are already borrows and
                     // may be reused without cloning the underlying value.
@@ -686,11 +748,38 @@ fn repeated_non_copy_locals(
                         output.insert(name.clone());
                     }
                 }
-                walk(body, definitions, table, &nested, output);
+                walk(body, context, &nested, &nested_types, output);
             }
-            Expr::Match { .. } => {
-                for child in expr.children() {
-                    walk(child, definitions, table, non_copy_locals, output);
+            Expr::Match {
+                scrut,
+                alts,
+                default,
+            } => {
+                walk(scrut, context, non_copy_locals, local_types, output);
+                let scrutinee_type =
+                    expression_type(scrut, definitions, table, local_types, parameters);
+                for alt in alts {
+                    let mut nested = non_copy_locals.clone();
+                    let mut nested_types = local_types.clone();
+                    for name in &alt.binders {
+                        nested.remove(name);
+                        nested_types.remove(name);
+                    }
+                    for (name, ty) in pattern_types(scrutinee_type.as_ref(), alt, table) {
+                        if !copy_type(&ty, table, &mut BTreeSet::new()) {
+                            nested.insert(name.clone());
+                            if !borrowed_bindings.contains(&name)
+                                && count_path_uses(&alt.body, &name) > 1
+                            {
+                                output.insert(name.clone());
+                            }
+                        }
+                        nested_types.insert(name, ty);
+                    }
+                    walk(&alt.body, context, &nested, &nested_types, output);
+                }
+                if let Some(default) = default {
+                    walk(default, context, non_copy_locals, local_types, output);
                 }
             }
             Expr::Jp {
@@ -703,11 +792,11 @@ fn repeated_non_copy_locals(
                         output.insert(parameter.clone());
                     }
                 }
-                walk(body, definitions, table, non_copy_locals, output);
+                walk(body, context, non_copy_locals, local_types, output);
             }
             _ => {
                 for child in expr.children() {
-                    walk(child, definitions, table, non_copy_locals, output);
+                    walk(child, context, non_copy_locals, local_types, output);
                 }
             }
         }
@@ -722,7 +811,19 @@ fn repeated_non_copy_locals(
             output.insert(name.clone());
         }
     }
-    walk(expr, definitions, table, &BTreeSet::new(), &mut output);
+    let context = Context {
+        definitions,
+        table,
+        parameters: params,
+        borrowed_bindings,
+    };
+    walk(
+        expr,
+        &context,
+        &BTreeSet::new(),
+        &params.iter().cloned().collect(),
+        &mut output,
+    );
     output
 }
 
@@ -825,24 +926,39 @@ fn borrowed_locals(
         definitions: &[Definition],
         table: &TypeTable<'_>,
         params: &[(String, Type)],
+        local_types: &LocalTypes,
         locals: &mut BTreeSet<String>,
     ) {
         match expr {
             Expr::Let(name, value, body) => {
-                walk(value, definitions, table, params, locals);
+                walk(value, definitions, table, params, local_types, locals);
+                let mut nested_types = local_types.clone();
+                if let Some(ty) = expression_type(value, definitions, table, local_types, params) {
+                    nested_types.insert(name.clone(), ty);
+                } else {
+                    nested_types.remove(name);
+                }
                 if expression_is_borrowed(value, definitions, table, locals) {
                     locals.insert(name.clone());
                 }
-                walk(body, definitions, table, params, locals);
+                walk(body, definitions, table, params, &nested_types, locals);
             }
             Expr::Match {
                 scrut,
                 alts,
                 default,
             } => {
-                walk(scrut, definitions, table, params, locals);
+                walk(scrut, definitions, table, params, local_types, locals);
                 let borrowed = expression_is_borrowed(scrut, definitions, table, locals);
+                let scrutinee_type =
+                    expression_type(scrut, definitions, table, local_types, params);
                 for alt in alts {
+                    let fields = pattern_types(scrutinee_type.as_ref(), alt, table);
+                    let mut nested_types = local_types.clone();
+                    for name in &alt.binders {
+                        nested_types.remove(name);
+                    }
+                    nested_types.extend(fields.clone());
                     if alt.ctor == "List.cons" && alt.binders.len() == 2 {
                         // Slice patterns always borrow their tail. Keep the
                         // head classification identical to render_match's
@@ -853,6 +969,13 @@ fn borrowed_locals(
                         }
                     }
                     if borrowed {
+                        if alt.ctor != "List.cons" {
+                            for (name, ty) in &fields {
+                                if !copy_type(ty, table, &mut BTreeSet::new()) {
+                                    locals.insert(name.clone());
+                                }
+                            }
+                        }
                         if let Some(constructor) = table.values().find_map(|declaration| {
                             declaration.ctors.iter().find(|row| row.name == alt.ctor)
                         }) {
@@ -864,15 +987,15 @@ fn borrowed_locals(
                             }
                         }
                     }
-                    walk(&alt.body, definitions, table, params, locals);
+                    walk(&alt.body, definitions, table, params, &nested_types, locals);
                 }
                 if let Some(default) = default {
-                    walk(default, definitions, table, params, locals);
+                    walk(default, definitions, table, params, local_types, locals);
                 }
             }
             _ => {
                 for child in expr.children() {
-                    walk(child, definitions, table, params, locals);
+                    walk(child, definitions, table, params, local_types, locals);
                 }
             }
         }
@@ -889,6 +1012,7 @@ fn borrowed_locals(
         definitions,
         table,
         &definition.params,
+        &definition.params.iter().cloned().collect(),
         &mut locals,
     );
     locals
@@ -912,6 +1036,7 @@ fn generate_def_in<'m>(
         def.name.clone()
     };
     let visibility = if helper { "" } else { "pub " };
+    let borrowed_bindings = borrowed_locals(def, definitions, table);
     let renderer = Renderer {
         shapes,
         definitions,
@@ -924,9 +1049,10 @@ fn generate_def_in<'m>(
             table,
             &def.params,
             returns_copy,
+            &borrowed_bindings,
         ),
         inline_values: inline_bindings(&def.body),
-        borrowed_locals: borrowed_locals(def, definitions, table),
+        borrowed_locals: borrowed_bindings,
     };
 
     let mut params = String::new();

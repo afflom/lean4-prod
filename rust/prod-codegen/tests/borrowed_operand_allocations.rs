@@ -88,6 +88,35 @@ const IR: &str = r#"(module BorrowedOperands
       (if (eq local input) (eq local (bytes)) false)))
   (def fresh_words ((input (List String))) (Option (List String))
     (ctor "Option.some" input))
+  (def prepend_owned ((head String) (tail (Option (List String)))) (Option (List String))
+    (cases tail
+      (alt "Option.none" () (ctor "Option.none"))
+      (alt "Option.some" (values)
+        (ctor "Option.some" (ctor "List.cons" head values)))))
+  (def prepend_borrowed ((head String) (tail (List String))) (Option (List String))
+    (ctor "Option.some" (ctor "List.cons" head tail)))
+  (def prepend_retained ((head String) (tail (Option (List String)))) (Option (List String))
+    (cases tail
+      (alt "Option.none" () (ctor "Option.none"))
+      (alt "Option.some" (values)
+        (let prefixed (ctor "List.cons" head values)
+          (ctor "Option.some" (append prefixed values))))))
+  (def prepend_failure_order ((head Nat) (tail Nat)) (Option (List Nat))
+    (ctor "Option.some"
+      (ctor "List.cons" (add head 1)
+        (ctor "List.cons" (mul tail 2) (ctor "List.nil")))))
+  (def prepend_temporary ((head String) (__list (Option (List String)))) (Option (List String))
+    (cases __list
+      (alt "Option.none" () (ctor "Option.none"))
+      (alt "Option.some" (values)
+        (ctor "Option.some" (ctor "List.cons" head values)))))
+  (def owned_list_entry ((input Bytes)) Bytes
+    (cases (utf8-decode input)
+      (alt "Option.none" () (bytes))
+      (alt "Option.some" (text)
+        (cases (call prepend_owned (string "head") (split-exact text (string "|") 8192))
+          (alt "Option.none" () (bytes))
+          (alt "Option.some" (values) (utf8-encode (join values (string "|"))))))))
   (def join_read ((input (List String)) (separator String)) (Option String)
     (cases (call fresh_words input)
       (alt "Option.none" () (ctor "Option.none"))
@@ -150,6 +179,49 @@ fn measured<T>(action: impl FnOnce() -> T) -> (T, usize) {
 }
 
 fn main() {
+    for size in [0, 1, 32, 1024] {
+        let mut tail = Vec::with_capacity(size + 1);
+        for index in 0..size {
+            tail.push(format!("tail-{index}"));
+        }
+        let pointer = tail.as_ptr();
+        let head = "head".to_owned();
+        let mut expected = vec![head.clone()];
+        expected.extend(tail.clone());
+        let (output, count) = measured(|| prepend_owned(head, Some(tail)));
+        let output = output.unwrap();
+        assert_eq!(output, expected);
+        assert_eq!(count, 0, "reuse owned tail capacity, size={size}");
+        assert_eq!(output.as_ptr(), pointer, "retain owned tail allocation");
+
+        let tail = expected[1..].to_vec().into_boxed_slice().into_vec();
+        assert_eq!(tail.capacity(), tail.len(), "full tail fixture");
+        let head = "head".to_owned();
+        let (output, count) = measured(|| prepend_owned(head, Some(tail)));
+        let output = output.unwrap();
+        assert_eq!(output, expected);
+        assert_eq!(count, 1, "one exact growth, size={size}");
+        assert_eq!(output.capacity(), size + 1, "do not double full tail capacity");
+
+        let tail = expected[1..].to_vec();
+        let retained = tail.clone();
+        let output = prepend_borrowed("head".to_owned(), &tail).unwrap();
+        assert_eq!(output, expected);
+        assert_eq!(tail, retained, "borrowed tail must remain unchanged");
+
+        let head = "head".to_owned();
+        let tail = retained.clone();
+        let mut repeated = expected.clone();
+        repeated.extend(retained);
+        assert_eq!(prepend_retained(head, Some(tail)), Some(repeated));
+
+        let tail = expected[1..].to_vec();
+        assert_eq!(prepend_temporary("head".to_owned(), Some(tail)), Some(expected));
+    }
+    assert_eq!(prepend_owned("head".to_owned(), None), None);
+    assert_eq!(prepend_failure_order(u64::MAX, u64::MAX), Err(ComputeError::AddOverflow));
+    assert_eq!(prepend_failure_order(0, u64::MAX), Err(ComputeError::MulOverflow));
+    assert_eq!(prepend_failure_order(0, 0), Ok(Some(vec![1, 0])));
     for size in [0, 1, 8192, 65536] {
         for present in [false, true] {
             let input = vec![0x5a; size];
@@ -370,17 +442,38 @@ fn read_only_owned_operands_do_not_allocate_in_std_and_no_std() {
 
 #[test]
 fn read_only_owned_operands_fit_actual_wasm_memory_bound() {
+    actual_wasm(
+        "entry",
+        1_048_576,
+        1_048_576,
+        80,
+        "borrowed_operands_wasm_test.mjs",
+    );
+}
+
+#[test]
+fn owned_list_tail_executes_in_actual_bounded_wasm() {
+    actual_wasm(
+        "owned_list_entry",
+        262_144,
+        262_149,
+        64,
+        "owned_list_tail_wasm_test.mjs",
+    );
+}
+
+fn actual_wasm(entry: &str, input_cap: u32, output_cap: u32, pages: u32, script: &str) {
     let (remaining, module) = parse_module(IR).unwrap();
     assert!(remaining.is_empty());
     let package = generate_core_wasm_package(
         &module,
         &CoreWasmSpec {
             crate_name: "borrowed-operands-guest".into(),
-            entry: "entry".into(),
+            entry: entry.into(),
             export_name: "holo_run".into(),
-            input_allocation_cap: 1_048_576,
-            output_allocation_cap: 1_048_576,
-            maximum_pages: 80,
+            input_allocation_cap: input_cap,
+            output_allocation_cap: output_cap,
+            maximum_pages: pages,
             input_ir_sha256: format!("{:x}", Sha256::digest(IR.as_bytes())),
         },
     )
@@ -400,10 +493,11 @@ fn read_only_owned_operands_fit_actual_wasm_memory_bound() {
     );
     succeeds(
         Command::new("node")
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/borrowed_operands_wasm_test.mjs"
-            ))
+            .arg(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures")
+                    .join(script),
+            )
             .arg(
                 scratch
                     .0

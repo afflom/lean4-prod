@@ -932,7 +932,14 @@ fn single_owned_option_match(
         || !alts.iter().any(|alt| {
             alt.ctor == "Option.some"
                 && alt.binders.len() == 1
-                && count_var_uses(&alt.body, name) == 0
+                && (count_var_uses(&alt.body, name) == 0
+                    // Name-keyed ownership tables admit only a shadowed identity arm:
+                    // repeated payloads (including captured join points) still
+                    // need its conservative clone flag.
+                    || alt.binders[0] == name
+                        && matches!(&alt.body, Expr::Ctor(ctor, args)
+                            if ctor == "Option.some"
+                                && matches!(args.as_slice(), [Expr::Var(returned)] if returned == name)))
         })
     {
         return false;

@@ -224,6 +224,12 @@ codes, so the compiled Rust library remains the single implementation. The
 TypeScript binding accepts a native function loader (for example `koffi` or
 `ffi-napi`), Python uses `ctypes`, and Kotlin uses JNA.
 
+Scalar wrappers independently normalize parameter names that collide with a
+target language keyword, imported helper, temporary, or callee. One positional
+mapping is shared by all six adapters; safe names retain their bytes, and
+exported symbols, scalar types, argument order, and status handling are unchanged.
+This parameter boundary does not rename global definitions or generated types.
+
 To generate only one language, use a language-specific recipe:
 
 ```sh

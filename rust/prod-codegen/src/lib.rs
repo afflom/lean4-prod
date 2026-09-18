@@ -1790,11 +1790,18 @@ impl<'m> Renderer<'_, 'm> {
                 Mode::Value if self.is_empty_list(&args[1]) => {
                     Ok(format!("alloc::vec![{}]", self.owned_value(&args[0])?))
                 }
-                Mode::Value => Ok(format!(
-                    "{{ let mut __list = alloc::vec![{}]; __list.extend({}); __list }}",
-                    self.owned_value(&args[0])?,
-                    self.owned_value(&args[1])?
-                )),
+                Mode::Value => {
+                    // Evaluate the head before the tail, then reuse the owned
+                    // tail's capacity. Exact growth avoids doubling a full tail
+                    // under the Wasm bump allocator. Tuple initialization keeps
+                    // both operands outside the temporary's scope and preserves
+                    // error order.
+                    Ok(format!(
+                        "{{ let mut __list = ({}, {}); __list.1.reserve_exact(1); __list.1.insert(0, __list.0); __list.1 }}",
+                        self.owned_value(&args[0])?,
+                        self.owned_value(&args[1])?
+                    ))
+                }
             },
 
             // ---- everything else ----

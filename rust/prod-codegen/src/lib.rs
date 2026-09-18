@@ -1621,6 +1621,11 @@ impl<'m> Renderer<'_, 'm> {
 
     fn render_value_leaf(&self, expr: &'m Expr) -> Result<String, Error> {
         match expr {
+            // A let-bound literal used through a later receiver cast has no
+            // Rust integer type constraint and otherwise defaults to i32.
+            // Preserve existing small-literal output, but make wide Nat
+            // values explicit at their definition, before any such cast.
+            Expr::Nat(n) if *n > i32::MAX as u64 => Ok(format!("{n}u64")),
             Expr::Nat(n) => Ok(format!("{}", n)),
             Expr::Int(n) => Ok(format!("{}", n)),
             Expr::String(value) => Ok(format!(

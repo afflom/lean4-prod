@@ -1911,7 +1911,7 @@ impl<'m> Renderer<'_, 'm> {
                 self.value(right)?
             )),
             Expr::SplitExact(value, delimiter, maximum) => Ok(format!(
-                "{{ let __value = {}; let __delimiter = {}; let __maximum = usize::try_from({}).ok(); if __delimiter.is_empty() {{ None }} else {{ let __fields: alloc::vec::Vec<alloc::string::String> = __value.split(&__delimiter).map(alloc::string::String::from).collect(); __maximum.filter(|__maximum| __fields.len() <= *__maximum).map(|_| __fields) }} }}",
+                "{{ let __value = {}; let __delimiter = {}; let __limit: u32 = {}; let __maximum = usize::try_from(__limit).ok(); if __delimiter.is_empty() {{ None }} else {{ let __fields: alloc::vec::Vec<alloc::string::String> = __value.split(&__delimiter).map(alloc::string::String::from).collect(); __maximum.filter(|__maximum| __fields.len() <= *__maximum).map(|_| __fields) }} }}",
                 self.value(value)?,
                 self.value(delimiter)?,
                 self.value(maximum)?

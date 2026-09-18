@@ -107,6 +107,7 @@ pub enum Expr {
     Utf8Encode(Box<Expr>),
     Utf8Decode(Box<Expr>),
     CompareBytes(Box<Expr>, Box<Expr>),
+    /// String value, String delimiter, and an exact UInt32 maximum field count.
     SplitExact(Box<Expr>, Box<Expr>, Box<Expr>),
     Join(Box<Expr>, Box<Expr>),
     ParseDecimal(Box<Expr>),

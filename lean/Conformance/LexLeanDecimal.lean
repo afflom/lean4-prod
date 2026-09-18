@@ -316,4 +316,16 @@ end LexLeanRuntime
 
 @[expose] public def acceptInt (value : String) : Bool := (match (LexLeanRuntime.parseDecimal (value) : Option (Int)) with | Option.none => false | Option.some _ => true)
 
+@[expose] public def splitMaximum (value : String) (delimiter : String) : Option (List (String)) := (LexLeanRuntime.splitExact (value) (delimiter) ((4294967295 : UInt32)) : Option (List (String)))
+
+@[expose] public def splitZero (value : String) (delimiter : String) : Option (List (String)) := (LexLeanRuntime.splitExact (value) (delimiter) ((0 : UInt32)) : Option (List (String)))
+
+@[expose] public def splitOne (value : String) (delimiter : String) : Option (List (String)) := (LexLeanRuntime.splitExact (value) (delimiter) ((1 : UInt32)) : Option (List (String)))
+
+@[expose] public def splitBounded (value : String) (delimiter : String) (maximum : UInt32) : Option (List (String)) := (LexLeanRuntime.splitExact (value) (delimiter) (maximum) : Option (List (String)))
+
+@[expose] public def splitAccepted (value : Option (List (String))) : Bool := (match value with | Option.none => false | Option.some _ => true)
+
+@[expose] public def splitEntry (input : ByteArray) : ByteArray := (match (LexLeanRuntime.utf8Decode (input) : Option (String)) with | Option.none => ByteArray.mk #[255] | Option.some text => (LexLeanRuntime.append ((LexLeanRuntime.append ((LexLeanRuntime.append (boolByte (splitAccepted (splitMaximum (text) ("|")))) (boolByte (splitAccepted (splitZero (text) ("|")))) : ByteArray)) (boolByte (splitAccepted (splitOne (text) ("|")))) : ByteArray)) (boolByte (splitAccepted (splitBounded (text) ("|") ((2 : UInt32))))) : ByteArray))
+
 end DecimalFixture.Main

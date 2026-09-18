@@ -762,7 +762,10 @@ fn repeated_non_copy_locals(
                     nested.insert(name.clone());
                     // Projections of non-Copy fields are already borrows and
                     // may be reused without cloning the underlying value.
-                    if !matches!(value.as_ref(), Expr::Proj(..)) && count_var_uses(body, name) > 1 {
+                    if !matches!(value.as_ref(), Expr::Proj(..))
+                        && count_var_uses(body, name) > 1
+                        && !single_owned_option_match(name, value, body, definitions, table)
+                    {
                         output.insert(name.clone());
                     }
                 }
@@ -1034,6 +1037,53 @@ fn borrowed_locals(
         &mut locals,
     );
     locals
+}
+
+/// Matching None does not move a payload, so that arm can return the original
+/// Option without cloning the Some payload. Keep the original typed expression
+/// intact: replacing the return with an untyped None can lose type inference.
+/// Any other use of the owner retains the existing conservative clone policy.
+fn single_owned_option_match(
+    name: &str,
+    value: &Expr,
+    body: &Expr,
+    definitions: &[Definition],
+    table: &TypeTable<'_>,
+) -> bool {
+    let Expr::Call(callee, _) = value else {
+        return false;
+    };
+    if !definitions.iter().any(|definition| {
+        definition.name == *callee
+            && matches!(definition.ret, Type::Option(_))
+            && !returns_borrowed_projection(&definition.body, &definition.ret, table)
+    }) {
+        return false;
+    }
+    let Expr::Match {
+        scrut,
+        alts,
+        default,
+    } = body
+    else {
+        return false;
+    };
+    if !matches!(scrut.as_ref(), Expr::Var(scrutinee) if scrutinee == name)
+        || default.is_some()
+        || alts.len() != 2
+        || !alts.iter().any(|alt| {
+            alt.ctor == "Option.some"
+                && alt.binders.len() == 1
+                && count_var_uses(&alt.body, name) == 0
+        })
+    {
+        return false;
+    }
+    alts.iter().any(|alt| {
+        alt.ctor == "Option.none"
+            && alt.binders.is_empty()
+            && matches!(&alt.body, Expr::Var(returned) if returned == name)
+    })
 }
 
 fn generate_def_in<'m>(

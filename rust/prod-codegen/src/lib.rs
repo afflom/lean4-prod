@@ -1829,11 +1829,6 @@ impl<'m> Renderer<'_, 'm> {
 
     fn render_value_leaf(&self, expr: &'m Expr) -> Result<String, Error> {
         match expr {
-            // A let-bound literal used through a later receiver cast has no
-            // Rust integer type constraint and otherwise defaults to i32.
-            // Preserve existing small-literal output, but make wide Nat
-            // values explicit at their definition, before any such cast.
-            Expr::Nat(n) if *n > i32::MAX as u64 => Ok(format!("{n}u64")),
             Expr::Nat(n) => Ok(format!("{}", n)),
             Expr::Int(n) => Ok(format!("{}", n)),
             Expr::String(value) => Ok(format!(
@@ -1953,9 +1948,9 @@ impl<'m> Renderer<'_, 'm> {
             Expr::Negate(value) => Ok(format!("-({})", self.value(value)?)),
             Expr::Sub(a, b) => {
                 // Lean Nat subtraction truncates at zero, so it is total.
-                // See `checked_binop` for the `as u64` receiver pin.
+                // The associated function constrains even a let-bound literal.
                 Ok(format!(
-                    "(({}) as u64).saturating_sub({})",
+                    "u64::saturating_sub({}, {})",
                     self.value(a)?,
                     self.value(b)?
                 ))
@@ -1977,7 +1972,7 @@ impl<'m> Renderer<'_, 'm> {
             // fallback for a real error — there is no `ComputeError` variant
             // for this because none is needed.
             Expr::Shr(a, b) => Ok(format!(
-                "(({}) as u64).checked_shr(u32::try_from({}).unwrap_or(u32::MAX)).unwrap_or(0)",
+                "u64::checked_shr({}, u32::try_from(core::convert::identity::<u64>({})).unwrap_or(u32::MAX)).unwrap_or(0)",
                 self.value(a)?,
                 self.value(b)?
             )),
@@ -2386,9 +2381,9 @@ impl<'m> Renderer<'_, 'm> {
 
     /// `checked_add`/`checked_mul`: report overflow instead of panicking.
     ///
-    /// `as u64` pins the receiver: method calls on an inferred `{integer}`
-    /// (a let-bound literal, e.g. LCNF's `let _x := 1`) fail method resolution
-    /// (E0689) — a no-op when the receiver is already `u64`.
+    /// An associated function constrains a let-bound literal to `u64` at its
+    /// definition. A receiver cast would leave it defaulting to `i32` before
+    /// that cast; globally suffixing literals would break UInt32 contexts.
     fn checked_binop(
         &self,
         a: &'m Expr,
@@ -2397,9 +2392,9 @@ impl<'m> Renderer<'_, 'm> {
         error: &str,
     ) -> Result<String, Error> {
         Ok(format!(
-            "(({}) as u64).{}({}).ok_or(crate::ComputeError::{})?",
-            self.value(a)?,
+            "u64::{}({}, {}).ok_or(crate::ComputeError::{})?",
             method,
+            self.value(a)?,
             self.value(b)?,
             error
         ))
@@ -2416,9 +2411,9 @@ impl<'m> Renderer<'_, 'm> {
         overflow_error: &str,
     ) -> Result<String, Error> {
         Ok(format!(
-            "(({}) as u64).{}(u32::try_from({}).map_err(|_| crate::ComputeError::{})?).ok_or(crate::ComputeError::{})?",
-            self.value(a)?,
+            "u64::{}({}, u32::try_from(core::convert::identity::<u64>({})).map_err(|_| crate::ComputeError::{})?).ok_or(crate::ComputeError::{})?",
             method,
+            self.value(a)?,
             self.value(b)?,
             exponent_error,
             overflow_error

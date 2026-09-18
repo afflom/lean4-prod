@@ -10,6 +10,44 @@ use std::process::Command;
 
 const IR: &str = r#"(module BorrowedOperands
   (type "Parcel" (ctor "Parcel.mk" (bytes Bytes) (offset Nat)))
+  (def maybe_bytes ((input Bytes) (present Bool)) (Option Bytes)
+    (if present (ctor "Option.some" input) (ctor "Option.none")))
+  (def none_return ((input Bytes) (present Bool)) (Option Bytes)
+    (let result (call maybe_bytes input present)
+      (cases result
+        (alt "Option.none" () result)
+        (alt "Option.some" (value) (ctor "Option.some" value)))))
+  (def none_return_shadow ((input Bytes) (present Bool)) (Option Bytes)
+    (let result (call maybe_bytes input present)
+      (cases result
+        (alt "Option.some" (result) (ctor "Option.some" result))
+        (alt "Option.none" () result))))
+  (def none_return_keeps_owner ((input Bytes) (present Bool)) (Option Bytes)
+    (let result (call maybe_bytes input present)
+      (cases result
+        (alt "Option.none" () result)
+        (alt "Option.some" (value)
+          (cases result
+            (alt "Option.none" () (ctor "Option.none"))
+            (alt "Option.some" (later) (ctor "Option.some" (append value later))))))))
+  (def none_return_type_constraint ((input Bytes) (present Bool)) Nat
+    (let selected
+      (let result (call maybe_bytes input present)
+        (cases result
+          (alt "Option.none" () result)
+          (alt "Option.some" (value) (ctor "Option.none"))))
+      (cases selected
+        (alt "Option.none" () 0)
+        (alt "Option.some" (value) 1))))
+  (def none_return_builder ((input Bytes) (present Bool)) (List Nat)
+    (let selected
+      (let result (call maybe_bytes input present)
+        (cases result
+          (alt "Option.none" () result)
+          (alt "Option.some" (value) (ctor "Option.some" value))))
+      (cases selected
+        (alt "Option.none" () (ctor "List.nil"))
+        (alt "Option.some" (bytes) (ctor "List.cons" (length bytes) (ctor "List.nil"))))))
   (def fresh ((input Bytes)) (Option (named "Parcel"))
     (ctor "Option.some" (ctor "Parcel.mk" input 0)))
   (def parcel ((input Bytes)) (Option Bytes)
@@ -74,9 +112,12 @@ const IR: &str = r#"(module BorrowedOperands
           (let consumed (call consume_parcel (ctor "Option.some" owner))
             (if (eq (length viewed) offset) (ctor "Option.none") consumed))))))
   (def entry ((input Bytes)) Bytes
-    (cases (call parcel input)
+    (cases (call none_return input true)
       (alt "Option.none" () (bytes))
-      (alt "Option.some" (output) output))))"#;
+      (alt "Option.some" (output)
+        (cases (call parcel output)
+          (alt "Option.none" () (bytes))
+          (alt "Option.some" (result) result))))))"#;
 
 const RUNNER: &str = r#"use borrowed_operands_fixture::*;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -110,6 +151,34 @@ fn measured<T>(action: impl FnOnce() -> T) -> (T, usize) {
 
 fn main() {
     for size in [0, 1, 8192, 65536] {
+        for present in [false, true] {
+            let input = vec![0x5a; size];
+            let (output, count) = measured(|| none_return(input, present));
+            assert_eq!(count, 0, "None-arm return must not clone a Some payload, size={size}, present={present}");
+            assert_eq!(output.as_deref(), present.then_some(vec![0x5a; size].as_slice()));
+
+            let input = vec![0x5a; size];
+            let (output, count) = measured(|| none_return_shadow(input, present));
+            assert_eq!(count, 0, "reversed arms and shadowing, size={size}, present={present}");
+            assert_eq!(output.as_deref(), present.then_some(vec![0x5a; size].as_slice()));
+
+            let input = vec![0x5a; size];
+            let (output, count) = measured(|| none_return_keeps_owner(input, present));
+            // A real owner use in the Some branch still needs the scrutinee
+            // preserved; this conservative pass must not remove that clone.
+            assert_eq!(count, 3 * usize::from(present && size != 0), "later owner use, size={size}, present={present}");
+            assert_eq!(output.as_deref(), present.then_some(vec![0x5a; size * 2].as_slice()));
+
+            let input = vec![0x5a; size];
+            assert_eq!(none_return_type_constraint(input, present), 0);
+
+            let input = vec![0x5a; size];
+            let mut buffer = [99_u64; 1];
+            let (output, count) = measured(|| none_return_builder(input, present, &mut buffer));
+            assert_eq!(count, 0, "None return nested in builder, size={size}, present={present}");
+            assert_eq!(output, Ok(usize::from(present)));
+            assert_eq!(buffer[0], if present { size as u64 } else { 99 });
+        }
         let input = vec![0x5a; size];
         ALLOCATIONS.store(0, Ordering::Relaxed);
         let output = parcel(input);

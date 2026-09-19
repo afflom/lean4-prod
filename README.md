@@ -191,6 +191,12 @@ operation retains its byte/element meaning. `just scalar-length` checks the
 unchanged LexLean source, every Unicode scalar in native std/no_std at O0/O3,
 mixed strings and record fields, and deterministic bounded debug/release Wasm.
 
+Imported LexLean byte-index wrappers retain an exact typed bounds-check after
+Lean monomorphization. Lowering recognizes that body, not its generated name.
+`just specialized-index` verifies the unchanged LexLean fixture, rejects 18
+altered bodies, and checks native std/no_std plus debug/release Wasm boundaries
+and deterministic bytes.
+
 ### C headers and foreign-function calls
 
 The CLI can generate both sides of a small, explicit C ABI: a header for C

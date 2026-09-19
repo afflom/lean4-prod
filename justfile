@@ -3,11 +3,15 @@ default:
     @just --list
 
 # Complete clean-checkout CI contract.
-ci: fixture-provenance prod fmt-check lint wasm-check portable-package scalar-length typed-decimal core-wasm view text-view wasm-sdk-fixture uor-fixture
+ci: fixture-provenance prod fmt-check lint wasm-check portable-package scalar-length specialized-index typed-decimal core-wasm view text-view wasm-sdk-fixture uor-fixture
 
 # Unicode scalars must not be counted as UTF-8 bytes or grapheme clusters.
 scalar-length:
     bash scripts/check-scalar-length.sh
+
+# Exact imported byte-index specialization, generated source and execution.
+specialized-index:
+    bash scripts/check-specialized-index.sh
 
 # Preserve exact decimal integer targets from actual LexLean-generated LCNF.
 typed-decimal:

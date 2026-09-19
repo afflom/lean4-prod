@@ -369,6 +369,9 @@ syntax; mathematical `Int` remains rejected by the production renderer.
 UTF-8 decoding validates borrowed byte fields before allocating an owned result;
 invalid input allocates nothing, and owned input transfers its existing buffer.
 Empty byte literals retain their `u8` type even in read-only expressions.
+Completed leading length reads do not force an owned input copy; reads after
+a possible transfer retain the conservative ownership checks. Self append
+extends the owned buffer in place, while preserving other uses and borrowed inputs.
 
 UTF-8 encoding preserves the existing ownership boundary: borrowed String
 parameters and fields are copied into owned bytes, while owned Strings reuse

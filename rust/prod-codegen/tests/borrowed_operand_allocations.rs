@@ -174,6 +174,31 @@ const IR: &str = r#"(module BorrowedOperands
     (let local (call own_bytes input)
       (if (eq (length local) 0) (bytes) (append (bytes) local))))
   (def self_append ((input Bytes)) Bytes (append input input))
+  (def length_then_move ((input Bytes)) (named "Parcel")
+    (let width (length input) (ctor "Parcel.mk" input width)))
+  (def scalar_length_then_move ((input String)) String
+    (let width (string-length input) (if (eq width 0) input input)))
+  (def move_then_length ((input Bytes)) (named "Pair")
+    (let moved (call own_bytes input)
+      (let width (length input) (ctor "Pair.mk" moved (if (eq width 0) input input)))))
+  (def move_then_last_length ((input Bytes)) (named "Parcel")
+    (let moved (call own_bytes input)
+      (let width (length input) (ctor "Parcel.mk" moved width))))
+  (def read_move_read ((input Bytes)) (named "Parcel")
+    (let before (length input)
+      (let moved (call own_bytes input)
+        (let after (length input) (ctor "Parcel.mk" moved after)))))
+  (def length_entry ((input Bytes)) Bytes
+    (let width (length input) (if (eq width 0) input input)))
+  (def self_append_retained ((input Bytes)) (named "Pair")
+    (let twice (append input input) (ctor "Pair.mk" twice input)))
+  (def self_append_borrowed ((input (named "Parcel"))) Bytes
+    (let bytes (proj "Parcel" "bytes" input) (append bytes bytes)))
+  (def self_append_hygiene ((__value Bytes)) Bytes (append __value __value))
+  (def self_append_words ((input (Option (List String)))) (Option (List String))
+    (cases input
+      (alt "Option.none" () (ctor "Option.none"))
+      (alt "Option.some" (words) (ctor "Option.some" (append words words)))))
   (def compare_read ((input Bytes) (other Bytes)) Ordering
     (let left (call own_bytes input)
       (let right (call own_bytes other)
@@ -275,6 +300,51 @@ fn measured<T>(action: impl FnOnce() -> T) -> (T, usize) {
 }
 
 fn main() {
+    for size in [0, 1, 32, 8192, 1_048_576] {
+        let input = vec![17; size];
+        let pointer = input.as_ptr();
+        let (output, count) = measured(|| length_then_move(input));
+        assert_eq!(count, 0, "a completed scalar read cannot retain ownership");
+        assert_eq!(output.bytes.as_ptr(), pointer);
+        assert_eq!(output.offset, size as u64);
+        assert_eq!(output.bytes, vec![17; size]);
+        let text = "é".repeat(size);
+        let pointer = text.as_ptr();
+        let (output, count) = measured(|| scalar_length_then_move(text));
+        assert_eq!(count, 0, "a completed scalar-count read cannot retain ownership");
+        assert_eq!(output.as_ptr(), pointer);
+        assert_eq!(output, "é".repeat(size));
+        for append in [self_append, self_append_hygiene] {
+            let mut input = Vec::with_capacity(size * 2);
+            input.resize(size, 17);
+            let pointer = input.as_ptr();
+            let (output, count) = measured(|| append(input));
+            assert_eq!(count, 0, "self append reuses sufficient owned capacity");
+            assert_eq!(output.as_ptr(), pointer);
+            assert_eq!(output, vec![17; size * 2]);
+        }
+        let output = move_then_length(vec![17; size]);
+        assert_eq!(output.first, vec![17; size]);
+        assert_eq!(output.second, vec![17; size]);
+        for action in [move_then_last_length, read_move_read] {
+            let output = action(vec![17; size]);
+            assert_eq!(output.bytes, vec![17; size]);
+            assert_eq!(output.offset, size as u64, "later length reads must retain their owner");
+        }
+        let mut output = self_append_retained(vec![17; size]);
+        assert_eq!(output.first, vec![17; size * 2]);
+        assert_eq!(output.second, vec![17; size]);
+        output.first.push(9);
+        assert_eq!(output.second.len(), size);
+        let original = Parcel { bytes: vec![17; size], offset: 0 };
+        assert_eq!(self_append_borrowed(&original), vec![17; size * 2]);
+        assert_eq!(original.bytes, vec![17; size]);
+    }
+    let mut output = self_append_words(Some(vec!["é".into(), "tail".into()])).unwrap();
+    assert_eq!(output, vec!["é", "tail", "é", "tail"]);
+    output[0].push('!');
+    assert_eq!(output[2], "é");
+    assert_eq!(self_append_words(None), None);
     for text in ["", "ascii", "\0", "é", "e\u{301}", "🦀", "日本語"] {
         for decode in [decode_field, decode_alias] {
             let input = Parcel { bytes: text.as_bytes().to_vec(), offset: 7 };
@@ -549,8 +619,8 @@ fn main() {
 
         let input = vec![0x5a; size];
         let (output, count) = measured(|| self_append(input));
-        // Preserve one owned left clone and one growth allocation, but no right clone.
-        assert_eq!(count, 2 * usize::from(size != 0), "self append, size={size}");
+        // Self append grows the original buffer without an intermediate clone.
+        assert_eq!(count, usize::from(size != 0), "self append, size={size}");
         assert_eq!(output, vec![0x5a; size * 2]);
 
         let input = vec![0x5a; size];
@@ -783,6 +853,34 @@ fn borrowed_utf8_decoding_executes_in_actual_bounded_wasm() {
             4096,
             16,
             "borrowed_decode_wasm_test.mjs",
+            release,
+        );
+    }
+}
+
+#[test]
+fn leading_length_reads_move_within_actual_wasm_memory_bound() {
+    for release in [false, true] {
+        actual_wasm_profile(
+            "length_entry",
+            1_048_576,
+            1_048_576,
+            50,
+            "borrowed_operands_wasm_test.mjs",
+            release,
+        );
+    }
+}
+
+#[test]
+fn self_append_reuses_owned_storage_in_actual_bounded_wasm() {
+    for release in [false, true] {
+        actual_wasm_profile(
+            "self_append",
+            1_048_576,
+            2_097_152,
+            98,
+            "self_append_wasm_test.mjs",
             release,
         );
     }

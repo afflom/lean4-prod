@@ -366,6 +366,12 @@ private def isDictionaryResult (resultType : Option Expr) : LowerM Bool := do
 def lowerLetValue (v : LetValue .pure) (resultType : Option Expr := none) : LowerM String := do
   if let some literal ← byteLiteral? v then return literal
   if let some append ← specializedByteAppend? v resultType then return append
+  -- String.length counts Unicode scalars, not the UTF-8 byte count returned by
+  -- the collection `length` opcode. Retain this distinction in typed IR.
+  if let .const ``String.length _ #[.fvar input] := v then
+    if let some (.const ``Nat _) := resultType then
+      if let some (.const ``String _) := (← get).fvarTypes[input.name]? then
+        return s!"(string-length {← lookupFVar input})"
   -- Lean can simplify a call through a byte-length wrapper to this builtin.
   -- Admit only its exact Bytes -> Nat shape, not a name-only external escape.
   if let .const ``ByteArray.size _ #[.fvar input] := v then
@@ -406,6 +412,10 @@ def lowerLetValue (v : LetValue .pure) (resultType : Option Expr := none) : Lowe
       if args'.size >= arity then
         let values := args'.extract (args'.size - arity) args'.size
         modify fun st => { st with dropped := st.dropped + (args'.size - arity) }
+        if op == "length" then
+          if let some (.fvar input) := args.back? then
+            if let some (.const ``String _) := (← get).fvarTypes[input.name]? then
+              return s!"(string-length{spaced values})"
         if op == "parse-decimal" then
           if let some target := resultType.bind decimalTarget? then
             return s!"(parse-decimal-as {target}{spaced values})"

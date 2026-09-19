@@ -1417,11 +1417,12 @@ fn test_byte_literals_preserve_arbitrary_bytes_and_borrow_in_predicates() {
 "#;
     let out = generate(ir);
     assert!(out.contains("alloc::vec![0, 128, 255]"));
-    assert!(out.contains("alloc::vec![]"));
+    assert!(out.contains("alloc::vec::Vec::<u8>::new()"));
     assert!(out.contains("pub fn equalsBytes(value: &[u8]) -> bool"));
     assert!(out.contains("core::convert::AsRef::<[u8]>::as_ref(&(value)) == &[0, 128, 255]"));
     assert!(out.contains("equalsBytes(&[0, 128, 255])"));
-    assert_eq!(out.matches("alloc::vec!").count(), 2);
+    assert_eq!(out.matches("alloc::vec!").count(), 1);
+    assert_eq!(out.matches("alloc::vec::Vec::<u8>::new()").count(), 1);
     let directory = loop {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

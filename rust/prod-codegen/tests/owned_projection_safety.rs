@@ -15,6 +15,48 @@ const IR: &str = r#"(module OwnedProjectionSafety
   (type "Pair" (ctor "Pair.mk" (first Bytes) (second Bytes)))
   (type "OptionalPair" (ctor "OptionalPair.mk" (first (Option Bytes)) (second (Option Bytes))))
   (type "ParcelList" (ctor "ParcelList.mk" (slots (List (named "Parcel")))))
+  (type "VariantBox" (ctor "VariantBox.mk" (value (Option (named "EmptyVariant"))) (bytes Bytes)))
+  (def equal_variant ((left (named "EmptyVariant")) (right (named "EmptyVariant"))) Bool
+    (eq left right))
+  (def borrowed_result_error ((input (Result (named "Parcel") (named "EmptyVariant"))) (expected (named "EmptyVariant"))) Bool
+    (cases input
+      (alt "Except.ok" (value) false)
+      (alt "Except.error" (failure) (call equal_variant failure expected))))
+  (def borrowed_result_ok ((input (Result (named "EmptyVariant") (named "Parcel"))) (expected (named "EmptyVariant"))) Bool
+    (let alias input
+      (cases alias
+        (alt "Except.ok" (value) (call equal_variant value expected))
+        (alt "Except.error" (failure) false))))
+  (def borrowed_option_variant ((input (named "VariantBox")) (expected (named "EmptyVariant"))) Bool
+    (let value (proj "VariantBox" "value" input)
+      (cases value
+        (alt "Option.none" () false)
+        (alt "Option.some" (actual) (call equal_variant actual expected)))))
+  (def borrowed_nested_variant ((input (Option (Result (named "EmptyVariant") (named "Parcel")))) (expected (named "EmptyVariant"))) Bool
+    (cases input
+      (alt "Option.none" () false)
+      (alt "Option.some" (result)
+        (cases result
+          (alt "Except.ok" (actual) (call equal_variant actual expected))
+          (alt "Except.error" (failure) false)))))
+  (def owned_option_variant ((input (Option (named "EmptyVariant")))) (named "EmptyVariant")
+    (cases input
+      (alt "Option.none" () (ctor "EmptyVariant.first"))
+      (alt "Option.some" (actual) actual)))
+  (def owned_result_variant ((input (Result (named "EmptyVariant") (named "Parcel")))) String
+    (cases input
+      (alt "Except.ok" (actual)
+        (if (call equal_variant actual (ctor "EmptyVariant.first")) (string "first") (string "second")))
+      (alt "Except.error" (failure) (string "error"))))
+  (def borrowed_copy_record ((input (Result (named "EmptyRecord") (named "Parcel")))) Nat
+    (cases input
+      (alt "Except.ok" (actual) (call match_empty_record actual))
+      (alt "Except.error" (failure) 0)))
+  (def borrowed_copy_nat ((input (Result Nat (named "Parcel")))) Nat
+    (cases input
+      (alt "Except.ok" (actual) (call counted_nat actual))
+      (alt "Except.error" (failure) 0)))
+  (def counted_nat ((input Nat)) Nat (ctor "counted_value" input))
   (def choose_label ((left (named "Envelope")) (right (named "Envelope")) (flag Bool)) String
     (cases flag
       (alt "Bool.false" () (let label (proj "Envelope" "label" left) label))
@@ -512,7 +554,36 @@ fn main() {
     assert_eq!(ambiguous_label_accessor(&left, &right), left.label);
     assert_eq!(temporary_label(), "temporary");
     cases += 3;
-    assert_eq!(cases, 193);
+    for expected in [EmptyVariant::first, EmptyVariant::second] {
+        for actual in [EmptyVariant::first, EmptyVariant::second] {
+            assert_eq!(borrowed_result_error(Err(actual), expected), actual == expected);
+            assert_eq!(borrowed_result_ok(Ok(actual), expected), actual == expected);
+            assert_eq!(borrowed_option_variant(&VariantBox { value: Some(actual), bytes: vec![1] }, expected), actual == expected);
+            assert_eq!(borrowed_nested_variant(Some(Ok(actual)), expected), actual == expected);
+            cases += 4;
+        }
+        assert!(!borrowed_result_error(Ok(parcel(vec![1], 2)), expected));
+        assert!(!borrowed_result_ok(Err(parcel(vec![1], 2)), expected));
+        assert!(!borrowed_option_variant(&VariantBox { value: None, bytes: vec![1] }, expected));
+        assert!(!borrowed_nested_variant(Some(Err(parcel(vec![1], 2))), expected));
+        assert!(!borrowed_nested_variant(None, expected));
+        cases += 5;
+    }
+    assert_eq!(owned_option_variant(None), EmptyVariant::first);
+    assert_eq!(owned_option_variant(Some(EmptyVariant::first)), EmptyVariant::first);
+    assert_eq!(owned_option_variant(Some(EmptyVariant::second)), EmptyVariant::second);
+    assert_eq!(owned_result_variant(Ok(EmptyVariant::first)), "first");
+    assert_eq!(owned_result_variant(Ok(EmptyVariant::second)), "second");
+    assert_eq!(owned_result_variant(Err(parcel(vec![1], 2))), "error");
+    assert_eq!(borrowed_copy_record(Ok(EmptyRecord {})), 17);
+    assert_eq!(borrowed_copy_record(Err(parcel(vec![1], 2))), 0);
+    reset_evaluation_probe();
+    assert_eq!(borrowed_copy_nat(Ok(42)), 42);
+    assert_eq!((evaluation_calls(), evaluation_order()), (1, 42));
+    assert_eq!(borrowed_copy_nat(Err(parcel(vec![1], 2))), 0);
+    assert_eq!((evaluation_calls(), evaluation_order()), (1, 42));
+    cases += 12;
+    assert_eq!(cases, 231);
     println!("owned projection safety: {cases} cases passed");
 }
 "#;
@@ -645,7 +716,7 @@ fn owned_projection_safety_executes_in_std_and_no_std_debug_and_optimized() {
             );
             assert_eq!(
                 succeeds(&mut Command::new(&executable)),
-                "owned projection safety: 193 cases passed\n"
+                "owned projection safety: 231 cases passed\n"
             );
         }
     }

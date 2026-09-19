@@ -12,6 +12,14 @@ const IR: &str = r#"(module BorrowedOperands
   (type "Parcel" (ctor "Parcel.mk" (bytes Bytes) (offset Nat)))
   (type "Fields" (ctor "Fields.mk" (bytes Bytes) (text String) (words (List String)) (offset Nat)))
   (type "Pair" (ctor "Pair.mk" (first Bytes) (second Bytes)))
+  (type "CopyTag" (ctor "CopyTag.first") (ctor "CopyTag.second"))
+  (def equal_tag ((left (named "CopyTag")) (right (named "CopyTag"))) Bool (eq left right))
+  (def inspect_error ((input (Result Bytes (named "CopyTag"))) (expected (named "CopyTag"))) Bool
+    (cases input
+      (alt "Except.ok" (bytes) (eq (length bytes) 8192))
+      (alt "Except.error" (tag) (call equal_tag tag expected))))
+  (def copy_pattern_entry ((input Bytes)) Bytes
+    (if (call inspect_error (ctor "Except.error" (ctor "CopyTag.second")) (ctor "CopyTag.second")) input (bytes)))
   (def move_fields ((input (Option (named "Fields")))) (Option (named "Fields"))
     (cases input
       (alt "Option.none" () (ctor "Option.none"))
@@ -252,6 +260,17 @@ fn measured<T>(action: impl FnOnce() -> T) -> (T, usize) {
 }
 
 fn main() {
+    for expected in [CopyTag::first, CopyTag::second] {
+        for actual in [CopyTag::first, CopyTag::second] {
+            let (output, count) = measured(|| inspect_error(Err(actual), expected));
+            assert_eq!(output, actual == expected);
+            assert_eq!(count, 0, "Copy pattern payloads do not allocate");
+        }
+        let input = vec![7; 8192];
+        let (output, count) = measured(|| inspect_error(Ok(input), expected));
+        assert!(output);
+        assert_eq!(count, 0, "non-Copy alternative remains borrowed");
+    }
     for size in [0, 1, 32, 8192] {
         for choose in [false, true] {
             for action in [branch_parameter, branch_alias, branch_join] {
@@ -690,6 +709,17 @@ fn exclusive_owned_branches_execute_in_actual_bounded_wasm() {
     // Input/output ABI copies remain subject to the existing fixture cap.
     actual_wasm(
         "branch_entry",
+        1_048_576,
+        1_048_576,
+        64,
+        "borrowed_operands_wasm_test.mjs",
+    );
+}
+
+#[test]
+fn borrowed_copy_patterns_execute_in_actual_bounded_wasm() {
+    actual_wasm(
+        "copy_pattern_entry",
         1_048_576,
         1_048_576,
         64,

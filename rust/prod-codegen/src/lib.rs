@@ -1014,19 +1014,25 @@ fn list_head_rebound_by_value(
         .unwrap_or(true)
 }
 
-fn borrowed_locals(
+#[derive(Default)]
+struct BindingOwnership {
+    borrowed: BTreeSet<String>,
+    copied_patterns: BTreeSet<String>,
+}
+
+fn binding_ownership(
     definition: &Definition,
     definitions: &[Definition],
     table: &TypeTable<'_>,
     movable: &BTreeSet<String>,
-) -> BTreeSet<String> {
+) -> BindingOwnership {
     fn walk(
         expr: &Expr,
         definitions: &[Definition],
         table: &TypeTable<'_>,
         params: &[(String, Type)],
         local_types: &LocalTypes,
-        locals: &mut BTreeSet<String>,
+        locals: &mut BindingOwnership,
         movable: &BTreeSet<String>,
     ) {
         match expr {
@@ -1046,8 +1052,8 @@ fn borrowed_locals(
                 } else {
                     nested_types.remove(name);
                 }
-                if expression_is_borrowed(value, definitions, table, locals, movable) {
-                    locals.insert(name.clone());
+                if expression_is_borrowed(value, definitions, table, &locals.borrowed, movable) {
+                    locals.borrowed.insert(name.clone());
                 }
                 walk(
                     body,
@@ -1073,7 +1079,8 @@ fn borrowed_locals(
                     locals,
                     movable,
                 );
-                let borrowed = expression_is_borrowed(scrut, definitions, table, locals, movable);
+                let borrowed =
+                    expression_is_borrowed(scrut, definitions, table, &locals.borrowed, movable);
                 let scrutinee_type =
                     expression_type(scrut, definitions, table, local_types, params);
                 for alt in alts {
@@ -1087,16 +1094,21 @@ fn borrowed_locals(
                         // Slice patterns always borrow their tail. Keep the
                         // head classification identical to render_match's
                         // optional by-value rebind, including nested matches.
-                        locals.insert(alt.binders[1].clone());
+                        locals.borrowed.insert(alt.binders[1].clone());
                         if !list_head_rebound_by_value(scrut, params, table) {
-                            locals.insert(alt.binders[0].clone());
+                            locals.borrowed.insert(alt.binders[0].clone());
                         }
                     }
                     if borrowed {
                         if alt.ctor != "List.cons" {
                             for (name, ty) in &fields {
-                                if !copy_type(ty, table, &mut BTreeSet::new()) {
-                                    locals.insert(name.clone());
+                                if copy_type(ty, table, &mut BTreeSet::new()) {
+                                    // Builtin patterns use match ergonomics too.
+                                    // Record positive typed evidence for their
+                                    // by-value rebind; an unknown type is not Copy.
+                                    locals.copied_patterns.insert(name.clone());
+                                } else {
+                                    locals.borrowed.insert(name.clone());
                                 }
                             }
                         }
@@ -1106,7 +1118,7 @@ fn borrowed_locals(
                             for ((_, ty), binder) in constructor.fields.iter().zip(&alt.binders) {
                                 // Copy fields are rebound by value in render_match.
                                 if !copy_type(ty, table, &mut BTreeSet::new()) {
-                                    locals.insert(binder.clone());
+                                    locals.borrowed.insert(binder.clone());
                                 }
                             }
                         }
@@ -1149,12 +1161,15 @@ fn borrowed_locals(
         }
     }
     let returns_copy = copy_type(&definition.ret, table, &mut BTreeSet::new());
-    let mut locals = definition
-        .params
-        .iter()
-        .filter(|(_, ty)| internal_borrowed_parameter(ty, table, returns_copy))
-        .map(|(name, _)| name.clone())
-        .collect();
+    let mut locals = BindingOwnership {
+        borrowed: definition
+            .params
+            .iter()
+            .filter(|(_, ty)| internal_borrowed_parameter(ty, table, returns_copy))
+            .map(|(name, _)| name.clone())
+            .collect(),
+        copied_patterns: BTreeSet::new(),
+    };
     walk(
         &definition.body,
         definitions,
@@ -1256,7 +1271,7 @@ fn generate_def_in<'m>(
     };
     let visibility = if helper { "" } else { "pub " };
     let movable_projections = movable_projection_owners(def, table);
-    let borrowed_bindings = borrowed_locals(def, definitions, table, &movable_projections);
+    let bindings = binding_ownership(def, definitions, table, &movable_projections);
     let renderer = Renderer {
         shapes,
         definitions,
@@ -1269,10 +1284,11 @@ fn generate_def_in<'m>(
             table,
             &def.params,
             returns_copy,
-            &borrowed_bindings,
+            &bindings.borrowed,
         ),
         inline_values: inline_bindings(&def.body),
-        borrowed_locals: borrowed_bindings,
+        borrowed_locals: bindings.borrowed,
+        copied_patterns: bindings.copied_patterns,
         movable_projections,
         eager_bindings,
     };
@@ -1690,6 +1706,7 @@ struct Renderer<'s, 'm> {
     inline_values: BTreeMap<String, &'m Expr>,
     /// Locals that borrow a field/parameter rather than owning its value.
     borrowed_locals: BTreeSet<String>,
+    copied_patterns: BTreeSet<String>,
     /// Syntactically single-use fields; actual movement also requires an owned receiver.
     movable_projections: BTreeSet<String>,
     /// Expanded jump arguments are eager even when a list builder would
@@ -2638,21 +2655,21 @@ impl<'m> Renderer<'_, 'm> {
                 ("Bool.true", 0) => format!("        true => {},\n", body),
                 ("Bool.false", 0) => format!("        false => {},\n", body),
                 ("Option.none", 0) => format!("        None => {},\n", body),
-                ("Option.some", 1) => format!(
-                    "        Some({}) => {},\n",
-                    rust_local_ident(&alt.binders[0]),
-                    body
-                ),
-                ("Except.ok", 1) => format!(
-                    "        Ok({}) => {},\n",
-                    rust_local_ident(&alt.binders[0]),
-                    body
-                ),
-                ("Except.error", 1) => format!(
-                    "        Err({}) => {},\n",
-                    rust_local_ident(&alt.binders[0]),
-                    body
-                ),
+                ("Option.some" | "Except.ok" | "Except.error", 1) => {
+                    let constructor = match alt.ctor.as_str() {
+                        "Option.some" => "Some",
+                        "Except.ok" => "Ok",
+                        _ => "Err",
+                    };
+                    let binder = rust_local_ident(&alt.binders[0]);
+                    if self.copied_patterns.contains(&alt.binders[0]) {
+                        format!(
+                            "        {constructor}({binder}) => {{ let {binder} = *{binder}; {body} }},\n"
+                        )
+                    } else {
+                        format!("        {constructor}({binder}) => {body},\n")
+                    }
+                }
                 _ => match self.ctor_decl(&alt.ctor) {
                     Some((decl, cdecl)) if alt.binders.len() == cdecl.fields.len() => {
                         let path = if decl.ctors.len() == 1 {

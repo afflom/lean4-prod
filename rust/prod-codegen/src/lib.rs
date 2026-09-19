@@ -46,9 +46,9 @@
 //! shifts, and powers render as `checked_*(..).ok_or(crate::ComputeError::X)?`
 //! (with the shift/power exponent narrowed through
 //! `u32::try_from(..).map_err(..)?`). Subtraction saturates at zero (Lean Nat
-//! subtraction) and division/modulo by zero return zero (Lean Nat's total
-//! operations), so neither is fallible. There is no bignum fallback, so this
-//! is exact only while values fit in `u64`.
+//! subtraction); division by zero returns zero and remainder by zero returns
+//! the dividend (Lean Nat's total operations), so neither is fallible.
+//! There is no bignum fallback, so this is exact only while values fit in `u64`.
 //!
 //! A definition returns `Result<T, crate::ComputeError>` **only if it needs
 //! to**: if its body contains a checked operation, or calls a definition that
@@ -2781,12 +2781,14 @@ impl<'m> Renderer<'_, 'm> {
         ))
     }
 
-    /// Lean Nat division and modulo are total: `x / 0 = x % 0 = 0`.
+    /// Lean Nat's total operations satisfy `x / 0 = 0` and `x % 0 = x`.
+    /// Tuple evaluation is once, left-to-right; match bindings are not in
+    /// scope in either operand, even when an operand uses the same name.
     fn total_binop(&self, a: &'m Expr, b: &'m Expr, op: &str) -> Result<String, Error> {
         let (a, b) = (self.value(a)?, self.value(b)?);
+        let zero = if op == "%" { "__left" } else { "0" };
         Ok(format!(
-            "if ({}) == 0 {{ 0 }} else {{ ({}) {} ({}) }}",
-            b, a, op, b
+            "match (({a}) as u64, ({b}) as u64) {{ (__left, 0) => {zero}, (__left, __right) => __left {op} __right }}"
         ))
     }
 }

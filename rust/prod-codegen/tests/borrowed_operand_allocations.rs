@@ -105,6 +105,40 @@ const IR: &str = r#"(module BorrowedOperands
     (if (call accepts input) (ctor "Option.some" input) (ctor "Option.none")))
   (def own_bytes ((input Bytes)) Bytes input)
   (def own_text ((input String)) String input)
+  (def branch_parameter ((input Bytes) (choose Bool)) Bytes
+    (if choose input input))
+  (def branch_alias ((input Bytes) (choose Bool)) Bytes
+    (let local (call own_bytes input) (if choose local local)))
+  (def branch_nested ((input Bytes) (first Bool) (second Bool)) Bytes
+    (cases first
+      (alt "Bool.false" () (if second input input))
+      (default (if second input input))))
+  (def branch_join ((input Bytes) (choose Bool)) Bytes
+    (let finish (jp finish (value) (if choose value value))
+      (jmp finish input)))
+  (def branch_text ((input String) (choose Bool)) String
+    (if choose input input))
+  (def branch_walk ((remaining Nat) (input Bytes)) Bytes
+    (if (eq remaining 0) input (call branch_walk (sub remaining 1) input)))
+  (def branch_append ((remaining Nat) (input Bytes) (suffix (named "Parcel"))) Bytes
+    (if (eq remaining 0) input
+      (call branch_append (sub remaining 1) (append input (proj "Parcel" "bytes" suffix)) suffix)))
+  (def branch_join_retained ((input Bytes) (choose Bool)) (named "Pair")
+    (let finish (jp finish (value) (if choose value value))
+      (let first (jmp finish input)
+        (ctor "Pair.mk" first (jmp finish input)))))
+  (def branch_retained ((input Bytes) (choose Bool)) (named "Pair")
+    (let first (if choose (call own_bytes input) (call own_bytes input))
+      (ctor "Pair.mk" first input)))
+  (def branch_duplicate ((input Bytes) (choose Bool)) (named "Pair")
+    (if choose (ctor "Pair.mk" input input) (ctor "Pair.mk" input (bytes))))
+  (def branch_scrutinee ((input Bytes)) Bytes
+    (cases (utf8-decode input)
+      (alt "Option.none" () input)
+      (alt "Option.some" (text) (append input (utf8-encode text)))))
+  (def branch_eager_failure ((input Bytes) (choose Bool) (maximum Nat)) Bytes
+    (let unused (add maximum 1) (if choose input input)))
+  (def branch_entry ((input Bytes)) Bytes (call branch_walk 64 input))
   (def slice_read ((input Bytes)) (Option Bytes)
     (let local (call own_bytes input)
       (let part (slice local 0 1)
@@ -218,6 +252,67 @@ fn measured<T>(action: impl FnOnce() -> T) -> (T, usize) {
 }
 
 fn main() {
+    for size in [0, 1, 32, 8192] {
+        for choose in [false, true] {
+            for action in [branch_parameter, branch_alias, branch_join] {
+                let input = vec![19; size];
+                let pointer = input.as_ptr();
+                let (output, count) = measured(|| action(input, choose));
+                assert_eq!(count, 0, "exclusive owned branch must move, size={size}");
+                assert_eq!(output.as_ptr(), pointer);
+                assert_eq!(output, vec![19; size]);
+            }
+            for second in [false, true] {
+                let input = vec![19; size];
+                let pointer = input.as_ptr();
+                let (output, count) = measured(|| branch_nested(input, choose, second));
+                assert_eq!(count, 0, "nested/default alternatives share no execution path");
+                assert_eq!(output.as_ptr(), pointer);
+                assert_eq!(output, vec![19; size]);
+            }
+            let input = "x".repeat(size);
+            let pointer = input.as_ptr();
+            let (output, count) = measured(|| branch_text(input, choose));
+            assert_eq!(count, 0, "String ownership is branch-exclusive too");
+            assert_eq!(output.as_ptr(), pointer);
+            assert_eq!(output, "x".repeat(size));
+
+            let input = vec![19; size];
+            let mut output = branch_retained(input, choose);
+            assert_eq!(output.first, vec![19; size]);
+            assert_eq!(output.second, vec![19; size]);
+            if size > 0 { output.first[0] = 23; assert_eq!(output.second[0], 19); }
+            let mut output = branch_duplicate(vec![19; size], choose);
+            assert_eq!(output.first, vec![19; size]);
+            assert_eq!(output.second, vec![19; if choose { size } else { 0 }]);
+            if choose && size > 0 { output.first[0] = 23; assert_eq!(output.second[0], 19); }
+            let mut output = branch_join_retained(vec![19; size], choose);
+            assert_eq!(output.first, vec![19; size]);
+            assert_eq!(output.second, vec![19; size]);
+            if size > 0 { output.first[0] = 23; assert_eq!(output.second[0], 19); }
+            assert_eq!(branch_eager_failure(vec![19; size], choose, u64::MAX),
+                       Err(ComputeError::AddOverflow));
+        }
+        for steps in [0, 1, 64] {
+            let input = vec![19; size];
+            let pointer = input.as_ptr();
+            let (output, count) = measured(|| branch_walk(steps, input));
+            assert_eq!(count, 0, "recursive exclusive ownership transfer");
+            assert_eq!(output.as_ptr(), pointer);
+            assert_eq!(output, vec![19; size]);
+            let mut input = Vec::with_capacity(size + steps as usize);
+            input.resize(size, 19);
+            let pointer = input.as_ptr();
+            let suffix = Parcel { bytes: vec![7], offset: 0 };
+            let (output, count) = measured(|| branch_append(steps, input, &suffix));
+            assert_eq!(count, 0, "preallocated accumulator must retain its capacity");
+            assert_eq!(output.as_ptr(), pointer);
+            assert_eq!(&output[..size], vec![19; size]);
+            assert_eq!(&output[size..], vec![7; steps as usize]);
+        }
+    }
+    assert_eq!(branch_scrutinee(vec![255]), [255]);
+    assert_eq!(branch_scrutinee(b"abc".to_vec()), b"abcabc");
     for size in [0, 1, 32, 1024] {
         let owner = Parcel { bytes: vec![19; size], offset: 7 };
         let original = owner.bytes.as_ptr();
@@ -587,6 +682,19 @@ fn owned_match_result_executes_in_actual_bounded_wasm() {
             "owned_result_wasm_test.mjs",
         );
     }
+}
+
+#[test]
+fn exclusive_owned_branches_execute_in_actual_bounded_wasm() {
+    // Sixty-four transfers of the same one-MiB allocation must not copy it.
+    // Input/output ABI copies remain subject to the existing fixture cap.
+    actual_wasm(
+        "branch_entry",
+        1_048_576,
+        1_048_576,
+        64,
+        "borrowed_operands_wasm_test.mjs",
+    );
 }
 
 fn actual_wasm(entry: &str, input_cap: u32, output_cap: u32, pages: u32, script: &str) {

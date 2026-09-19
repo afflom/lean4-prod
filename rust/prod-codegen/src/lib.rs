@@ -779,7 +779,7 @@ fn repeated_non_copy_locals(
                     // Borrowed projections can be shared; a moved field is
                     // an owned local and needs the usual reuse protection.
                     if !borrowed_bindings.contains(name)
-                        && count_var_uses(body, name) > 1
+                        && count_path_uses(body, name) > 1
                         && !single_owned_option_match(name, value, body, definitions, table)
                     {
                         output.insert(name.clone());
@@ -825,7 +825,7 @@ fn repeated_non_copy_locals(
                 ..
             } => {
                 for parameter in join_params {
-                    if count_var_uses(body, parameter) > 1 {
+                    if count_path_uses(body, parameter) > 1 {
                         output.insert(parameter.clone());
                     }
                 }
@@ -843,7 +843,7 @@ fn repeated_non_copy_locals(
     for (name, ty) in params {
         if !internal_borrowed_parameter(ty, table, returns_copy)
             && !copy_type(ty, table, &mut BTreeSet::new())
-            && count_var_uses(expr, name) > 1
+            && count_path_uses(expr, name) > 1
         {
             output.insert(name.clone());
         }

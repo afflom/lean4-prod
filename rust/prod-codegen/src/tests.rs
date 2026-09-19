@@ -938,6 +938,7 @@ fn test_every_error_variant_is_published_in_rejections() {
         Error::UnresolvedCall(s()),
         Error::UnknownField(s(), s()),
         Error::UnsupportedJoinPoint(s()),
+        Error::JoinExpansionLimit,
         Error::DuplicateBinding(s()),
     ];
 
@@ -956,6 +957,7 @@ fn test_every_error_variant_is_published_in_rejections() {
             Error::UnresolvedCall(_) => "UnresolvedCall",
             Error::UnknownField(..) => "UnknownField",
             Error::UnsupportedJoinPoint(_) => "UnsupportedJoinPoint",
+            Error::JoinExpansionLimit => "JoinExpansionLimit",
             Error::DuplicateBinding(_) => "DuplicateBinding",
         };
         assert!(
@@ -1026,7 +1028,7 @@ fn test_generate_jp_jmp_inlined() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn f(x: u64) -> Result<u64, crate::ComputeError> {\n    Ok({ let g = /* jp \"g\" inlined at its jump site */ (); { let a = x; ((a) as u64).checked_add(1).ok_or(crate::ComputeError::AddOverflow)? } })\n}\n\n"
+        "pub fn f(x: u64) -> Result<u64, crate::ComputeError> {\n    Ok({ let a = x; ((a) as u64).checked_add(1).ok_or(crate::ComputeError::AddOverflow)? })\n}\n\n"
     );
 }
 
@@ -1061,10 +1063,10 @@ fn test_multi_caller_acyclic_join_point_is_inlined_at_every_jump() {
 )
 "#;
     let out = generate(ir);
-    assert_eq!(out.matches("let a =").count(), 2);
+    assert_eq!(out.matches("let ").count(), 2);
     assert_eq!(out.matches("checked_add(1)").count(), 2);
     assert!(out.contains("let a = x"));
-    assert!(out.contains("let a = c"));
+    assert!(out.contains(" = c;"));
 }
 
 #[test]
@@ -1077,7 +1079,7 @@ fn test_join_point_with_no_callers_still_renders() {
     (jp g (a) x))
 )
 "#;
-    assert!(generate(ir).contains("no jump sites"));
+    assert_eq!(generate(ir), "pub fn f(x: u64) -> u64 {\n    x\n}\n\n");
 }
 
 #[test]

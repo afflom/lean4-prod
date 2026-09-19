@@ -12,6 +12,61 @@ const IR: &str = r#"(module OwnedProjectionSafety
   (type "MaybeEnvelope" (ctor "MaybeEnvelope.mk" (parcel (Option (named "Parcel")))))
   (type "Pair" (ctor "Pair.mk" (first Bytes) (second Bytes)))
   (type "OptionalPair" (ctor "OptionalPair.mk" (first (Option Bytes)) (second (Option Bytes))))
+  (type "ParcelList" (ctor "ParcelList.mk" (slots (List (named "Parcel")))))
+  (def empty_order () Ordering (compare-bytes (bytes) (bytes)))
+  (def aliased_empty_order () Ordering
+    (let empty (bytes) (compare-bytes empty empty)))
+  (def literal_order () Ordering (compare-bytes (bytes 0 255) (bytes 128)))
+  (def empty_left ((input Bytes)) Ordering (compare-bytes (bytes) input))
+  (def empty_right ((input Bytes)) Ordering (compare-bytes input (bytes)))
+  (def join_failure_order ((input Nat)) Nat
+    (let continuation (jp continuation (first second) 0)
+      (jmp continuation (add input 1) (mul input 2))))
+  (def borrowed_head ((input (List (named "Parcel")))) (Option (named "Parcel"))
+    (cases input
+      (alt "List.nil" () (ctor "Option.none"))
+      (alt "List.cons" (head tail) (ctor "Option.some" head))))
+  (def borrowed_rebuild ((input (List (named "Parcel")))) (named "ParcelList")
+    (cases input
+      (alt "List.nil" () (ctor "ParcelList.mk" (ctor "List.nil")))
+      (alt "List.cons" (head tail)
+        (ctor "ParcelList.mk" (ctor "List.cons" head tail)))))
+  (def borrowed_prepend ((head (named "Parcel")) (tail (List (named "Parcel")))) (named "ParcelList")
+    (ctor "ParcelList.mk" (ctor "List.cons" head tail)))
+  (def borrowed_projected_tail ((head (named "Parcel")) (tail (named "ParcelList"))) (named "ParcelList")
+    (let slots (proj "ParcelList" "slots" tail)
+      (ctor "ParcelList.mk" (ctor "List.cons" head slots))))
+  (def owned_list ((head (Option (named "Parcel"))) (tail (Option (List (named "Parcel"))))) (Option (named "ParcelList"))
+    (cases head
+      (alt "Option.none" () (ctor "Option.none"))
+      (alt "Option.some" (item)
+        (cases tail
+          (alt "Option.none" () (ctor "Option.none"))
+          (alt "Option.some" (items)
+            (ctor "Option.some" (ctor "ParcelList.mk" (ctor "List.cons" item items))))))))
+  (def owned_singleton ((input (Option (named "Parcel")))) (Option (named "ParcelList"))
+    (cases input
+      (alt "Option.none" () (ctor "Option.none"))
+      (alt "Option.some" (head)
+        (ctor "Option.some" (ctor "ParcelList.mk" (ctor "List.cons" head (ctor "List.nil")))))))
+  (def mixed_join ((input (List (named "Parcel"))) (replacement Bytes) (choose Bool)) (Option (named "ParcelList"))
+    (cases input
+      (alt "List.nil" () (ctor "Option.none"))
+      (alt "List.cons" (head tail)
+        (let continuation
+          (jp continuation (item)
+            (let alias item
+              (ctor "Option.some" (ctor "ParcelList.mk" (ctor "List.cons" alias tail)))))
+          (if choose
+            (jmp continuation (ctor "Parcel.mk" replacement 42))
+            (jmp continuation head))))))
+  (def nested_join ((input (named "Parcel"))) (Option (named "Parcel"))
+    (let outer
+      (jp outer (item)
+        (let alias item
+          (let inner (jp inner (value) (ctor "Option.some" value))
+            (jmp inner alias))))
+      (jmp outer input)))
   (def nested_owned ((input (Option (named "Envelope")))) (Option (named "Pair"))
     (cases input
       (alt "Option.none" () (ctor "Option.none"))
@@ -75,6 +130,82 @@ fn main() {
     let mut cases = 0;
     for size in [0, 1, 128, 8192] {
         let expected: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
+        assert_eq!(empty_left(expected.clone()), [].as_slice().cmp(expected.as_slice()));
+        assert_eq!(empty_right(expected.clone()), expected.as_slice().cmp(&[]));
+        cases += 2;
+        let slots = vec![parcel(expected.clone(), 11), parcel(vec![254], 12)];
+        let mut output = borrowed_head(&slots).unwrap();
+        assert_eq!(output, slots[0]);
+        output.bytes.push(255);
+        assert_eq!(slots[0].bytes, expected);
+
+        let mut output = borrowed_rebuild(&slots);
+        assert_eq!(output.slots, slots);
+        output.slots[0].bytes.push(255);
+        output.slots[1].bytes.push(255);
+        assert_eq!(slots[0].bytes, expected);
+        assert_eq!(slots[1].bytes, [254]);
+
+        let head = parcel(vec![253], 13);
+        let mut output = nested_join(&head).unwrap();
+        assert_eq!(output, head);
+        output.bytes.push(255);
+        assert_eq!(head.bytes, [253]);
+        for choose in [false, true] {
+            let replacement = vec![251; size + 1];
+            let pointer = replacement.as_ptr();
+            let mut output = mixed_join(&slots, replacement, choose).unwrap();
+            assert_eq!(output.slots.len(), slots.len());
+            if choose {
+                assert_eq!(output.slots[0].bytes, vec![251; size + 1]);
+                assert_eq!(output.slots[0].marker, 42);
+                assert_eq!(output.slots[0].bytes.as_ptr(), pointer, "owned join argument moves");
+            } else {
+                assert_eq!(output.slots[0], slots[0]);
+            }
+            output.slots[0].bytes.push(255);
+            assert_eq!(slots[0].bytes, expected);
+            assert_eq!(output.slots[1], slots[1]);
+        }
+        cases += 3;
+        let mut output = borrowed_prepend(&head, &slots);
+        assert_eq!(output.slots, [vec![head.clone()], slots.clone()].concat());
+        output.slots[0].bytes.push(255);
+        output.slots[1].bytes.push(255);
+        assert_eq!(head.bytes, [253]);
+        assert_eq!(slots[0].bytes, expected);
+
+        let list = ParcelList { slots };
+        let mut output = borrowed_projected_tail(&head, &list);
+        assert_eq!(output.slots, [vec![head.clone()], list.slots.clone()].concat());
+        output.slots[2].bytes.push(255);
+        assert_eq!(list.slots[1].bytes, [254]);
+
+        let mut tail = Vec::with_capacity(4);
+        tail.push(parcel(vec![252], 14));
+        let list_pointer = tail.as_ptr();
+        let tail_pointer = tail[0].bytes.as_ptr();
+        let head = parcel(expected.clone(), 11);
+        let head_pointer = head.bytes.as_ptr();
+        let output = owned_list(Some(head), Some(tail)).unwrap();
+        assert_eq!(output.slots.len(), 2);
+        assert_eq!(output.slots[0].bytes, expected);
+        assert_eq!(output.slots[1].bytes, [252]);
+        assert_eq!(output.slots.as_ptr(), list_pointer, "owned list capacity is reused");
+        assert_eq!(output.slots[1].bytes.as_ptr(), tail_pointer, "owned tail item moves");
+        if size != 0 {
+            assert_eq!(output.slots[0].bytes.as_ptr(), head_pointer, "owned head moves");
+        }
+
+        let head = parcel(expected.clone(), 11);
+        let head_pointer = head.bytes.as_ptr();
+        let output = owned_singleton(Some(head)).unwrap();
+        assert_eq!(output.slots.len(), 1);
+        assert_eq!(output.slots[0].bytes, expected);
+        if size != 0 {
+            assert_eq!(output.slots[0].bytes.as_ptr(), head_pointer, "singleton moves its item");
+        }
+        cases += 6;
         for label in ["", "parcel", "🌱\0é"] {
             let bytes = expected.clone();
             let pointer = bytes.as_ptr();
@@ -169,7 +300,21 @@ fn main() {
     assert!(nested_shadow(None).is_none());
     assert!(borrowed_optional(&MaybeEnvelope { parcel: None }).is_none());
     cases += 3;
-    assert_eq!(cases, 79);
+    assert!(borrowed_head(&[]).is_none());
+    assert!(borrowed_rebuild(&[]).slots.is_empty());
+    assert!(owned_list(None, None).is_none());
+    assert!(owned_singleton(None).is_none());
+    cases += 4;
+    assert_eq!(empty_order(), core::cmp::Ordering::Equal);
+    assert_eq!(aliased_empty_order(), core::cmp::Ordering::Equal);
+    assert_eq!(literal_order(), core::cmp::Ordering::Less);
+    cases += 3;
+    assert!(mixed_join(&[], vec![1], true).is_none());
+    cases += 1;
+    assert_eq!(join_failure_order(0), Ok(0));
+    assert_eq!(join_failure_order(u64::MAX), Err(ComputeError::AddOverflow));
+    cases += 2;
+    assert_eq!(cases, 133);
     println!("owned projection safety: {cases} cases passed");
 }
 "#;
@@ -280,7 +425,7 @@ fn owned_projection_safety_executes_in_std_and_no_std_debug_and_optimized() {
             );
             assert_eq!(
                 succeeds(&mut Command::new(&executable)),
-                "owned projection safety: 79 cases passed\n"
+                "owned projection safety: 133 cases passed\n"
             );
         }
     }

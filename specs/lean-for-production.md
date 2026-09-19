@@ -77,5 +77,6 @@ Everything else fails, precisely:
 | `UnboundedInt` | mathematical Lean Int reaches a fixed-width runtime target |
 | `UnresolvedCall` | the callee is neither @[prod]-tagged nor a whitelisted operator, so there is nothing to call |
 | `UnknownField` | a projection names a field the declared type does not have |
-| `UnsupportedJoinPoint` | a join point with several callers, or one that jumps to itself; only the single-caller form, which inlines at its jump site, has a lowering |
+| `UnsupportedJoinPoint` | a cyclic join point or a jump whose argument count differs from its parameters; acyclic continuations are specialized before ownership analysis |
+| `JoinExpansionLimit` | acyclic join expansion exceeds 65536 expression nodes or 128 nested continuation calls per definition; checked before materialization, not an application memory or general IR-depth guarantee |
 | `DuplicateBinding` | simultaneous parameters or pattern fields repeat a name; nested shadowing and sibling name reuse remain supported |

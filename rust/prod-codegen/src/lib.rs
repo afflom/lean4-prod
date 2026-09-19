@@ -106,6 +106,7 @@ extern crate alloc;
 
 mod c_abi;
 mod core_wasm;
+mod joins;
 mod naming;
 mod ownership;
 mod package;
@@ -166,6 +167,8 @@ pub enum Error {
     /// A join point that jumps to itself. Acyclic join points are duplicated
     /// at their call sites; cycles would need real control flow.
     UnsupportedJoinPoint(String),
+    /// Acyclic join expansion exceeds 65,536 expression nodes or 128 nested calls.
+    JoinExpansionLimit,
     /// Two simultaneous parameters or pattern fields bind the same name.
     /// Ordinary nested shadowing and sibling name reuse remain supported.
     DuplicateBinding(String),
@@ -215,8 +218,12 @@ impl fmt::Display for Error {
             }
             Error::UnsupportedJoinPoint(name) => write!(
                 f,
-                "join point `{}` has several callers or jumps to itself; only the single-caller form has a lowering",
+                "join point `{}` is cyclic or its argument count differs from its parameters",
                 name
+            ),
+            Error::JoinExpansionLimit => write!(
+                f,
+                "join expansion exceeds 65536 expression nodes or 128 nested calls per definition"
             ),
             Error::DuplicateBinding(name) => write!(
                 f,
@@ -283,7 +290,11 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     ),
     (
         "UnsupportedJoinPoint",
-        "a join point with several callers, or one that jumps to itself; only the single-caller form, which inlines at its jump site, has a lowering",
+        "a cyclic join point or a jump whose argument count differs from its parameters; acyclic continuations are specialized before ownership analysis",
+    ),
+    (
+        "JoinExpansionLimit",
+        "acyclic join expansion exceeds 65536 expression nodes or 128 nested continuation calls per definition; checked before materialization, not an application memory or general IR-depth guarantee",
     ),
     (
         "DuplicateBinding",
@@ -1206,6 +1217,15 @@ fn generate_def_in<'m>(
         &|name| emitted_call_name(name, definitions, table),
         table,
     )?;
+    let normalized = if let Some(expanded) = joins::expand(&normalized)? {
+        naming::normalize_definition(
+            &expanded,
+            &|name| emitted_call_name(name, definitions, table),
+            table,
+        )?
+    } else {
+        normalized
+    };
     let def = &normalized;
     let shape = shapes
         .get(def.name.as_str())
@@ -1853,6 +1873,7 @@ impl<'m> Renderer<'_, 'm> {
             }
             Expr::Let(name, value, body)
                 if count_var_uses(body, name) == 0
+                    && !is_fallible(value, self.shapes)
                     && !matches!(value.as_ref(), Expr::Jp { .. }) =>
             {
                 self.render(body, mode)
@@ -2088,7 +2109,7 @@ impl<'m> Renderer<'_, 'm> {
                 self.value(value)?
             )),
             Expr::CompareBytes(left, right) => Ok(format!(
-                "({}).cmp(&{})",
+                "core::convert::AsRef::<[u8]>::as_ref(&({})).cmp(core::convert::AsRef::<[u8]>::as_ref(&({})))",
                 self.read_value(left)?,
                 self.read_value(right)?
             )),

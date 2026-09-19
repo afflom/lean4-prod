@@ -2288,6 +2288,7 @@ impl<'m> Renderer<'_, 'm> {
             // One owned allocation at the existing Bytes ABI boundary; the
             // compiler folds Array literal builders, so no push-chain or
             // intermediate runtime allocations are introduced.
+            Expr::Bytes(value) if value.is_empty() => Ok("alloc::vec::Vec::<u8>::new()".into()),
             Expr::Bytes(value) => Ok(format!("alloc::vec!{value:?}")),
             Expr::Bool(b) => Ok(format!("{}", b)),
             Expr::Param(index) => self
@@ -2357,9 +2358,15 @@ impl<'m> Renderer<'_, 'm> {
             // fields must cross the existing owned boundary first; already
             // owned Strings retain their allocation through `into_bytes`.
             Expr::Utf8Encode(value) => Ok(format!("({}).into_bytes()", self.owned_value(value)?)),
+            // Borrowed bytes are validated before allocating the owned result.
+            // An owned input instead transfers its allocation into the String.
+            Expr::Utf8Decode(value) if self.borrows(value) => Ok(format!(
+                "core::str::from_utf8(core::convert::AsRef::<[u8]>::as_ref(&({}))).ok().map(alloc::borrow::ToOwned::to_owned)",
+                self.read_value(value)?
+            )),
             Expr::Utf8Decode(value) => Ok(format!(
                 "alloc::string::String::from_utf8({}).ok()",
-                self.value(value)?
+                self.owned_value(value)?
             )),
             Expr::CompareBytes(left, right) => Ok(format!(
                 "core::convert::AsRef::<[u8]>::as_ref(&({})).cmp(core::convert::AsRef::<[u8]>::as_ref(&({})))",

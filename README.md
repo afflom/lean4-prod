@@ -348,6 +348,10 @@ compared with a literal. Legacy `parse-decimal` IR remains accepted. The real
 LexLean-generated decimal fixture checks fixed-width bounds and canonical
 syntax; mathematical `Int` remains rejected by the production renderer.
 
+UTF-8 decoding validates borrowed byte fields before allocating an owned result;
+invalid input allocates nothing, and owned input transfers its existing buffer.
+Empty byte literals retain their `u8` type even in read-only expressions.
+
 UTF-8 encoding preserves the existing ownership boundary: borrowed String
 parameters and fields are copied into owned bytes, while owned Strings reuse
 their buffer. The ordinary Core-Wasm fixture suite executes borrowed, aliased,

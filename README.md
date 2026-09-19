@@ -197,6 +197,12 @@ Lean monomorphization. Lowering recognizes that body, not its generated name.
 altered bodies, and checks native std/no_std plus debug/release Wasm boundaries
 and deterministic bytes.
 
+Imported byte slicing likewise requires the exact typed `start + count <= size`
+guard and extraction of that same range. Overflowing indices, excessive counts
+and out-of-range starts return `None`; they cannot wrap into an admitted range.
+The fixture additionally rejects 21 altered slice bodies and exercises native
+and bounded Wasm slicing alongside indexing.
+
 ### C headers and foreign-function calls
 
 The CLI can generate both sides of a small, explicit C ABI: a header for C

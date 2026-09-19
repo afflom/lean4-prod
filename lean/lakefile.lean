@@ -8,6 +8,9 @@ package «lean4-prod» where
 lean_lib ProdLib where
   roots := #[`Prod]
 
+lean_lib IndexFixture where
+  roots := #[`IndexFixture.Bytes, `IndexFixture.Main]
+
 @[default_target]
 lean_lib Example where
   roots := #[`Example]

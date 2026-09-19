@@ -176,6 +176,12 @@ Positional parameters still refer to the original formal parameters under
 shadowing. Duplicate names within one parameter or pattern-binding group are
 rejected as `DuplicateBinding`, rather than choosing an ambiguous binding.
 
+Imported LexLean byte-index wrappers retain an exact typed bounds-check after
+Lean monomorphization. Lowering recognizes that body, not its generated name.
+`just specialized-index` verifies the unchanged LexLean fixture, rejects 18
+altered bodies, and checks native std/no_std plus debug/release Wasm boundaries
+and deterministic bytes.
+
 ### C headers and foreign-function calls
 
 The CLI can generate both sides of a small, explicit C ABI: a header for C

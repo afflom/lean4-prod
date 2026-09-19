@@ -47,7 +47,10 @@ for output in first-guest second-guest; do
   for profile in debug release; do
     flags=()
     if [ "$profile" = release ]; then flags+=(--release); fi
-    RUSTC_WRAPPER= cargo build --locked --offline "${flags[@]}"
+    # Keep debug information while removing the temporary build-directory identity.
+    # cargo rustc appends this flag without replacing the bounded Wasm linker flags.
+    CARGO_PROFILE_DEV_DEBUG=2 RUSTC_WRAPPER= cargo rustc --locked --offline "${flags[@]}" -- \
+      --remap-path-prefix "$PWD=."
     node "$repo_root/rust/prod-codegen/tests/fixtures/byte_index_wasm_test.mjs" \
       "$scratch/$output/target/wasm32-unknown-unknown/$profile/byte_index_guest.wasm"
   done

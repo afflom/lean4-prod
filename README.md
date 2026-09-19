@@ -176,6 +176,15 @@ Positional parameters still refer to the original formal parameters under
 shadowing. Duplicate names within one parameter or pattern-binding group are
 rejected as `DuplicateBinding`, rather than choosing an ambiguous binding.
 
+Eligible self-tail recursion lowers to explicit loops in value-returning
+functions, including fallible and owned results. Parallel parameter assignment
+preserves swaps and eager error order. Borrowed parameters must remain the
+same formal at every back edge; non-tail, mutual, builder and changed-borrow
+recursion retain their existing lowering. The transformation adds no heap,
+runtime stack or ABI, and does not establish termination of arbitrary raw IR.
+The regression executes 100,000 steps in native std/no_std at O0/O3 and in
+debug/release Core-Wasm with an unchanged 64-KiB stack.
+
 ### C headers and foreign-function calls
 
 The CLI can generate both sides of a small, explicit C ABI: a header for C

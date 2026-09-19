@@ -111,6 +111,7 @@ mod naming;
 mod ownership;
 mod package;
 mod sdk;
+mod tail_calls;
 mod text_view;
 mod view;
 
@@ -1270,6 +1271,12 @@ fn generate_def_in<'m>(
         def.name.clone()
     };
     let visibility = if helper { "" } else { "pub " };
+    let borrowed_return = returns_borrowed_projection(def, table);
+    let tail_plan = if matches!(shape, Shape::Value | Shape::Fallible) && !borrowed_return {
+        tail_calls::plan(def, table)
+    } else {
+        None
+    };
     let movable_projections = movable_projection_owners(def, table);
     let bindings = binding_ownership(def, definitions, table, &movable_projections);
     let renderer = Renderer {
@@ -1299,7 +1306,12 @@ fn generate_def_in<'m>(
             params.push_str(", ");
         }
         params.push_str(&format!(
-            "{}: {}",
+            "{}{}: {}",
+            if tail_plan.as_ref().is_some_and(|plan| plan.mutates(i)) {
+                "mut "
+            } else {
+                ""
+            },
             rust_local_ident(name),
             param_type_to_rust(
                 ty,
@@ -1309,7 +1321,6 @@ fn generate_def_in<'m>(
         ));
     }
     check_named_type(&def.ret, table)?;
-    let borrowed_return = returns_borrowed_projection(def, table);
     let return_type = if borrowed_return {
         format!("&{}", type_to_rust(&def.ret)?)
     } else {
@@ -1353,20 +1364,37 @@ fn generate_def_in<'m>(
                 generated_name, params, body
             ))
         }
-        Shape::Fallible => Ok(format!(
-            "{visibility}fn {}({}) -> Result<{}, crate::ComputeError> {{\n    Ok({})\n}}\n",
-            generated_name,
-            params,
-            return_type,
-            renderer.render_return(&def.body, borrowed_return)?
-        )),
-        Shape::Value => Ok(format!(
-            "{visibility}fn {}({}) -> {} {{\n    {}\n}}\n",
-            generated_name,
-            params,
-            return_type,
-            renderer.render_return(&def.body, borrowed_return)?
-        )),
+        Shape::Fallible => {
+            let body = if let Some(plan) = &tail_plan {
+                format!(
+                    "loop {{ return Ok({}); }}",
+                    renderer.render_tail(&def.body, plan)?
+                )
+            } else {
+                format!(
+                    "Ok({})",
+                    renderer.render_return(&def.body, borrowed_return)?
+                )
+            };
+            Ok(format!(
+                "{visibility}fn {}({}) -> Result<{}, crate::ComputeError> {{\n    {}\n}}\n",
+                generated_name, params, return_type, body
+            ))
+        }
+        Shape::Value => {
+            let body = if let Some(plan) = &tail_plan {
+                format!(
+                    "loop {{ return {}; }}",
+                    renderer.render_tail(&def.body, plan)?
+                )
+            } else {
+                renderer.render_return(&def.body, borrowed_return)?
+            };
+            Ok(format!(
+                "{visibility}fn {}({}) -> {} {{\n    {}\n}}\n",
+                generated_name, params, return_type, body
+            ))
+        }
     }?;
 
     if !helper {
@@ -2125,7 +2153,7 @@ impl<'m> Renderer<'_, 'm> {
                 scrut,
                 alts,
                 default,
-            } => self.render_match(scrut, alts, default.as_deref(), mode),
+            } => self.render_match(scrut, alts, default.as_deref(), mode, None),
 
             // ---- list-shaped leaves ----
             Expr::Ctor(name, args) if name == "List.nil" && args.is_empty() => match mode {
@@ -2600,6 +2628,7 @@ impl<'m> Renderer<'_, 'm> {
         alts: &'m [Alt],
         default: Option<&'m Expr>,
         mode: &Mode<'_, 'm>,
+        tail: Option<&tail_calls::Plan>,
     ) -> Result<String, Error> {
         let head_rebound_by_value = self.list_head_rebound_by_value(scrut);
         let scrut_is_borrowed = self.borrows(scrut);
@@ -2615,7 +2644,9 @@ impl<'m> Renderer<'_, 'm> {
         let scrut = self.value(scrut)?;
         let mut out = format!("match {} {{\n", scrut);
         for alt in alts {
-            let body = if normalize_results {
+            let body = if let Some(plan) = tail {
+                self.render_tail(&alt.body, plan)?
+            } else if normalize_results {
                 self.owned_value(&alt.body)?
             } else {
                 self.render(&alt.body, mode)?
@@ -2751,7 +2782,9 @@ impl<'m> Renderer<'_, 'm> {
             out.push_str(&arm);
         }
         if let Some(d) = default {
-            let body = if normalize_results {
+            let body = if let Some(plan) = tail {
+                self.render_tail(d, plan)?
+            } else if normalize_results {
                 self.owned_value(d)?
             } else {
                 self.render(d, mode)?

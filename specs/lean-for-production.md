@@ -38,6 +38,13 @@ O: 0 }` is constructible in Rust where the Lean type forbids it.
 Callers that need the invariant must re-check it in Rust; the
 generated struct is a plain data carrier, not a refinement type.
 
+## First-order control flow
+
+- Saturated, non-escaping, acyclic first-order local functions with runtime-valued arguments; no runtime closure values or erased/type local-call arguments
+- Local-function admission: 65536 aggregate Code/argument/parameter elements and 128 local calls per path
+- LocalFunctionError: inputLimit, depthLimit, escaping, arity, recursive, unsupported; no partial or overapplied local calls
+- Expression-valued continuation expansion preserves non-tail caller continuations, lexical captures and eager argument evaluation
+
 ## Operators
 
 - `Nat.add`

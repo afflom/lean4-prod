@@ -2309,9 +2309,9 @@ impl<'m> Renderer<'_, 'm> {
             Expr::Negate(value) => Ok(format!("-({})", self.value(value)?)),
             Expr::Sub(a, b) => {
                 // Lean Nat subtraction truncates at zero, so it is total.
-                // See `checked_binop` for the `as u64` receiver pin.
+                // See `checked_binop` for the exact Nat receiver type.
                 Ok(format!(
-                    "(({}) as u64).saturating_sub({})",
+                    "core::convert::identity::<u64>({}).saturating_sub({})",
                     self.value(a)?,
                     self.value(b)?
                 ))
@@ -2333,7 +2333,7 @@ impl<'m> Renderer<'_, 'm> {
             // fallback for a real error — there is no `ComputeError` variant
             // for this because none is needed.
             Expr::Shr(a, b) => Ok(format!(
-                "(({}) as u64).checked_shr(u32::try_from({}).unwrap_or(u32::MAX)).unwrap_or(0)",
+                "core::convert::identity::<u64>({}).checked_shr(u32::try_from(core::convert::identity::<u64>({})).unwrap_or(u32::MAX)).unwrap_or(0)",
                 self.value(a)?,
                 self.value(b)?
             )),
@@ -2403,7 +2403,7 @@ impl<'m> Renderer<'_, 'm> {
                             rust_ident(last_component(&cdecl.name))
                         )
                     };
-                    if cdecl.fields.is_empty() {
+                    if cdecl.fields.is_empty() && decl.ctors.len() != 1 {
                         Ok(path)
                     } else {
                         let mut bound = Vec::with_capacity(args.len());
@@ -2619,7 +2619,7 @@ impl<'m> Renderer<'_, 'm> {
                                 rust_ident(last_component(&cdecl.name))
                             )
                         };
-                        if cdecl.fields.is_empty() {
+                        if cdecl.fields.is_empty() && decl.ctors.len() != 1 {
                             format!("        {} => {},\n", path, body)
                         } else {
                             let mut bound = Vec::with_capacity(alt.binders.len());
@@ -2742,9 +2742,9 @@ impl<'m> Renderer<'_, 'm> {
 
     /// `checked_add`/`checked_mul`: report overflow instead of panicking.
     ///
-    /// `as u64` pins the receiver: method calls on an inferred `{integer}`
-    /// (a let-bound literal, e.g. LCNF's `let _x := 1`) fail method resolution
-    /// (E0689) — a no-op when the receiver is already `u64`.
+    /// Exact Nat typing propagates to let-bound literals. A cast leaves their
+    /// original type unconstrained (default i32), rejecting large valid Nats;
+    /// identity also refuses narrowing from an incompatible operand type.
     fn checked_binop(
         &self,
         a: &'m Expr,
@@ -2753,7 +2753,7 @@ impl<'m> Renderer<'_, 'm> {
         error: &str,
     ) -> Result<String, Error> {
         Ok(format!(
-            "(({}) as u64).{}({}).ok_or(crate::ComputeError::{})?",
+            "core::convert::identity::<u64>({}).{}({}).ok_or(crate::ComputeError::{})?",
             self.value(a)?,
             method,
             self.value(b)?,
@@ -2772,7 +2772,7 @@ impl<'m> Renderer<'_, 'm> {
         overflow_error: &str,
     ) -> Result<String, Error> {
         Ok(format!(
-            "(({}) as u64).{}(u32::try_from({}).map_err(|_| crate::ComputeError::{})?).ok_or(crate::ComputeError::{})?",
+            "core::convert::identity::<u64>({}).{}(u32::try_from(core::convert::identity::<u64>({})).map_err(|_| crate::ComputeError::{})?).ok_or(crate::ComputeError::{})?",
             self.value(a)?,
             method,
             self.value(b)?,
@@ -2788,7 +2788,7 @@ impl<'m> Renderer<'_, 'm> {
         let (a, b) = (self.value(a)?, self.value(b)?);
         let zero = if op == "%" { "__left" } else { "0" };
         Ok(format!(
-            "match (({a}) as u64, ({b}) as u64) {{ (__left, 0) => {zero}, (__left, __right) => __left {op} __right }}"
+            "match (core::convert::identity::<u64>({a}), core::convert::identity::<u64>({b})) {{ (__left, 0) => {zero}, (__left, __right) => __left {op} __right }}"
         ))
     }
 }

@@ -7,12 +7,39 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const IR: &str = r#"(module OwnedProjectionSafety
+  (type "EmptyRecord" (ctor "EmptyRecord.mk"))
+  (type "EmptyVariant" (ctor "EmptyVariant.first") (ctor "EmptyVariant.second"))
   (type "Parcel" (ctor "Parcel.mk" (bytes Bytes) (marker Nat)))
   (type "Envelope" (ctor "Envelope.mk" (parcel (named "Parcel")) (label String)))
   (type "MaybeEnvelope" (ctor "MaybeEnvelope.mk" (parcel (Option (named "Parcel")))))
   (type "Pair" (ctor "Pair.mk" (first Bytes) (second Bytes)))
   (type "OptionalPair" (ctor "OptionalPair.mk" (first (Option Bytes)) (second (Option Bytes))))
   (type "ParcelList" (ctor "ParcelList.mk" (slots (List (named "Parcel")))))
+  (def large_nat_add () Nat (let high 4294967295 (add high 1)))
+  (def large_nat_mul () Nat (let high 4294967296 (mul high 2)))
+  (def large_nat_sub () Nat (let high 18446744073709551615 (let alias high (sub alias 1))))
+  (def large_nat_div () Nat (let high 18446744073709551615 (div high 3)))
+  (def large_nat_mod () Nat (let high 18446744073709551615 (mod high 3)))
+  (def large_nat_shl () Nat (let high 4294967296 (shl high 1)))
+  (def large_nat_shr () Nat (let high 18446744073709551615 (shr high 32)))
+  (def large_nat_pow () Nat (let high 4294967296 (pow high 1)))
+  (def large_nat_add_overflow () Nat (let high 18446744073709551615 (add high 1)))
+  (def large_nat_mul_overflow () Nat (let high 18446744073709551615 (mul high 2)))
+  (def large_nat_divisor () Nat (let high 18446744073709551615 (div 4294967295 high)))
+  (def large_nat_remainder () Nat (let high 18446744073709551615 (mod 4294967295 high)))
+  (def large_nat_shl_exponent () Nat (let high 18446744073709551615 (shl 1 high)))
+  (def large_nat_pow_exponent () Nat (let high 18446744073709551615 (pow 1 high)))
+  (def large_nat_shr_exponent () Nat (let high 18446744073709551615 (shr 1 high)))
+  (def contextual_uint8 () UInt8 (let value 255 value))
+  (def contextual_uint32 () UInt32 (let value 4294967295 value))
+  (def contextual_int32 () Int32 (let value 2147483647 value))
+  (def contextual_int64 () Int64 (let value 9223372036854775807 value))
+  (def empty_record () (named "EmptyRecord") (ctor "EmptyRecord.mk"))
+  (def match_empty_record ((input (named "EmptyRecord"))) Nat
+    (cases input (alt "EmptyRecord.mk" () 17)))
+  (def empty_variant () (named "EmptyVariant") (ctor "EmptyVariant.first"))
+  (def match_empty_variant ((input (named "EmptyVariant"))) Nat
+    (cases input (alt "EmptyVariant.first" () 19) (alt "EmptyVariant.second" () 23)))
   (def empty_order () Ordering (compare-bytes (bytes) (bytes)))
   (def aliased_empty_order () Ordering
     (let empty (bytes) (compare-bytes empty empty)))
@@ -48,6 +75,20 @@ const IR: &str = r#"(module OwnedProjectionSafety
   (def join_partial_failure ((input Nat)) Nat
     (let continuation (jp continuation (first second third) 7)
       (jmp continuation (ctor "counted_value" 1) (add input 1) (ctor "counted_value" 2))))
+  (def non_tail_calls ((capture Nat)) Nat
+    (let function (jp function (value) (add capture value))
+      (let first (jmp function 2)
+        (let second (jmp function 3) (add first second)))))
+  (def non_tail_capture_shadow ((capture Nat)) Nat
+    (let function (jp function (value) (add capture value))
+      (let capture 100 (let result (jmp function 2) (add result capture)))))
+  (def non_tail_unused_failure ((input Nat)) Nat
+    (let function (jp function (unused) 7)
+      (let ignored (jmp function (add input 1)) 19)))
+  (def non_tail_order () Nat
+    (let function (jp function (value) (ctor "counted_value" value))
+      (let first (jmp function 1)
+        (let second (jmp function 2) (ctor "counted_value" 3)))))
   (def borrowed_head ((input (List (named "Parcel")))) (Option (named "Parcel"))
     (cases input
       (alt "List.nil" () (ctor "Option.none"))
@@ -362,7 +403,39 @@ fn main() {
     assert_eq!(join_partial_failure(0), Ok(7));
     assert_eq!((evaluation_calls(), evaluation_order()), (2, 12));
     cases += 4;
-    assert_eq!(cases, 145);
+    assert_eq!(non_tail_calls(5), Ok(15));
+    assert_eq!(non_tail_capture_shadow(5), Ok(107));
+    assert_eq!(non_tail_unused_failure(u64::MAX), Err(ComputeError::AddOverflow));
+    assert_eq!(non_tail_unused_failure(0), Ok(19));
+    reset_evaluation_probe();
+    assert_eq!(non_tail_order(), 3);
+    assert_eq!((evaluation_calls(), evaluation_order()), (3, 123));
+    cases += 5;
+    assert_eq!(match_empty_record(empty_record()), 17);
+    assert_eq!(match_empty_variant(empty_variant()), 19);
+    assert_eq!(match_empty_variant(EmptyVariant::second), 23);
+    cases += 3;
+    assert_eq!(large_nat_add(), Ok(4294967296));
+    assert_eq!(large_nat_mul(), Ok(8589934592));
+    assert_eq!(large_nat_sub(), u64::MAX - 1);
+    assert_eq!(large_nat_div(), u64::MAX / 3);
+    assert_eq!(large_nat_mod(), 0);
+    assert_eq!(large_nat_shl(), Ok(8589934592));
+    assert_eq!(large_nat_shr(), 4294967295);
+    assert_eq!(large_nat_pow(), Ok(4294967296));
+    assert_eq!(large_nat_add_overflow(), Err(ComputeError::AddOverflow));
+    assert_eq!(large_nat_mul_overflow(), Err(ComputeError::MulOverflow));
+    assert_eq!(large_nat_divisor(), 0);
+    assert_eq!(large_nat_remainder(), 4294967295);
+    assert_eq!(large_nat_shl_exponent(), Err(ComputeError::ShiftExponentTooLarge));
+    assert_eq!(large_nat_pow_exponent(), Err(ComputeError::PowExponentTooLarge));
+    assert_eq!(large_nat_shr_exponent(), 0);
+    assert_eq!(contextual_uint8(), u8::MAX);
+    assert_eq!(contextual_uint32(), u32::MAX);
+    assert_eq!(contextual_int32(), i32::MAX);
+    assert_eq!(contextual_int64(), i64::MAX);
+    cases += 19;
+    assert_eq!(cases, 172);
     println!("owned projection safety: {cases} cases passed");
 }
 "#;
@@ -495,7 +568,7 @@ fn owned_projection_safety_executes_in_std_and_no_std_debug_and_optimized() {
             );
             assert_eq!(
                 succeeds(&mut Command::new(&executable)),
-                "owned projection safety: 145 cases passed\n"
+                "owned projection safety: 172 cases passed\n"
             );
         }
     }

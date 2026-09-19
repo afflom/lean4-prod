@@ -10,6 +10,38 @@ use std::process::Command;
 
 const IR: &str = r#"(module BorrowedOperands
   (type "Parcel" (ctor "Parcel.mk" (bytes Bytes) (offset Nat)))
+  (type "Fields" (ctor "Fields.mk" (bytes Bytes) (text String) (words (List String)) (offset Nat)))
+  (type "Pair" (ctor "Pair.mk" (first Bytes) (second Bytes)))
+  (def move_fields ((input (Option (named "Fields")))) (Option (named "Fields"))
+    (cases input
+      (alt "Option.none" () (ctor "Option.none"))
+      (alt "Option.some" (row)
+        (let bytes (proj "Fields" "bytes" row)
+          (let text (proj "Fields" "text" row)
+            (let words (proj "Fields" "words" row)
+              (let offset (proj "Fields" "offset" row)
+                (ctor "Option.some" (ctor "Fields.mk" bytes text words offset)))))))))
+  (def duplicate_moved_alias ((input (Option (named "Parcel")))) (Option (named "Pair"))
+    (cases input
+      (alt "Option.none" () (ctor "Option.none"))
+      (alt "Option.some" (row)
+        (let bytes (proj "Parcel" "bytes" row)
+          (ctor "Option.some" (ctor "Pair.mk" bytes bytes))))))
+  (def borrowed_field ((input (named "Parcel"))) (Option Bytes)
+    (ctor "Option.some" (proj "Parcel" "bytes" input)))
+  (def accessor ((input (named "Parcel"))) Bytes
+    (let result (proj "Parcel" "bytes" input) result))
+  (def mixed_fields ((input Bytes) (other (named "Parcel")) (choose Bool)) (Option Bytes)
+    (let row (ctor "Parcel.mk" input 0)
+      (let selected (if choose (proj "Parcel" "bytes" row) (proj "Parcel" "bytes" other))
+        (ctor "Option.some" selected))))
+  (def shadowed_fields ((row Bytes)) (Option Bytes)
+    (let row (ctor "Parcel.mk" row 0)
+      (let row (proj "Parcel" "bytes" row) (ctor "Option.some" row))))
+  (def owned_field_entry ((input Bytes)) Bytes
+    (cases (call consume_parcel (call fresh input))
+      (alt "Option.none" () (bytes))
+      (alt "Option.some" (result) result)))
   (def maybe_bytes ((input Bytes) (present Bool)) (Option Bytes)
     (if present (ctor "Option.some" input) (ctor "Option.none")))
   (def none_return ((input Bytes) (present Bool)) (Option Bytes)
@@ -223,6 +255,54 @@ fn main() {
     assert_eq!(prepend_failure_order(0, u64::MAX), Err(ComputeError::MulOverflow));
     assert_eq!(prepend_failure_order(0, 0), Ok(Some(vec![1, 0])));
     for size in [0, 1, 8192, 65536] {
+        let input = vec![0x5a; size];
+        let pointer = input.as_ptr();
+        let (output, count) = measured(|| consume_parcel(Some(Parcel { bytes: input, offset: 7 })));
+        assert_eq!(count, 0, "consuming an owned record field must not clone, size={size}");
+        assert_eq!(output.as_ref().unwrap().as_ptr(), pointer);
+        assert_eq!(output.as_deref(), Some(vec![0x5a; size].as_slice()));
+
+        let input = Fields { bytes: vec![0x5a; size], text: "x".repeat(size),
+            words: vec!["first".to_owned(), "second".to_owned()], offset: 13 };
+        let pointers = (input.bytes.as_ptr(), input.text.as_ptr(), input.words.as_ptr(), input.words[0].as_ptr());
+        let (output, count) = measured(|| move_fields(Some(input)));
+        assert_eq!(count, 0, "disjoint owned fields, size={size}");
+        let output = output.unwrap();
+        assert_eq!((output.bytes.as_ptr(), output.text.as_ptr(), output.words.as_ptr(), output.words[0].as_ptr()), pointers);
+        assert_eq!(output.bytes, vec![0x5a; size]);
+        assert_eq!(output.text, "x".repeat(size));
+        assert_eq!(output.words, ["first", "second"]);
+        assert_eq!(output.offset, 13);
+
+        let input = Parcel { bytes: vec![0x5a; size], offset: 0 };
+        let output = duplicate_moved_alias(Some(input)).unwrap();
+        assert_eq!(output.first, vec![0x5a; size]);
+        assert_eq!(output.second, vec![0x5a; size]);
+        if size != 0 { assert_ne!(output.first.as_ptr(), output.second.as_ptr()); }
+
+        let input = Parcel { bytes: vec![0xa5; size], offset: 0 };
+        let (output, count) = measured(|| borrowed_field(&input));
+        assert_eq!(count, usize::from(size != 0), "borrowed record must retain its field");
+        assert_eq!(output.as_deref(), Some(input.bytes.as_slice()));
+        let (view, count) = measured(|| accessor(&input));
+        assert_eq!(count, 0, "accessor ABI remains borrowed");
+        assert!(std::ptr::eq(view, &input.bytes));
+        for choose in [false, true] {
+            let bytes = vec![0x5a; size];
+            let pointer = bytes.as_ptr();
+            let (output, count) = measured(|| mixed_fields(bytes, &input, choose));
+            assert_eq!(count, usize::from(!choose && size != 0), "mixed ownership branches");
+            assert_eq!(output.as_deref(), Some(vec![if choose { 0x5a } else { 0xa5 }; size].as_slice()));
+            if choose { assert_eq!(output.as_ref().unwrap().as_ptr(), pointer); }
+        }
+        assert_eq!(input.bytes, vec![0xa5; size]);
+
+        let input = vec![0x5a; size];
+        let pointer = input.as_ptr();
+        let (output, count) = measured(|| shadowed_fields(input));
+        assert_eq!(count, 0, "lexically distinct owners must not alias");
+        assert_eq!(output.as_ref().unwrap().as_ptr(), pointer);
+        assert_eq!(output.as_deref(), Some(vec![0x5a; size].as_slice()));
         for present in [false, true] {
             let input = vec![0x5a; size];
             let (output, count) = measured(|| none_return(input, present));
@@ -298,9 +378,9 @@ fn main() {
 
         let input = vec![0x5a; size];
         let (output, count) = measured(|| projection_then_consume(input));
-        // The consumed record and returned owned bytes each need a copy. The
-        // original field borrow remains live after consumption of the record copy.
-        assert_eq!(count, 2 * usize::from(size != 0), "project then consume, size={size}");
+        // Only the record needs copying to keep the original field borrow
+        // live; consume_parcel moves the copied record's field into its result.
+        assert_eq!(count, usize::from(size != 0), "project then consume, size={size}");
         assert_eq!(output.as_deref(), (size != 0).then_some(vec![0x5a; size].as_slice()));
     }
 
@@ -462,6 +542,17 @@ fn owned_list_tail_executes_in_actual_bounded_wasm() {
     );
 }
 
+#[test]
+fn owned_record_field_executes_in_actual_bounded_wasm() {
+    actual_wasm(
+        "owned_field_entry",
+        1_048_576,
+        1_048_576,
+        64,
+        "borrowed_operands_wasm_test.mjs",
+    );
+}
+
 fn actual_wasm(entry: &str, input_cap: u32, output_cap: u32, pages: u32, script: &str) {
     let (remaining, module) = parse_module(IR).unwrap();
     assert!(remaining.is_empty());
@@ -502,6 +593,7 @@ fn actual_wasm(entry: &str, input_cap: u32, output_cap: u32, pages: u32, script:
                 scratch
                     .0
                     .join("target/wasm32-unknown-unknown/release/borrowed_operands_guest.wasm"),
-            ),
+            )
+            .arg(pages.to_string()),
     );
 }

@@ -755,9 +755,9 @@ fn repeated_non_copy_locals(
                     })
                 {
                     nested.insert(name.clone());
-                    // Projections of non-Copy fields are already borrows and
-                    // may be reused without cloning the underlying value.
-                    if !matches!(value.as_ref(), Expr::Proj(..))
+                    // Borrowed projections can be shared; a moved field is
+                    // an owned local and needs the usual reuse protection.
+                    if !borrowed_bindings.contains(name)
                         && count_var_uses(body, name) > 1
                         && !single_owned_option_match(name, value, body, definitions, table)
                     {
@@ -873,6 +873,63 @@ fn inline_bindings(expr: &Expr) -> BTreeMap<String, &Expr> {
     output
 }
 
+/// Owners used exclusively through distinct field projections can be partially
+/// moved. Names must already be lexically normalized. Any whole-owner use,
+/// repeated field, or join point retains the conservative borrowing policy.
+fn movable_projection_owners(definition: &Definition, table: &TypeTable<'_>) -> BTreeSet<String> {
+    fn walk(
+        expr: &Expr,
+        fields: &mut BTreeMap<String, BTreeSet<String>>,
+        retained: &mut BTreeSet<String>,
+    ) -> bool {
+        match expr {
+            Expr::Proj(_, field, owner) => {
+                if let Expr::Var(name) = owner.as_ref() {
+                    if !fields
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(field.clone())
+                    {
+                        retained.insert(name.clone());
+                    }
+                    true
+                } else {
+                    walk(owner, fields, retained)
+                }
+            }
+            Expr::Var(name) => {
+                retained.insert(name.clone());
+                true
+            }
+            // Join-point bodies may be substituted into another lexical
+            // context. This pass deliberately does not model that ownership.
+            Expr::Jp { .. } | Expr::Jmp { .. } => false,
+            _ => expr
+                .children()
+                .into_iter()
+                .all(|child| walk(child, fields, retained)),
+        }
+    }
+    if returns_borrowed_projection(&definition.body, &definition.ret, table) {
+        return BTreeSet::new();
+    }
+    let mut fields = BTreeMap::new();
+    let mut retained = BTreeSet::new();
+    if !walk(&definition.body, &mut fields, &mut retained) {
+        return BTreeSet::new();
+    }
+    fields
+        .into_keys()
+        .filter(|name| !retained.contains(name))
+        .collect()
+}
+
+fn projection_moves(expr: &Expr, locals: &BTreeSet<String>, movable: &BTreeSet<String>) -> bool {
+    matches!(expr, Expr::Proj(_, _, owner)
+        if matches!(owner.as_ref(), Expr::Var(name)
+            if movable.contains(name) && !locals.contains(name)))
+}
+
 /// Whether value-mode rendering borrows an existing owner. This is separate
 /// from non-Copy analysis: an owned constructor must copy a borrowed field even
 /// when it uses that field only once, while predicates must keep borrowing.
@@ -881,10 +938,14 @@ fn expression_is_borrowed(
     definitions: &[Definition],
     table: &TypeTable<'_>,
     locals: &BTreeSet<String>,
+    movable: &BTreeSet<String>,
 ) -> bool {
     match expr {
         Expr::Var(name) => locals.contains(name),
-        Expr::Proj(..) => expression_is_non_copy(expr, definitions, table, &BTreeSet::new()),
+        Expr::Proj(..) => {
+            !projection_moves(expr, locals, movable)
+                && expression_is_non_copy(expr, definitions, table, &BTreeSet::new())
+        }
         Expr::Call(name, _) => definitions
             .iter()
             .find(|definition| definition.name == *name)
@@ -892,19 +953,19 @@ fn expression_is_borrowed(
                 returns_borrowed_projection(&definition.body, &definition.ret, table)
                     || definition.params.is_empty() && matches!(definition.ret, Type::List(_))
             }),
-        Expr::Let(_, _, body) => expression_is_borrowed(body, definitions, table, locals),
+        Expr::Let(_, _, body) => expression_is_borrowed(body, definitions, table, locals, movable),
         Expr::If(_, then_value, else_value) => {
-            expression_is_borrowed(then_value, definitions, table, locals)
-                && expression_is_borrowed(else_value, definitions, table, locals)
+            expression_is_borrowed(then_value, definitions, table, locals, movable)
+                && expression_is_borrowed(else_value, definitions, table, locals, movable)
         }
         Expr::Match { alts, default, .. } => {
             (!alts.is_empty() || default.is_some())
-                && alts
-                    .iter()
-                    .all(|alt| expression_is_borrowed(&alt.body, definitions, table, locals))
-                && default
-                    .as_ref()
-                    .is_none_or(|value| expression_is_borrowed(value, definitions, table, locals))
+                && alts.iter().all(|alt| {
+                    expression_is_borrowed(&alt.body, definitions, table, locals, movable)
+                })
+                && default.as_ref().is_none_or(|value| {
+                    expression_is_borrowed(value, definitions, table, locals, movable)
+                })
         }
         _ => false,
     }
@@ -936,6 +997,7 @@ fn borrowed_locals(
     definition: &Definition,
     definitions: &[Definition],
     table: &TypeTable<'_>,
+    movable: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     fn walk(
         expr: &Expr,
@@ -944,28 +1006,53 @@ fn borrowed_locals(
         params: &[(String, Type)],
         local_types: &LocalTypes,
         locals: &mut BTreeSet<String>,
+        movable: &BTreeSet<String>,
     ) {
         match expr {
             Expr::Let(name, value, body) => {
-                walk(value, definitions, table, params, local_types, locals);
+                walk(
+                    value,
+                    definitions,
+                    table,
+                    params,
+                    local_types,
+                    locals,
+                    movable,
+                );
                 let mut nested_types = local_types.clone();
                 if let Some(ty) = expression_type(value, definitions, table, local_types, params) {
                     nested_types.insert(name.clone(), ty);
                 } else {
                     nested_types.remove(name);
                 }
-                if expression_is_borrowed(value, definitions, table, locals) {
+                if expression_is_borrowed(value, definitions, table, locals, movable) {
                     locals.insert(name.clone());
                 }
-                walk(body, definitions, table, params, &nested_types, locals);
+                walk(
+                    body,
+                    definitions,
+                    table,
+                    params,
+                    &nested_types,
+                    locals,
+                    movable,
+                );
             }
             Expr::Match {
                 scrut,
                 alts,
                 default,
             } => {
-                walk(scrut, definitions, table, params, local_types, locals);
-                let borrowed = expression_is_borrowed(scrut, definitions, table, locals);
+                walk(
+                    scrut,
+                    definitions,
+                    table,
+                    params,
+                    local_types,
+                    locals,
+                    movable,
+                );
+                let borrowed = expression_is_borrowed(scrut, definitions, table, locals, movable);
                 let scrutinee_type =
                     expression_type(scrut, definitions, table, local_types, params);
                 for alt in alts {
@@ -1003,15 +1090,39 @@ fn borrowed_locals(
                             }
                         }
                     }
-                    walk(&alt.body, definitions, table, params, &nested_types, locals);
+                    walk(
+                        &alt.body,
+                        definitions,
+                        table,
+                        params,
+                        &nested_types,
+                        locals,
+                        movable,
+                    );
                 }
                 if let Some(default) = default {
-                    walk(default, definitions, table, params, local_types, locals);
+                    walk(
+                        default,
+                        definitions,
+                        table,
+                        params,
+                        local_types,
+                        locals,
+                        movable,
+                    );
                 }
             }
             _ => {
                 for child in expr.children() {
-                    walk(child, definitions, table, params, local_types, locals);
+                    walk(
+                        child,
+                        definitions,
+                        table,
+                        params,
+                        local_types,
+                        locals,
+                        movable,
+                    );
                 }
             }
         }
@@ -1030,6 +1141,7 @@ fn borrowed_locals(
         &definition.params,
         &definition.params.iter().cloned().collect(),
         &mut locals,
+        movable,
     );
     locals
 }
@@ -1107,7 +1219,8 @@ fn generate_def_in<'m>(
         def.name.clone()
     };
     let visibility = if helper { "" } else { "pub " };
-    let borrowed_bindings = borrowed_locals(def, definitions, table);
+    let movable_projections = movable_projection_owners(def, table);
+    let borrowed_bindings = borrowed_locals(def, definitions, table, &movable_projections);
     let renderer = Renderer {
         shapes,
         definitions,
@@ -1124,6 +1237,7 @@ fn generate_def_in<'m>(
         ),
         inline_values: inline_bindings(&def.body),
         borrowed_locals: borrowed_bindings,
+        movable_projections,
     };
 
     let mut params = String::new();
@@ -1515,9 +1629,21 @@ struct Renderer<'s, 'm> {
     inline_values: BTreeMap<String, &'m Expr>,
     /// Locals that borrow a field/parameter rather than owning its value.
     borrowed_locals: BTreeSet<String>,
+    /// Syntactically single-use fields; actual movement also requires an owned receiver.
+    movable_projections: BTreeSet<String>,
 }
 
 impl<'m> Renderer<'_, 'm> {
+    fn borrows(&self, expr: &Expr) -> bool {
+        expression_is_borrowed(
+            expr,
+            self.definitions,
+            self.types,
+            &self.borrowed_locals,
+            &self.movable_projections,
+        )
+    }
+
     fn value(&self, expr: &'m Expr) -> Result<String, Error> {
         self.render(expr, &Mode::Value)
     }
@@ -1534,7 +1660,7 @@ impl<'m> Renderer<'_, 'm> {
 
     fn owned_value(&self, expr: &'m Expr) -> Result<String, Error> {
         let rendered = self.value(expr)?;
-        if expression_is_borrowed(expr, self.definitions, self.types, &self.borrowed_locals) {
+        if self.borrows(expr) {
             // Use the fully qualified alloc trait: generated no_std modules
             // need no extra imports. This also turns borrowed str/slices into
             // their owned String/Vec representation at this owned boundary.
@@ -1705,18 +1831,7 @@ impl<'m> Renderer<'_, 'm> {
         match expr {
             // ---- control flow: identical in both modes ----
             Expr::If(cond, t, f)
-                if matches!(mode, Mode::Value)
-                    && expression_is_borrowed(
-                        t,
-                        self.definitions,
-                        self.types,
-                        &self.borrowed_locals,
-                    ) != expression_is_borrowed(
-                        f,
-                        self.definitions,
-                        self.types,
-                        &self.borrowed_locals,
-                    ) =>
+                if matches!(mode, Mode::Value) && self.borrows(t) != self.borrows(f) =>
             {
                 // Rust branches must agree on ownership. Keep a borrowed
                 // result when both arms borrow; a mixed result owns both arms.
@@ -2053,8 +2168,8 @@ impl<'m> Renderer<'_, 'm> {
                     Ok(format!("core::convert::AsRef::<[u8]>::as_ref(&({})) == &{value:?}", self.read_value(other)?))
                 }
                 _ => {
-                    let borrowed_a = expression_is_borrowed(a, self.definitions, self.types, &self.borrowed_locals);
-                    let borrowed_b = expression_is_borrowed(b, self.definitions, self.types, &self.borrowed_locals);
+                    let borrowed_a = self.borrows(a);
+                    let borrowed_b = self.borrows(b);
                     let a = self.read_value(a)?;
                     let b = self.read_value(b)?;
                     // Equality borrows its operands; normalize mixed owned /
@@ -2138,7 +2253,7 @@ impl<'m> Renderer<'_, 'm> {
                     return Err(Error::UnknownField(ty.clone(), field.clone()));
                 }
                 let projection = format!("({}).{}", self.read_value(e)?, rust_ident(field));
-                if field_type.is_some_and(|field_type| {
+                if !projection_moves(expr, &self.borrowed_locals, &self.movable_projections) && field_type.is_some_and(|field_type| {
                     !copy_type(field_type, self.types, &mut BTreeSet::new())
                 }) {
                     Ok(format!("&{projection}"))
@@ -2241,15 +2356,12 @@ impl<'m> Renderer<'_, 'm> {
         mode: &Mode<'_, 'm>,
     ) -> Result<String, Error> {
         let head_rebound_by_value = self.list_head_rebound_by_value(scrut);
-        let scrut_is_borrowed =
-            expression_is_borrowed(scrut, self.definitions, self.types, &self.borrowed_locals);
+        let scrut_is_borrowed = self.borrows(scrut);
         let branch_borrows = alts
             .iter()
             .map(|alt| &alt.body)
             .chain(default)
-            .map(|body| {
-                expression_is_borrowed(body, self.definitions, self.types, &self.borrowed_locals)
-            })
+            .map(|body| self.borrows(body))
             .collect::<Vec<_>>();
         let normalize_results = matches!(mode, Mode::Value)
             && branch_borrows.iter().any(|borrowed| *borrowed)

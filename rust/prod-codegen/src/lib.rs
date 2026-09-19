@@ -931,7 +931,7 @@ fn movable_projection_owners(definition: &Definition, table: &TypeTable<'_>) -> 
                 .all(|child| walk(child, fields, retained)),
         }
     }
-    if returns_borrowed_projection(&definition.body, &definition.ret, table) {
+    if returns_borrowed_projection(definition, table) {
         return BTreeSet::new();
     }
     let mut fields = BTreeMap::new();
@@ -971,7 +971,7 @@ fn expression_is_borrowed(
             .iter()
             .find(|definition| definition.name == *name)
             .is_some_and(|definition| {
-                returns_borrowed_projection(&definition.body, &definition.ret, table)
+                returns_borrowed_projection(definition, table)
                     || definition.params.is_empty() && matches!(definition.ret, Type::List(_))
             }),
         Expr::Let(_, _, body) => expression_is_borrowed(body, definitions, table, locals, movable),
@@ -1184,7 +1184,7 @@ fn single_owned_option_match(
     if !definitions.iter().any(|definition| {
         definition.name == *callee
             && matches!(definition.ret, Type::Option(_))
-            && !returns_borrowed_projection(&definition.body, &definition.ret, table)
+            && !returns_borrowed_projection(definition, table)
     }) {
         return false;
     }
@@ -1293,7 +1293,8 @@ fn generate_def_in<'m>(
         ));
     }
     check_named_type(&def.ret, table)?;
-    let return_type = if returns_borrowed_projection(&def.body, &def.ret, table) {
+    let borrowed_return = returns_borrowed_projection(def, table);
+    let return_type = if borrowed_return {
         format!("&{}", type_to_rust(&def.ret)?)
     } else {
         type_to_rust(&def.ret)?
@@ -1341,14 +1342,14 @@ fn generate_def_in<'m>(
             generated_name,
             params,
             return_type,
-            renderer.value(&def.body)?
+            renderer.render_return(&def.body, borrowed_return)?
         )),
         Shape::Value => Ok(format!(
             "{visibility}fn {}({}) -> {} {{\n    {}\n}}\n",
             generated_name,
             params,
             return_type,
-            renderer.value(&def.body)?
+            renderer.render_return(&def.body, borrowed_return)?
         )),
     }?;
 
@@ -1396,17 +1397,37 @@ fn generate_def_in<'m>(
 
 /// Whether a definition is the compiler-generated shape of an accessor for a
 /// non-`Copy` field. Returning a borrow preserves the source value without a
-/// clone (and therefore without a possible allocation).
-fn returns_borrowed_projection(expr: &Expr, ret: &Type, table: &TypeTable) -> bool {
-    let Expr::Let(name, value, body) = expr else {
+/// clone (and therefore without a possible allocation). The receiver must be
+/// the unique borrowed input, so its storage outlives the call and ordinary
+/// Rust lifetime elision binds the result to that input unambiguously.
+fn returns_borrowed_projection(definition: &Definition, table: &TypeTable) -> bool {
+    let Expr::Let(name, value, body) = &definition.body else {
         return false;
     };
     if !matches!(body.as_ref(), Expr::Var(result) if result == name) {
         return false;
     }
-    let Expr::Proj(owner, field, _) = value.as_ref() else {
+    let Expr::Proj(owner, field, receiver) = value.as_ref() else {
         return false;
     };
+    let parameter = match receiver.as_ref() {
+        Expr::Var(name) => definition
+            .params
+            .iter()
+            .find(|(parameter, _)| parameter == name),
+        Expr::Param(index) => definition.params.get(*index),
+        _ => None,
+    };
+    if !matches!(parameter, Some((_, Type::Named(name))) if name == owner)
+        || definition
+            .params
+            .iter()
+            .filter(|(_, ty)| internal_borrowed_parameter(ty, table, false))
+            .count()
+            != 1
+    {
+        return false;
+    }
     table
         .get(owner.as_str())
         .and_then(|declaration| {
@@ -1417,7 +1438,7 @@ fn returns_borrowed_projection(expr: &Expr, ret: &Type, table: &TypeTable) -> bo
                 .find_map(|(name, ty)| (name == field).then_some(ty))
         })
         .is_some_and(|field_type| {
-            field_type == ret && !copy_type(field_type, table, &mut BTreeSet::new())
+            field_type == &definition.ret && !copy_type(field_type, table, &mut BTreeSet::new())
         })
 }
 
@@ -1633,6 +1654,9 @@ enum Mode<'x, 'm> {
     /// Ordinary value position. The rendered text has the expression's own
     /// Rust type, with `?` embedded wherever an operation can fail.
     Value,
+    /// An owned ABI boundary. Convert borrowed results inside each lexical
+    /// scope, before any branch-local owners are dropped.
+    OwnedValue,
     /// List builder position. The rendered text has type
     /// `Result<usize, crate::ComputeError>` and fills `out`.
     Builder {
@@ -1699,6 +1723,18 @@ impl<'m> Renderer<'_, 'm> {
     }
 
     fn owned_value(&self, expr: &'m Expr) -> Result<String, Error> {
+        self.render(expr, &Mode::OwnedValue)
+    }
+
+    fn render_return(&self, expr: &'m Expr, borrowed: bool) -> Result<String, Error> {
+        if borrowed {
+            self.value(expr)
+        } else {
+            self.owned_value(expr)
+        }
+    }
+
+    fn owned_leaf(&self, expr: &'m Expr) -> Result<String, Error> {
         let rendered = self.value(expr)?;
         if self.borrows(expr) {
             // Use the fully qualified alloc trait: generated no_std modules
@@ -2010,6 +2046,11 @@ impl<'m> Renderer<'_, 'm> {
     }
 
     fn render(&self, expr: &'m Expr, mode: &Mode<'_, 'm>) -> Result<String, Error> {
+        if matches!(mode, Mode::OwnedValue)
+            && !matches!(expr, Expr::Let(..) | Expr::If(..) | Expr::Match { .. })
+        {
+            return self.owned_leaf(expr);
+        }
         if let (Expr::Let(name, value, _), Mode::Builder { env, .. }) = (expr, mode) {
             self.reject_eager_list_binding(name, value, env)?;
         }
@@ -2075,16 +2116,16 @@ impl<'m> Renderer<'_, 'm> {
                 // constrains neither type parameter on its own, and it can
                 // appear under a `?` (as the tail of a cons).
                 Mode::Builder { .. } => Ok(String::from("Ok::<usize, crate::ComputeError>(0)")),
-                Mode::Value => Ok(String::from("alloc::vec::Vec::new()")),
+                Mode::Value | Mode::OwnedValue => Ok(String::from("alloc::vec::Vec::new()")),
             },
             Expr::Ctor(name, args) if name == "List.cons" && args.len() == 2 => match mode {
                 Mode::Builder { out, env, depth } => {
                     self.render_cons(&args[0], &args[1], out, env, *depth)
                 }
-                Mode::Value if self.is_empty_list(&args[1]) => {
+                Mode::Value | Mode::OwnedValue if self.is_empty_list(&args[1]) => {
                     Ok(format!("alloc::vec![{}]", self.owned_value(&args[0])?))
                 }
-                Mode::Value => {
+                Mode::Value | Mode::OwnedValue => {
                     // Evaluate the head before the tail, then reuse the owned
                     // tail's capacity. Exact growth avoids doubling a full tail
                     // under the Wasm bump allocator. Tuple initialization keeps
@@ -2119,12 +2160,12 @@ impl<'m> Renderer<'_, 'm> {
                         name
                     ))),
                 },
-                Mode::Value
+                Mode::Value | Mode::OwnedValue
                     if self.clone_locals.contains(name) && !self.borrowed_locals.contains(name) =>
                 {
                     Ok(format!("{}.clone()", rust_local_ident(name)))
                 }
-                Mode::Value => Ok(rust_local_ident(name)),
+                Mode::Value | Mode::OwnedValue => Ok(rust_local_ident(name)),
             },
             Expr::Call(name, args) => {
                 let rendered = self.render_call_args(name, args)?;
@@ -2141,14 +2182,18 @@ impl<'m> Renderer<'_, 'm> {
                         "`{}` does not build its list into a caller buffer",
                         name
                     ))),
-                    (Mode::Value, Some(Shape::Buffer)) => Err(Error::UnsupportedList(format!(
+                    (Mode::Value | Mode::OwnedValue, Some(Shape::Buffer)) => {
+                        Err(Error::UnsupportedList(format!(
                         "`{}` returns a list; its result cannot be used as an intermediate value",
                         name
-                    ))),
-                    (Mode::Value, Some(Shape::Fallible)) => {
+                    )))
+                    }
+                    (Mode::Value | Mode::OwnedValue, Some(Shape::Fallible)) => {
                         Ok(format!("{}({})?", call_name, rendered.join(", ")))
                     }
-                    (Mode::Value, _) => Ok(format!("{}({})", call_name, rendered.join(", "))),
+                    (Mode::Value | Mode::OwnedValue, _) => {
+                        Ok(format!("{}({})", call_name, rendered.join(", ")))
+                    }
                 }
             }
 
@@ -2183,7 +2228,7 @@ impl<'m> Renderer<'_, 'm> {
                 Mode::Builder { .. } => Err(Error::UnsupportedList(
                     "expression does not build a list".to_string(),
                 )),
-                Mode::Value => self.render_value_leaf(expr),
+                Mode::Value | Mode::OwnedValue => self.render_value_leaf(expr),
             },
         }
     }

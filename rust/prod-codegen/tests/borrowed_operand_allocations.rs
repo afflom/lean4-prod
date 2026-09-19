@@ -31,6 +31,13 @@ const IR: &str = r#"(module BorrowedOperands
     (ctor "Option.some" (proj "Parcel" "bytes" input)))
   (def accessor ((input (named "Parcel"))) Bytes
     (let result (proj "Parcel" "bytes" input) result))
+  (def owned_result_choice ((left (named "Parcel")) (right (named "Parcel")) (flag Bool)) Bytes
+    (cases flag
+      (alt "Bool.false" () (let result (proj "Parcel" "bytes" left) result))
+      (alt "Bool.true" () (let result (proj "Parcel" "bytes" right) result))))
+  (def owned_result_entry ((input Bytes)) Bytes
+    (let owner (ctor "Parcel.mk" input 0)
+      (call owned_result_choice owner owner true)))
   (def mixed_fields ((input Bytes) (other (named "Parcel")) (choose Bool)) (Option Bytes)
     (let row (ctor "Parcel.mk" input 0)
       (let selected (if choose (proj "Parcel" "bytes" row) (proj "Parcel" "bytes" other))
@@ -211,6 +218,20 @@ fn measured<T>(action: impl FnOnce() -> T) -> (T, usize) {
 }
 
 fn main() {
+    for size in [0, 1, 32, 1024] {
+        let owner = Parcel { bytes: vec![19; size], offset: 7 };
+        let original = owner.bytes.as_ptr();
+        for flag in [false, true] {
+            let (mut result, count) = measured(|| owned_result_choice(&owner, &owner, flag));
+            assert_eq!(result, owner.bytes);
+            assert_eq!(count, usize::from(size > 0), "exactly one owned-result copy");
+            assert_eq!(owner.bytes.as_ptr(), original, "borrowed input allocation retained");
+            if size > 0 {
+                result[0] = 23;
+                assert_eq!(owner.bytes[0], 19, "owned result cannot modify its source");
+            }
+        }
+    }
     for size in [0, 1, 32, 1024] {
         let mut tail = Vec::with_capacity(size + 1);
         for index in 0..size {
@@ -551,6 +572,21 @@ fn owned_record_field_executes_in_actual_bounded_wasm() {
         64,
         "borrowed_operands_wasm_test.mjs",
     );
+}
+
+#[test]
+fn owned_match_result_executes_in_actual_bounded_wasm() {
+    // Four one-MiB buffers (input ABI, Vec, owned result, output ABI), plus
+    // stack/data. Verify the actual minimum, not a larger arbitrary ceiling.
+    for pages in [66, 65] {
+        actual_wasm(
+            "owned_result_entry",
+            1_048_576,
+            1_048_576,
+            pages,
+            "owned_result_wasm_test.mjs",
+        );
+    }
 }
 
 fn actual_wasm(entry: &str, input_cap: u32, output_cap: u32, pages: u32, script: &str) {

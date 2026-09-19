@@ -15,6 +15,49 @@ const IR: &str = r#"(module OwnedProjectionSafety
   (type "Pair" (ctor "Pair.mk" (first Bytes) (second Bytes)))
   (type "OptionalPair" (ctor "OptionalPair.mk" (first (Option Bytes)) (second (Option Bytes))))
   (type "ParcelList" (ctor "ParcelList.mk" (slots (List (named "Parcel")))))
+  (def choose_label ((left (named "Envelope")) (right (named "Envelope")) (flag Bool)) String
+    (cases flag
+      (alt "Bool.false" () (let label (proj "Envelope" "label" left) label))
+      (alt "Bool.true" () (let label (proj "Envelope" "label" right) label))))
+  (def choose_bytes ((left (named "Parcel")) (right (named "Parcel")) (flag Bool)) Bytes
+    (if flag (proj "Parcel" "bytes" right) (proj "Parcel" "bytes" left)))
+  (def choose_record ((left (named "Envelope")) (right (named "Envelope")) (flag Bool)) (named "Parcel")
+    (cases flag
+      (alt "Bool.false" () (let parcel (proj "Envelope" "parcel" left) parcel))
+      (alt "Bool.true" () (let parcel (proj "Envelope" "parcel" right) parcel))))
+  (def choose_option ((left (named "MaybeEnvelope")) (right (named "MaybeEnvelope")) (flag Bool)) (Option (named "Parcel"))
+    (if flag (proj "MaybeEnvelope" "parcel" right) (proj "MaybeEnvelope" "parcel" left)))
+  (def choose_list_owner ((left (named "ParcelList")) (right (named "ParcelList")) (flag Bool)) (named "ParcelList")
+    (ctor "ParcelList.mk"
+      (cases flag
+        (alt "Bool.false" () (let slots (proj "ParcelList" "slots" left) slots))
+        (alt "Bool.true" () (let slots (proj "ParcelList" "slots" right) slots)))))
+  (def local_owner_label ((input String)) String
+    (let owner (ctor "Envelope.mk" (ctor "Parcel.mk" (bytes 9) 7) input)
+      (let first (proj "Envelope" "label" owner)
+        (let second (proj "Envelope" "label" owner) (if (eq first second) first second)))))
+  (def fallible_label ((left (named "Envelope")) (right (named "Envelope")) (flag Bool) (input Nat)) String
+    (let checked (add input 1)
+      (let counted (ctor "counted_value" checked)
+        (cases flag
+          (alt "Bool.false" () (let label (proj "Envelope" "label" left) label))
+          (alt "Bool.true" () (let label (proj "Envelope" "label" right) label))))))
+  (def borrowed_label_accessor ((owner (named "Envelope"))) String
+    (let label (proj "Envelope" "label" owner) label))
+  (def borrowed_positional_accessor ((owner (named "Envelope"))) String
+    (let label (proj "Envelope" "label" (param 0)) label))
+  (def ambiguous_label_accessor ((owner (named "Envelope")) (other (named "Envelope"))) String
+    (let label (proj "Envelope" "label" owner) label))
+  (def temporary_label () String
+    (let label (proj "Envelope" "label" (ctor "Envelope.mk" (ctor "Parcel.mk" (bytes) 0) (string "temporary"))) label))
+  (def local_nested_return ((input (Option (named "Envelope"))) (flag Bool)) (Option (named "ParcelList"))
+    (cases input
+      (alt "Option.none" () (ctor "Option.none"))
+      (alt "Option.some" (owner)
+        (ctor "Option.some" (ctor "ParcelList.mk"
+          (let local (ctor "ParcelList.mk" (ctor "List.cons" (proj "Envelope" "parcel" owner) (ctor "List.nil")))
+            (let first (proj "ParcelList" "slots" local)
+              (let second (proj "ParcelList" "slots" local) (if flag first second)))))))))
   (def large_nat_add () Nat (let high 4294967295 (add high 1)))
   (def large_nat_mul () Nat (let high 4294967296 (mul high 2)))
   (def large_nat_sub () Nat (let high 18446744073709551615 (let alias high (sub alias 1))))
@@ -435,7 +478,41 @@ fn main() {
     assert_eq!(contextual_int32(), i32::MAX);
     assert_eq!(contextual_int64(), i64::MAX);
     cases += 19;
-    assert_eq!(cases, 172);
+    let left = Envelope { parcel: Parcel { bytes: vec![], marker: 11 }, label: "left".into() };
+    let right = Envelope { parcel: Parcel { bytes: vec![1, 2, 3], marker: 17 }, label: "right".into() };
+    let no_parcel = MaybeEnvelope { parcel: None };
+    let some_parcel = MaybeEnvelope { parcel: Some(right.parcel.clone()) };
+    let left_list = ParcelList { slots: vec![left.parcel.clone(), right.parcel.clone()] };
+    let right_list = ParcelList { slots: vec![right.parcel.clone()] };
+    for flag in [false, true] {
+        let expected = if flag { &right } else { &left };
+        assert_eq!(choose_label(&left, &right, flag), expected.label);
+        assert_eq!(choose_bytes(&left.parcel, &right.parcel, flag), expected.parcel.bytes);
+        assert_eq!(choose_record(&left, &right, flag), expected.parcel);
+        assert_eq!(choose_option(&no_parcel, &some_parcel, flag), if flag { some_parcel.parcel.clone() } else { None });
+        assert_eq!(choose_list_owner(&left_list, &right_list, flag), if flag { right_list.clone() } else { left_list.clone() });
+        reset_evaluation_probe();
+        assert_eq!(fallible_label(&left, &right, flag, 0), Ok(expected.label.clone()));
+        assert_eq!((evaluation_calls(), evaluation_order()), (1, 1));
+        cases += 6;
+    }
+    assert_eq!(local_owner_label("local".into()), "local");
+    reset_evaluation_probe();
+    assert_eq!(fallible_label(&left, &right, false, u64::MAX), Err(ComputeError::AddOverflow));
+    assert_eq!((evaluation_calls(), evaluation_order()), (0, 0));
+    assert!(std::ptr::eq(borrowed_label_accessor(&left), &left.label));
+    cases += 3;
+    for flag in [false, true] {
+        assert_eq!(local_nested_return(Some(left.clone()), flag), Some(ParcelList { slots: vec![left.parcel.clone()] }));
+        cases += 1;
+    }
+    assert_eq!(local_nested_return(None, false), None);
+    cases += 1;
+    assert!(std::ptr::eq(borrowed_positional_accessor(&left), &left.label));
+    assert_eq!(ambiguous_label_accessor(&left, &right), left.label);
+    assert_eq!(temporary_label(), "temporary");
+    cases += 3;
+    assert_eq!(cases, 193);
     println!("owned projection safety: {cases} cases passed");
 }
 "#;
@@ -568,7 +645,7 @@ fn owned_projection_safety_executes_in_std_and_no_std_debug_and_optimized() {
             );
             assert_eq!(
                 succeeds(&mut Command::new(&executable)),
-                "owned projection safety: 172 cases passed\n"
+                "owned projection safety: 193 cases passed\n"
             );
         }
     }

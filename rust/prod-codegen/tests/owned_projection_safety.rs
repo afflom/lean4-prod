@@ -22,6 +22,32 @@ const IR: &str = r#"(module OwnedProjectionSafety
   (def join_failure_order ((input Nat)) Nat
     (let continuation (jp continuation (first second) 0)
       (jmp continuation (add input 1) (mul input 2))))
+  (def panic_value () Nat (unreachable))
+  (def join_panic () Nat
+    (let continuation (jp continuation (unused) 7)
+      (jmp continuation (unreachable))))
+  (def join_called_panic () Nat
+    (let continuation (jp continuation (unused) 7)
+      (jmp continuation (call panic_value))))
+  (def join_panic_before_error ((input Nat)) Nat
+    (let continuation (jp continuation (first second) 7)
+      (jmp continuation (unreachable) (add input 1))))
+  (def join_error_before_panic ((input Nat)) Nat
+    (let continuation (jp continuation (first second) 7)
+      (jmp continuation (add input 1) (unreachable))))
+  (def unused_let_panic () Nat (let unused (call panic_value) 7))
+  (def join_conditional_panic ((fail Bool)) Nat
+    (let continuation (jp continuation (unused) 7)
+      (jmp continuation (if fail (unreachable) 0))))
+  (def join_once ((input Nat)) Nat
+    (let continuation (jp continuation (value) (add value value))
+      (jmp continuation (ctor "counted_value" input))))
+  (def join_unused_order () Nat
+    (let continuation (jp continuation (first second) 7)
+      (jmp continuation (ctor "counted_value" 1) (ctor "counted_value" 2))))
+  (def join_partial_failure ((input Nat)) Nat
+    (let continuation (jp continuation (first second third) 7)
+      (jmp continuation (ctor "counted_value" 1) (add input 1) (ctor "counted_value" 2))))
   (def borrowed_head ((input (List (named "Parcel")))) (Option (named "Parcel"))
     (cases input
       (alt "List.nil" () (ctor "Option.none"))
@@ -314,8 +340,49 @@ fn main() {
     assert_eq!(join_failure_order(0), Ok(0));
     assert_eq!(join_failure_order(u64::MAX), Err(ComputeError::AddOverflow));
     cases += 2;
-    assert_eq!(cases, 133);
+    assert!(std::panic::catch_unwind(join_panic).is_err());
+    assert!(std::panic::catch_unwind(join_called_panic).is_err());
+    assert!(std::panic::catch_unwind(|| join_panic_before_error(u64::MAX)).is_err());
+    assert_eq!(join_error_before_panic(u64::MAX), Err(ComputeError::AddOverflow));
+    assert!(std::panic::catch_unwind(|| join_error_before_panic(0)).is_err());
+    assert!(std::panic::catch_unwind(unused_let_panic).is_err());
+    assert_eq!(join_conditional_panic(false), 7);
+    assert!(std::panic::catch_unwind(|| join_conditional_panic(true)).is_err());
+    cases += 8;
+    reset_evaluation_probe();
+    assert_eq!(join_once(5), Ok(10));
+    assert_eq!((evaluation_calls(), evaluation_order()), (1, 5));
+    reset_evaluation_probe();
+    assert_eq!(join_unused_order(), 7);
+    assert_eq!((evaluation_calls(), evaluation_order()), (2, 12));
+    reset_evaluation_probe();
+    assert_eq!(join_partial_failure(u64::MAX), Err(ComputeError::AddOverflow));
+    assert_eq!((evaluation_calls(), evaluation_order()), (1, 1));
+    reset_evaluation_probe();
+    assert_eq!(join_partial_failure(0), Ok(7));
+    assert_eq!((evaluation_calls(), evaluation_order()), (2, 12));
+    cases += 4;
+    assert_eq!(cases, 145);
     println!("owned projection safety: {cases} cases passed");
+}
+"#;
+
+// Test-only instrumentation for the compiler's documented bare host-constructor
+// boundary. It observes evaluation count/order without changing generated IR
+// or supplying application behavior, and also compiles in a no_std library.
+const EVALUATION_PROBE: &str = r#"
+static EVALUATION_CALLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static EVALUATION_ORDER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub fn reset_evaluation_probe() {
+    EVALUATION_CALLS.store(0, core::sync::atomic::Ordering::SeqCst);
+    EVALUATION_ORDER.store(0, core::sync::atomic::Ordering::SeqCst);
+}
+pub fn evaluation_calls() -> usize { EVALUATION_CALLS.load(core::sync::atomic::Ordering::SeqCst) }
+pub fn evaluation_order() -> usize { EVALUATION_ORDER.load(core::sync::atomic::Ordering::SeqCst) }
+fn counted_value(value: u64) -> u64 {
+    EVALUATION_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    EVALUATION_ORDER.store(evaluation_order() * 10 + value as usize, core::sync::atomic::Ordering::SeqCst);
+    value
 }
 "#;
 
@@ -376,7 +443,10 @@ fn owned_projection_safety_executes_in_std_and_no_std_debug_and_optimized() {
     let package = generate_cargo_package(&module, &spec).unwrap();
     assert_eq!(package, generate_cargo_package(&module, &spec).unwrap());
     let scratch = Scratch::new();
-    for file in package.files {
+    for mut file in package.files {
+        if file.path == "src/lib.rs" {
+            file.bytes.extend_from_slice(EVALUATION_PROBE.as_bytes());
+        }
         let path = scratch.0.join(file.path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, file.bytes).unwrap();
@@ -425,7 +495,7 @@ fn owned_projection_safety_executes_in_std_and_no_std_debug_and_optimized() {
             );
             assert_eq!(
                 succeeds(&mut Command::new(&executable)),
-                "owned projection safety: 133 cases passed\n"
+                "owned projection safety: 145 cases passed\n"
             );
         }
     }

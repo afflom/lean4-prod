@@ -250,7 +250,7 @@ pub const REJECTIONS: &[(&str, &str)] = &[
     ),
     (
         "UnsupportedList",
-        "a list value outside a supported position: nested inside another type, or used as an intermediate value rather than a slice parameter/output buffer",
+        "a list value outside supported slice, output-buffer, constant or owned collection positions; computed eager jump arguments in builder/static mode require unsupported intermediate storage",
     ),
     (
         "HeapType",
@@ -597,6 +597,16 @@ fn is_fallible(expr: &Expr, shapes: &Signatures) -> bool {
         _ => false,
     };
     here || expr.children().any(|child| is_fallible(child, shapes))
+}
+
+/// Only closed, supported values can be discarded without evaluating them.
+/// Absence of ComputeError is not totality: calls can panic, and an unused
+/// unsupported expression must still fail code generation.
+fn discardable_value(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Nat(_) | Expr::Int(_) | Expr::Bool(_) | Expr::String(_) | Expr::Bytes(_)
+    ) || matches!(expr, Expr::Ctor(name, arguments) if name == "Prod.mk" && arguments.is_empty())
 }
 
 fn count_var_uses(expr: &Expr, name: &str) -> usize {
@@ -1217,14 +1227,20 @@ fn generate_def_in<'m>(
         &|name| emitted_call_name(name, definitions, table),
         table,
     )?;
-    let normalized = if let Some(expanded) = joins::expand(&normalized)? {
-        naming::normalize_definition(
+    let (normalized, eager_bindings) = if let Some(expanded) = joins::expand(&normalized)? {
+        let join_parameters = JpContext::collect(&normalized.body)
+            .decls
+            .values()
+            .flat_map(|(parameters, _)| parameters.iter().cloned())
+            .collect();
+        naming::normalize_tracking(
             &expanded,
             &|name| emitted_call_name(name, definitions, table),
             table,
+            &join_parameters,
         )?
     } else {
-        normalized
+        (normalized, BTreeSet::new())
     };
     let def = &normalized;
     let shape = shapes
@@ -1258,6 +1274,7 @@ fn generate_def_in<'m>(
         inline_values: inline_bindings(&def.body),
         borrowed_locals: borrowed_bindings,
         movable_projections,
+        eager_bindings,
     };
 
     let mut params = String::new();
@@ -1651,6 +1668,9 @@ struct Renderer<'s, 'm> {
     borrowed_locals: BTreeSet<String>,
     /// Syntactically single-use fields; actual movement also requires an owned receiver.
     movable_projections: BTreeSet<String>,
+    /// Expanded jump arguments are eager even when a list builder would
+    /// otherwise defer ordinary list bindings into its symbolic environment.
+    eager_bindings: BTreeSet<String>,
 }
 
 impl<'m> Renderer<'_, 'm> {
@@ -1847,7 +1867,152 @@ impl<'m> Renderer<'_, 'm> {
         }
     }
 
+    fn reject_eager_list_binding(
+        &self,
+        name: &str,
+        value: &'m Expr,
+        env: &[(&'m str, &'m Expr)],
+    ) -> Result<(), Error> {
+        if !self.eager_bindings.contains(name) {
+            return Ok(());
+        }
+        // Jumps were not supported in builder/static-list positions before
+        // ownership specialization. Do not silently add allocating storage or
+        // defer a computed argument into the allocation-free builder's env.
+        fn closed_list(value: &Expr) -> bool {
+            match value {
+                Expr::Ctor(name, fields) if name == "List.nil" => fields.is_empty(),
+                Expr::Ctor(name, fields) if name == "List.cons" && fields.len() == 2 => {
+                    discardable_value(&fields[0]) && closed_list(&fields[1])
+                }
+                _ => false,
+            }
+        }
+        fn list_result<'m>(
+            renderer: &Renderer<'_, 'm>,
+            value: &'m Expr,
+            env: &[(&'m str, &'m Expr)],
+            locals: &LocalTypes,
+            possible_lists: &BTreeSet<String>,
+        ) -> bool {
+            if matches!(value, Expr::Var(name) if possible_lists.contains(name)) {
+                return true;
+            }
+            if renderer.is_list_valued(value, env) {
+                return true;
+            }
+            let value_type = expression_type(
+                value,
+                renderer.definitions,
+                renderer.types,
+                locals,
+                renderer.params,
+            );
+            if matches!(value_type, Some(Type::List(_))) {
+                return true;
+            }
+            match value {
+                Expr::Append(left, _) => list_result(renderer, left, env, locals, possible_lists),
+                // In these previously unsupported builder jump positions,
+                // unknown aliases cannot justify intermediate storage.
+                Expr::Var(_) => value_type.is_none(),
+                Expr::If(_, yes, no) => {
+                    list_result(renderer, yes, env, locals, possible_lists)
+                        || list_result(renderer, no, env, locals, possible_lists)
+                }
+                Expr::Let(name, bound, body) => {
+                    let mut nested = env.to_vec();
+                    let mut nested_types = locals.clone();
+                    let mut nested_lists = possible_lists.clone();
+                    if let Some(ty) = expression_type(
+                        bound,
+                        renderer.definitions,
+                        renderer.types,
+                        locals,
+                        renderer.params,
+                    ) {
+                        nested_types.insert(name.clone(), ty);
+                    } else {
+                        nested_types.remove(name);
+                    }
+                    if list_result(renderer, bound, env, locals, possible_lists) {
+                        nested.push((name, bound));
+                        nested_lists.insert(name.clone());
+                    } else {
+                        nested_lists.remove(name);
+                    }
+                    list_result(renderer, body, &nested, &nested_types, &nested_lists)
+                }
+                Expr::Match {
+                    scrut,
+                    alts,
+                    default,
+                } => {
+                    let scrutinee_type = expression_type(
+                        scrut,
+                        renderer.definitions,
+                        renderer.types,
+                        locals,
+                        renderer.params,
+                    );
+                    alts.iter().any(|alt| {
+                        let fields = pattern_types(scrutinee_type.as_ref(), alt, renderer.types);
+                        let mut nested_types = locals.clone();
+                        let mut nested_lists = possible_lists.clone();
+                        for binder in &alt.binders {
+                            match fields.get(binder) {
+                                Some(ty) => {
+                                    nested_types.insert(binder.clone(), ty.clone());
+                                    if matches!(ty, Type::List(_)) {
+                                        nested_lists.insert(binder.clone());
+                                    } else {
+                                        nested_lists.remove(binder);
+                                    }
+                                }
+                                None => {
+                                    nested_types.remove(binder);
+                                    // Unknown pattern values cannot justify
+                                    // introducing intermediate list storage.
+                                    nested_lists.insert(binder.clone());
+                                }
+                            }
+                        }
+                        list_result(renderer, &alt.body, env, &nested_types, &nested_lists)
+                    }) || default.as_deref().is_some_and(|value| {
+                        list_result(renderer, value, env, locals, possible_lists)
+                    })
+                }
+                _ => false,
+            }
+        }
+        let value = self.resolved_inline(value);
+        let mut locals: LocalTypes = self.params.iter().cloned().collect();
+        let mut possible_lists = BTreeSet::new();
+        for (name, bound) in env {
+            if let Some(ty) =
+                expression_type(bound, self.definitions, self.types, &locals, self.params)
+            {
+                locals.insert(String::from(*name), ty);
+            }
+            if self.is_list_valued(bound, env) {
+                possible_lists.insert(String::from(*name));
+            }
+        }
+        if list_result(self, value, env, &locals, &possible_lists) && !closed_list(value) {
+            // Validate its supported expression forms before reporting the
+            // storage boundary; opaque/extern arguments must never disappear.
+            self.value(value)?;
+            return Err(Error::UnsupportedList(String::from(
+                "computed eager jump arguments require list storage in builder/static mode",
+            )));
+        }
+        Ok(())
+    }
+
     fn render(&self, expr: &'m Expr, mode: &Mode<'_, 'm>) -> Result<String, Error> {
+        if let (Expr::Let(name, value, _), Mode::Builder { env, .. }) = (expr, mode) {
+            self.reject_eager_list_binding(name, value, env)?;
+        }
         match expr {
             // ---- control flow: identical in both modes ----
             Expr::If(cond, t, f)
@@ -1872,9 +2037,7 @@ impl<'m> Renderer<'_, 'm> {
                 self.render(body, mode)
             }
             Expr::Let(name, value, body)
-                if count_var_uses(body, name) == 0
-                    && !is_fallible(value, self.shapes)
-                    && !matches!(value.as_ref(), Expr::Jp { .. }) =>
+                if count_var_uses(body, name) == 0 && discardable_value(value) =>
             {
                 self.render(body, mode)
             }
@@ -2546,6 +2709,9 @@ impl<'m> Renderer<'_, 'm> {
         env: &[(&'m str, &'m Expr)],
         items: &mut Vec<String>,
     ) -> Result<(), Error> {
+        if let Expr::Let(name, value, _) = expr {
+            self.reject_eager_list_binding(name, value, env)?;
+        }
         match expr {
             Expr::Var(name) => match lookup(env, name) {
                 Some(bound) => self.static_list(bound, env, items),

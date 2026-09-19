@@ -13,6 +13,124 @@ fn generate_err(ir: &str) -> Error {
     generate_module(&module).unwrap_err()
 }
 
+#[test]
+fn unused_eager_join_arguments_still_reject_unsupported_ir() {
+    for (argument, expected) in [
+        (
+            r#"(extern "Missing.fn")"#,
+            Error::UnresolvedCall(String::from("Missing.fn")),
+        ),
+        (
+            r#"(opaque "unsupported")"#,
+            Error::OpaqueExpr(String::from("unsupported")),
+        ),
+        (
+            r#"(let hidden (extern "Missing.fn") 1)"#,
+            Error::UnresolvedCall(String::from("Missing.fn")),
+        ),
+        (
+            r#"(if true 0 (opaque "unsupported"))"#,
+            Error::OpaqueExpr(String::from("unsupported")),
+        ),
+    ] {
+        let input = format!(
+            "(module M (def probe () Nat (let continuation (jp continuation (unused) 7) (jmp continuation {argument}))))"
+        );
+        let (remaining, module) = parse_module(&input).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(generate_module(&module), Err(expected), "{argument}");
+    }
+}
+
+#[test]
+fn computed_eager_list_arguments_do_not_enter_lazy_builders() {
+    for argument in [
+        "(ctor \"List.cons\" (add input 1) (ctor \"List.nil\"))",
+        "(if true (ctor \"List.cons\" (add input 1) (ctor \"List.nil\")) (ctor \"List.nil\"))",
+        "(let list (ctor \"List.cons\" (add input 1) (ctor \"List.nil\")) list)",
+        "(cases true (alt \"Bool.true\" () (ctor \"List.cons\" (add input 1) (ctor \"List.nil\"))) (alt \"Bool.false\" () (ctor \"List.nil\")))",
+    ] {
+        let input = format!(
+            "(module M (def probe ((input Nat)) (List Nat) (let g (jp g (unused) (ctor \"List.nil\")) (jmp g {argument}))))"
+        );
+        assert!(matches!(generate_err(&input), Error::UnsupportedList(_)), "{argument}");
+    }
+    // The second expansion renames the repeated formal. Its eager identity
+    // must survive that normalization instead of becoming an ordinary lazy let.
+    assert!(matches!(
+        generate_err(
+            r#"(module M (def probe ((input Nat)) (List Nat)
+          (let g (jp g (unused) (ctor "List.nil"))
+            (if (eq input 0)
+              (jmp g (ctor "List.cons" 1 (ctor "List.nil")))
+              (jmp g (ctor "List.cons" (add input 1) (ctor "List.nil")))))))"#
+        ),
+        Error::UnsupportedList(_)
+    ));
+    assert!(matches!(
+        generate_err(
+            r#"(module M (def probe () (List Nat)
+          (let g (jp g (unused) (ctor "List.nil"))
+            (jmp g (ctor "List.cons" (unreachable) (ctor "List.nil"))))))"#
+        ),
+        Error::UnsupportedList(_)
+    ));
+    assert_eq!(
+        generate_err(
+            r#"(module M (def probe ((input Nat)) (List Nat)
+          (let g (jp g (unused) (ctor "List.nil"))
+            (jmp g (ctor "List.cons" (extern "Missing.fn") (ctor "List.nil"))))))"#
+        ),
+        Error::UnresolvedCall(String::from("Missing.fn"))
+    );
+    // Scalar continuations inside a constant list head remain supported.
+    let source = generate(
+        r#"(module M (def probe () (List Nat)
+      (ctor "List.cons" (let g (jp g (value) value) (jmp g 7)) (ctor "List.nil"))))"#,
+    );
+    assert!(source.contains("&'static [u64]"));
+}
+
+#[test]
+fn eager_list_pattern_results_cannot_allocate_behind_builder_guards() {
+    assert!(matches!(
+        generate_err(
+            r#"(module M (def probe ((input (List Nat))) (List Nat)
+          (let g (jp g (unused) (ctor "List.nil")) (jmp g (append input input)))))"#
+        ),
+        Error::UnsupportedList(_)
+    ));
+    for argument in [
+        r#"(cases (ctor "Wrapped.mk" (ctor "List.cons" (add input 1) (ctor "List.nil")))
+          (alt "Wrapped.mk" (items) items))"#,
+        r#"(cases (ctor "Option.some" (ctor "List.cons" (add input 1) (ctor "List.nil")))
+          (alt "Option.some" (items) items) (alt "Option.none" () (ctor "List.nil")))"#,
+        r#"(cases (ctor "List.cons" input (ctor "List.nil"))
+          (alt "List.cons" (head tail) tail) (alt "List.nil" () (ctor "List.nil")))"#,
+    ] {
+        let input = format!(
+            r#"(module M
+          (type "Wrapped" (ctor "Wrapped.mk" (items (List Nat))))
+          (def probe ((input Nat)) (List Nat)
+            (let g (jp g (unused) (ctor "List.nil")) (jmp g {argument}))))"#
+        );
+        assert!(
+            matches!(generate_err(&input), Error::UnsupportedList(_)),
+            "{argument}"
+        );
+    }
+    let source = generate(
+        r#"(module M
+      (type "Wrapped" (ctor "Wrapped.mk" (value Nat)))
+      (def probe ((input Nat)) (List Nat)
+        (let g (jp g (unused) (ctor "List.nil"))
+          (jmp g (cases (ctor "Wrapped.mk" input)
+            (alt "Wrapped.mk" (value) value))))))"#,
+    );
+    assert!(source.contains("match"));
+    assert!(!source.contains("alloc::vec"));
+}
+
 fn package_file<'a>(package: &'a GeneratedPackage, path: &str) -> &'a [u8] {
     &package
         .files

@@ -67,7 +67,7 @@ Everything else fails, precisely:
 |---|---|
 | `OpaqueExpr` | an expression with no Rust rendering |
 | `ParamOutOfBounds` | a parameter index outside the definition's parameter list |
-| `UnsupportedList` | a list value outside a supported position: nested inside another type, or used as an intermediate value rather than a slice parameter/output buffer |
+| `UnsupportedList` | a list value outside supported slice, output-buffer, constant or owned collection positions; computed eager jump arguments in builder/static mode require unsupported intermediate storage |
 | `HeapType` | a type that would require a heap allocation in generated code |
 | `RecursiveType` | an inductive refers to itself (directly, or through one level of indirection); needs the tier-1 memory profile |
 | `PolymorphicType` | an inductive has type parameters; monomorphization is not implemented |

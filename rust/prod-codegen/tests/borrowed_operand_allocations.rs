@@ -190,6 +190,69 @@ const IR: &str = r#"(module BorrowedOperands
         (let after (length input) (ctor "Parcel.mk" moved after)))))
   (def length_entry ((input Bytes)) Bytes
     (let width (length input) (if (eq width 0) input input)))
+  (def branch_length_guarded ((input Bytes) (suffix Bytes)) Bytes
+    (let first (length input)
+      (if (le first 1048576)
+        (let second (length suffix)
+          (if (le second 1048576)
+            (let third (length input)
+              (let fourth (length suffix)
+                (if (le (add third fourth) 2097152)
+                  (append input suffix) (bytes))))
+            (bytes)))
+        (bytes))))
+  (def branch_length_match ((input Bytes) (tag (named "CopyTag"))) Bytes
+    (cases tag
+      (alt "CopyTag.first" ()
+        (let width (length input) (if (eq width 0) input input)))
+      (default
+        (let width (length input) (if (eq width 0) input input)))))
+  (def branch_length_local ((input Bytes) (choose Bool)) Bytes
+    (let local (call own_bytes input)
+      (if choose (let width (length local) (if (eq width 0) local local))
+        (let width (length local) local))))
+  (def branch_scalar_length ((input String) (choose Bool)) String
+    (if choose (let width (string-length input) (if (eq width 0) input input))
+      (let width (string-length input) input)))
+  (def branch_length_entry ((input Bytes)) Bytes
+    (call branch_length_guarded input (bytes)))
+  (def branch_move_then_read ((input Bytes) (choose Bool)) (named "Parcel")
+    (if choose
+      (let before (length input)
+        (let moved (call own_bytes input)
+          (let after (length input) (ctor "Parcel.mk" moved after))))
+      (let moved (call own_bytes input)
+        (let after (length input) (ctor "Parcel.mk" moved after)))))
+  (def branch_then_outer_read ((input Bytes) (choose Bool)) (named "Parcel")
+    (let moved
+      (if choose (let width (length input) input)
+        (let width (length input) input))
+      (ctor "Parcel.mk" moved (length input))))
+  (def branch_retained_length_alias ((input Bytes) (choose Bool)) (named "Pair")
+    (if choose
+      (let alias input
+        (let width (length input) (ctor "Pair.mk" alias input)))
+      (let width (length input) (ctor "Pair.mk" input input))))
+  (def consuming_predicate ((input Bytes)) Bool
+    (let moved (call own_bytes input) (eq (length moved) 0)))
+  (def branch_consuming_condition ((input Bytes)) Bytes
+    (if (call consuming_predicate input)
+      (let width (length input) input)
+      (let width (length input) input)))
+  (def branch_consuming_scrutinee ((input Bytes)) Bytes
+    (cases (call own_bytes input)
+      (default (let width (length input) input))))
+  (def branch_unknown_call ((input Bytes) (choose Bool)) Bytes
+    (if choose
+      (let observed (call consuming_predicate input)
+        (let width (length input) input))
+      (let width (length input) input)))
+  (def branch_retained_projection ((input (named "Parcel")) (choose Bool)) (named "Pair")
+    (if choose
+      (let alias (proj "Parcel" "bytes" input)
+        (let width (length alias)
+          (ctor "Pair.mk" alias (proj "Parcel" "bytes" input))))
+      (ctor "Pair.mk" (proj "Parcel" "bytes" input) (proj "Parcel" "bytes" input))))
   (def self_append_retained ((input Bytes)) (named "Pair")
     (let twice (append input input) (ctor "Pair.mk" twice input)))
   (def self_append_borrowed ((input (named "Parcel"))) Bytes
@@ -301,6 +364,56 @@ fn measured<T>(action: impl FnOnce() -> T) -> (T, usize) {
 
 fn main() {
     for size in [0, 1, 32, 8192, 1_048_576] {
+        let mut input = Vec::with_capacity(size + 1);
+        input.resize(size, 17);
+        let pointer = input.as_ptr();
+        let suffix = vec![9];
+        let (output, count) = measured(|| branch_length_guarded(input, suffix).unwrap());
+        assert_eq!(count, 0, "branch-local scalar guards must not clone an owned append operand");
+        assert_eq!(output.as_ptr(), pointer);
+        assert_eq!(&output[..size], vec![17; size]);
+        assert_eq!(output[size], 9);
+        for choose in [false, true] {
+            let input = vec![17; size];
+            let pointer = input.as_ptr();
+            let tag = if choose { CopyTag::first } else { CopyTag::second };
+            let (output, count) = measured(|| branch_length_match(input, tag));
+            assert_eq!(count, 0, "scalar reads in exclusive match branches retain no owner");
+            assert_eq!(output.as_ptr(), pointer);
+            assert_eq!(output, vec![17; size]);
+            let input = vec![17; size];
+            let pointer = input.as_ptr();
+            let (output, count) = measured(|| branch_length_local(input, choose));
+            assert_eq!(count, 0, "branch-local scalar reads of a local retain no owner");
+            assert_eq!(output.as_ptr(), pointer);
+            assert_eq!(output, vec![17; size]);
+            let input = "é".repeat(size);
+            let pointer = input.as_ptr();
+            let (output, count) = measured(|| branch_scalar_length(input, choose));
+            assert_eq!(count, 0, "branch-local scalar-count reads retain no owner");
+            assert_eq!(output.as_ptr(), pointer);
+            assert_eq!(output, "é".repeat(size));
+            for action in [branch_move_then_read, branch_then_outer_read] {
+                let output = action(vec![17; size], choose);
+                assert_eq!(output.bytes, vec![17; size]);
+                assert_eq!(output.offset, size as u64, "a branch cannot hide a post-transfer read");
+            }
+            let mut output = branch_retained_length_alias(vec![17; size], choose);
+            assert_eq!(output.first, vec![17; size]);
+            assert_eq!(output.second, vec![17; size]);
+            output.first.push(9);
+            assert_eq!(output.second.len(), size, "a retained alias needs an independent owner");
+            let original = Parcel { bytes: vec![17; size], offset: 7 };
+            let mut output = branch_retained_projection(&original, choose);
+            assert_eq!(output.first, original.bytes);
+            assert_eq!(output.second, original.bytes);
+            output.first.push(9);
+            assert_eq!(output.second.len(), size);
+            assert_eq!(original.bytes.len(), size, "borrowed projections retain their owner");
+            assert_eq!(branch_unknown_call(vec![17; size], choose), vec![17; size]);
+        }
+        assert_eq!(branch_consuming_condition(vec![17; size]), vec![17; size]);
+        assert_eq!(branch_consuming_scrutinee(vec![17; size]), vec![17; size]);
         let input = vec![17; size];
         let pointer = input.as_ptr();
         let (output, count) = measured(|| length_then_move(input));
@@ -863,6 +976,20 @@ fn leading_length_reads_move_within_actual_wasm_memory_bound() {
     for release in [false, true] {
         actual_wasm_profile(
             "length_entry",
+            1_048_576,
+            1_048_576,
+            50,
+            "borrowed_operands_wasm_test.mjs",
+            release,
+        );
+    }
+}
+
+#[test]
+fn branch_local_length_reads_move_within_actual_wasm_memory_bound() {
+    for release in [false, true] {
+        actual_wasm_profile(
+            "branch_length_entry",
             1_048_576,
             1_048_576,
             50,

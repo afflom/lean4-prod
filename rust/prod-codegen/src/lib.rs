@@ -633,7 +633,26 @@ fn count_path_uses(mut expr: &Expr, name: &str) -> usize {
             break;
         }
     }
-    count_sequential_path_uses(expr, name)
+    match expr {
+        // An owner-free selector cannot transfer or retain this binding.
+        // Each exclusive branch therefore begins with the same unmoved owner;
+        // only its own leading scalar reads may be ignored. An owner-bearing
+        // selector, retained value, or later sequential use stays conservative.
+        Expr::If(condition, yes, no) if count_var_uses(condition, name) == 0 => {
+            count_path_uses(yes, name).max(count_path_uses(no, name))
+        }
+        Expr::Match {
+            scrut,
+            alts,
+            default,
+        } if count_var_uses(scrut, name) == 0 => alts
+            .iter()
+            .map(|alt| count_path_uses(&alt.body, name))
+            .chain(default.iter().map(|value| count_path_uses(value, name)))
+            .max()
+            .unwrap_or(0),
+        _ => count_sequential_path_uses(expr, name),
+    }
 }
 
 fn count_sequential_path_uses(expr: &Expr, name: &str) -> usize {

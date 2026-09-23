@@ -84,6 +84,19 @@ const IR: &str = r#"(module BorrowedOperands
       (cases result
         (alt "Option.some" (result) (ctor "Option.some" result))
         (alt "Option.none" () result))))
+  (def none_return_shadow_reuse ((input Bytes) (present Bool)) (Option Bytes)
+    (let result (call maybe_bytes input present)
+      (cases result
+        (alt "Option.none" () result)
+        (alt "Option.some" (result)
+          (ctor "Option.some" (append (call own_bytes result) result))))))
+  (def none_return_shadow_join ((input Bytes) (present Bool)) (Option Bytes)
+    (let result (call maybe_bytes input present)
+      (cases result
+        (alt "Option.none" () result)
+        (alt "Option.some" (result)
+          (let continuation (jp copy () result)
+            (ctor "Option.some" (append (jmp copy) (jmp copy))))))))
   (def none_return_keeps_owner ((input Bytes) (present Bool)) (Option Bytes)
     (let result (call maybe_bytes input present)
       (cases result
@@ -678,6 +691,25 @@ fn main() {
             let (output, count) = measured(|| none_return_shadow(input, present));
             assert_eq!(count, 0, "reversed arms and shadowing, size={size}, present={present}");
             assert_eq!(output.as_deref(), present.then_some(vec![0x5a; size].as_slice()));
+
+            let input = vec![0x5a; size];
+            let (output, count) = measured(|| none_return_shadow_reuse(input, present));
+            // Keep the old name-based protection for a shadowed payload that
+            // is consumed by a call, then read again to append its bytes.
+            assert_eq!(count, 3 * usize::from(present && size != 0), "shadowed payload reuse, size={size}, present={present}");
+            assert_eq!(output.as_deref(), present.then_some(vec![0x5a; size * 2].as_slice()));
+
+            let input = vec![0x5a; size];
+            let (output, count) = measured(|| none_return_shadow_join(input, present));
+            // fefc4ce's conservative owner analysis keeps the outer
+            // `match result.clone()` (+1 allocation), while HEAD's in-place
+            // self append moves the captured payload and extends it with
+            // `extend_from_within` instead of cloning it first (one fewer
+            // allocation than the pre-perf 3..=4 shape). The remaining
+            // allocation is the extend's growth realloc.
+            assert_eq!(count, 2 * usize::from(present && size != 0),
+                    "captured shadowed payload reuse: allocations={count}, size={size}, present={present}");
+            assert_eq!(output.as_deref(), present.then_some(vec![0x5a; size * 2].as_slice()));
 
             let input = vec![0x5a; size];
             let (output, count) = measured(|| none_return_keeps_owner(input, present));

@@ -3,7 +3,7 @@ default:
     @just --list
 
 # Complete clean-checkout CI contract.
-ci: fixture-provenance prod fmt-check lint wasm-check portable-package scalar-length specialized-index typed-decimal core-wasm view text-view wasm-sdk-fixture uor-fixture
+ci: fixture-provenance prod fmt-check lint wasm-check portable-package specialized-index scalar-length typed-decimal core-wasm view text-view workspace-view wasm-sdk-fixture uor-fixture
 
 # Unicode scalars must not be counted as UTF-8 bytes or grapheme clusters.
 scalar-length:
@@ -25,6 +25,11 @@ view:
 # Closed UTF-8 transport generation, DOM behavior and compiled Wasm byte ABI.
 text-view:
     bash scripts/check-text-view.sh
+
+# Closed browser component projection and verified loader. Structural fixtures
+# test transport contracts, not application authority or source-proof acceptance.
+workspace-view:
+    bash scripts/check-workspace-view.sh
 
 # Export all portable runtime roots from the real LexLean-generated fixture,
 # build/test/package the result twice, and reject mathematical Int narrowing.

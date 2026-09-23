@@ -2404,6 +2404,10 @@ impl<'m> Renderer<'_, 'm> {
                 self.read_value(right)?
             )),
             Expr::Length(value) => Ok(format!("({}).len() as u64", self.read_value(value)?)),
+            Expr::StringLength(value) => Ok(format!(
+                "({}).chars().count() as u64",
+                self.read_value(value)?
+            )),
             Expr::Index(value, offset) => Ok(format!(
                 "usize::try_from({}).ok().and_then(|__index| ({}).get(__index).cloned())",
                 self.value(offset)?,

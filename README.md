@@ -195,6 +195,12 @@ runtime stack or ABI, and does not establish termination of arbitrary raw IR.
 The regression executes 100,000 steps in native std/no_std at O0/O3 and in
 debug/release Core-Wasm with an unchanged 64-KiB stack.
 
+String length lowers to an explicit `string-length` IR operation: Unicode
+scalar count, not UTF-8 bytes or grapheme clusters. The `length` collection
+operation retains its byte/element meaning. `just scalar-length` checks the
+unchanged LexLean source, every Unicode scalar in native std/no_std at O0/O3,
+mixed strings and record fields, and deterministic bounded debug/release Wasm.
+
 ### C headers and foreign-function calls
 
 The CLI can generate both sides of a small, explicit C ABI: a header for C

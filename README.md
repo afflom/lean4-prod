@@ -172,6 +172,10 @@ The Rust code-generation APIs, including Cargo and Core-Wasm packages, preserve
 lexical parameter, let, match, and join-point scopes. Colliding local names are
 normalized deterministically before ownership analysis; already hygienic names
 retain their output bytes.
+Local spellings that are not Rust Unicode-XID identifiers receive fresh names;
+collision checks use Rust's NFC identity, so distinct IR locals such as `K` and
+`K` remain distinct without rewriting valid, noncolliding Unicode spellings.
+This local-binding boundary does not rename global definitions or types.
 Positional parameters still refer to the original formal parameters under
 shadowing. Duplicate names within one parameter or pattern-binding group are
 rejected as `DuplicateBinding`, rather than choosing an ambiguous binding.

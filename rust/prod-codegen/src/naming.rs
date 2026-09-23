@@ -9,8 +9,24 @@ use alloc::{
     vec::Vec,
 };
 use prod_ir::{Definition, Expr, Type};
+use unicode_normalization::UnicodeNormalization;
 
 type Scope = BTreeMap<String, String>;
+
+fn binding_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || unicode_ident::is_xid_start(first))
+        && chars
+            .all(|ch| ch != '\u{200c}' && ch != '\u{200d}' && unicode_ident::is_xid_continue(ch))
+}
+
+// Rust compares identifiers in NFC. Keep valid original spelling in output,
+// but do not let distinct IR locals such as K and K become one Rust binding.
+fn collision_key(name: &str) -> String {
+    name.nfc().collect()
+}
 
 struct Names {
     reserved: BTreeSet<String>,
@@ -34,15 +50,17 @@ impl Names {
 
     fn bind_name(&mut self, original: &str) -> String {
         let rendered = crate::rust_local_ident(original);
+        let key = collision_key(&rendered);
         let indexed_buffer_temporary = self.buffer
             && ["__head", "__rest", "__len"].iter().any(|prefix| {
                 rendered.strip_prefix(prefix).is_some_and(|suffix| {
                     !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
                 })
             });
-        if !self.protected.contains(&rendered)
+        if binding_identifier(&rendered)
+            && !self.protected.contains(&key)
             && !indexed_buffer_temporary
-            && self.used.insert(rendered)
+            && self.used.insert(key)
         {
             return String::from(original);
         }
@@ -284,11 +302,11 @@ pub(crate) fn normalize_tracking(
         temporaries.extend(["output", "__source", "__len"].map(String::from));
     }
     let mut names = Names {
-        reserved,
+        reserved: reserved.iter().map(|name| collision_key(name)).collect(),
         used: BTreeSet::new(),
         next: 0,
         buffer,
-        protected: temporaries,
+        protected: temporaries.iter().map(|name| collision_key(name)).collect(),
         formals: Vec::new(),
         tracked_sources: tracked_sources.clone(),
         tracked_bindings: BTreeSet::new(),

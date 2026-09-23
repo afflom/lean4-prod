@@ -1,0 +1,12 @@
+{
+  "spec": "lean4-prod/lexlean-scalar-length-fixture/1",
+  "compiler_revision": "9c1456d34b896ab77db01c5e8ebbfed584edee26",
+  "compiler_crate_sha256": "94ee7d58bcbcc70dbb5b01fb4130e4f24f3fed314b3c63b2c252c431e53c2efb",
+  "compiler_semantics_id": "c56e1a234cee7c12f00e4f2f53d6094e2ed51f5bbf5195b60f79d4e8aa5bce53",
+  "build_id": "c81e4a7447eabbe093c6c590fdbc7b90add5551b2039a4ae24a8fcf95270e9ed",
+  "semantic_id": "a85a1ae9b350d860dcc7610a4a10200d2b724ed511f9dcfdf557bc291d8f1969",
+  "source_id": "9051e1afaf7f54c64bd1fb77c5d139856b88eda1fe072ce92f8cd24cced086bf",
+  "build_manifest_sha256": "20bb716e689a8f0fd9acdf8685a653afe6690131d59d40e61f5725136ecc4daa",
+  "generated_path": "lean/Conformance/LexLeanScalarLength.lean",
+  "generated_sha256": "ee126404ba9226f1c3deee2fe7a272ed00a9f2856f0870c974e0930f894742a5"
+}

@@ -111,8 +111,10 @@ mod naming;
 mod ownership;
 mod package;
 mod sdk;
+mod tail_calls;
 mod text_view;
 mod view;
+mod workspace_view;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -132,6 +134,10 @@ pub use text_view::{generate_text_view_v1, TextBrowserAdapterBinding, TextViewV1
 pub use view::{
     generate_holoview_bundle, generate_view_v1, BrowserAdapterBinding, EvaluatedViewV1,
     GeneratedViewV1, ViewOperation,
+};
+pub use workspace_view::{
+    generate_workspace_view_v1, GeneratedWorkspaceViewV1, WorkspaceBrowserBinding, WorkspaceGuest,
+    WorkspaceGuestRole, WorkspaceSdkAsset, WorkspaceViewError, WorkspaceViewV1,
 };
 
 /// Errors that can occur during code generation
@@ -648,6 +654,51 @@ fn count_path_uses(expr: &Expr, name: &str) -> usize {
     }
 }
 
+/// Uses of a local inside a join-point body are duplicated at every one of
+/// the join point's jump sites: the renderer inlines an acyclic join point
+/// at each `jmp`, so a payload captured once in the body but jumped to twice
+/// is really used twice. `count_path_uses` sees only the single syntactic
+/// use inside the body; without these extra uses such a payload keeps no
+/// clone flag, and its first inlined use renders as a move (E0382 on every
+/// remaining use). A body reference shadowed by one of the join point's own
+/// parameters names the parameter, not the captured local, and contributes
+/// nothing. Returns only the uses beyond the syntactic one, so callers add
+/// it to an ordinary `count_path_uses` total.
+fn inlined_join_extra_uses(root: &Expr, name: &str) -> usize {
+    fn jump_sites(expr: &Expr, join: &str) -> usize {
+        usize::from(matches!(expr, Expr::Jmp(candidate, _) if candidate == join))
+            + expr
+                .children()
+                .map(|child| jump_sites(child, join))
+                .sum::<usize>()
+    }
+    fn walk(expr: &Expr, root: &Expr, name: &str) -> usize {
+        match expr {
+            Expr::Jp {
+                name: join,
+                params,
+                body,
+            } => {
+                let captured = if params.iter().any(|param| param == name) {
+                    0
+                } else {
+                    count_path_uses(body, name)
+                };
+                // With no jump sites the body still renders once in place;
+                // otherwise once per jump. The syntactic use is already
+                // counted by the caller's `count_path_uses`.
+                let renders = jump_sites(root, join).max(1);
+                captured * (renders - 1) + walk(body, root, name)
+            }
+            _ => expr
+                .children()
+                .map(|child| walk(child, root, name))
+                .sum(),
+        }
+    }
+    walk(root, root, name)
+}
+
 /// Whether a binding expression produces a known non-`Copy` Rust value.
 ///
 /// This deliberately answers `false` when the type is not recoverable from
@@ -806,7 +857,9 @@ fn repeated_non_copy_locals(
                         if !copy_type(&ty, table, &mut BTreeSet::new()) {
                             nested.insert(name.clone());
                             if !borrowed_bindings.contains(&name)
-                                && count_path_uses(&alt.body, &name) > 1
+                                && count_path_uses(&alt.body, &name)
+                                    + inlined_join_extra_uses(&alt.body, &name)
+                                    > 1
                             {
                                 output.insert(name.clone());
                             }
@@ -1218,6 +1271,16 @@ fn single_owned_option_match(
             alt.ctor == "Option.some"
                 && alt.binders.len() == 1
                 && count_var_uses(&alt.body, name) == 0
+                // The payload may itself move out of the owner, but only an
+                // untouched payload or a pure `Some(x) => Some(x)` rewrap
+                // leaves the None arm's owner reusable. Binder names are
+                // normalized before this pass, so a payload that shadowed
+                // the owner arrives under a fresh name: count the binder's
+                // own uses rather than trusting lexical equality.
+                && (count_var_uses(&alt.body, &alt.binders[0]) == 0
+                    || matches!(&alt.body, Expr::Ctor(ctor, args)
+                        if ctor == "Option.some"
+                            && matches!(args.as_slice(), [Expr::Var(returned)] if returned == &alt.binders[0])))
         })
     {
         return false;
@@ -1270,6 +1333,12 @@ fn generate_def_in<'m>(
         def.name.clone()
     };
     let visibility = if helper { "" } else { "pub " };
+    let borrowed_return = returns_borrowed_projection(def, table);
+    let tail_plan = if matches!(shape, Shape::Value | Shape::Fallible) && !borrowed_return {
+        tail_calls::plan(def, table)
+    } else {
+        None
+    };
     let movable_projections = movable_projection_owners(def, table);
     let bindings = binding_ownership(def, definitions, table, &movable_projections);
     let renderer = Renderer {
@@ -1299,7 +1368,12 @@ fn generate_def_in<'m>(
             params.push_str(", ");
         }
         params.push_str(&format!(
-            "{}: {}",
+            "{}{}: {}",
+            if tail_plan.as_ref().is_some_and(|plan| plan.mutates(i)) {
+                "mut "
+            } else {
+                ""
+            },
             rust_local_ident(name),
             param_type_to_rust(
                 ty,
@@ -1309,7 +1383,6 @@ fn generate_def_in<'m>(
         ));
     }
     check_named_type(&def.ret, table)?;
-    let borrowed_return = returns_borrowed_projection(def, table);
     let return_type = if borrowed_return {
         format!("&{}", type_to_rust(&def.ret)?)
     } else {
@@ -1353,20 +1426,37 @@ fn generate_def_in<'m>(
                 generated_name, params, body
             ))
         }
-        Shape::Fallible => Ok(format!(
-            "{visibility}fn {}({}) -> Result<{}, crate::ComputeError> {{\n    Ok({})\n}}\n",
-            generated_name,
-            params,
-            return_type,
-            renderer.render_return(&def.body, borrowed_return)?
-        )),
-        Shape::Value => Ok(format!(
-            "{visibility}fn {}({}) -> {} {{\n    {}\n}}\n",
-            generated_name,
-            params,
-            return_type,
-            renderer.render_return(&def.body, borrowed_return)?
-        )),
+        Shape::Fallible => {
+            let body = if let Some(plan) = &tail_plan {
+                format!(
+                    "loop {{ return Ok({}); }}",
+                    renderer.render_tail(&def.body, plan)?
+                )
+            } else {
+                format!(
+                    "Ok({})",
+                    renderer.render_return(&def.body, borrowed_return)?
+                )
+            };
+            Ok(format!(
+                "{visibility}fn {}({}) -> Result<{}, crate::ComputeError> {{\n    {}\n}}\n",
+                generated_name, params, return_type, body
+            ))
+        }
+        Shape::Value => {
+            let body = if let Some(plan) = &tail_plan {
+                format!(
+                    "loop {{ return {}; }}",
+                    renderer.render_tail(&def.body, plan)?
+                )
+            } else {
+                renderer.render_return(&def.body, borrowed_return)?
+            };
+            Ok(format!(
+                "{visibility}fn {}({}) -> {} {{\n    {}\n}}\n",
+                generated_name, params, return_type, body
+            ))
+        }
     }?;
 
     if !helper {
@@ -2125,7 +2215,7 @@ impl<'m> Renderer<'_, 'm> {
                 scrut,
                 alts,
                 default,
-            } => self.render_match(scrut, alts, default.as_deref(), mode),
+            } => self.render_match(scrut, alts, default.as_deref(), mode, None),
 
             // ---- list-shaped leaves ----
             Expr::Ctor(name, args) if name == "List.nil" && args.is_empty() => match mode {
@@ -2314,6 +2404,10 @@ impl<'m> Renderer<'_, 'm> {
                 self.read_value(right)?
             )),
             Expr::Length(value) => Ok(format!("({}).len() as u64", self.read_value(value)?)),
+            Expr::StringLength(value) => Ok(format!(
+                "({}).chars().count() as u64",
+                self.read_value(value)?
+            )),
             Expr::Index(value, offset) => Ok(format!(
                 "usize::try_from({}).ok().and_then(|__index| ({}).get(__index).cloned())",
                 self.value(offset)?,
@@ -2600,6 +2694,7 @@ impl<'m> Renderer<'_, 'm> {
         alts: &'m [Alt],
         default: Option<&'m Expr>,
         mode: &Mode<'_, 'm>,
+        tail: Option<&tail_calls::Plan>,
     ) -> Result<String, Error> {
         let head_rebound_by_value = self.list_head_rebound_by_value(scrut);
         let scrut_is_borrowed = self.borrows(scrut);
@@ -2615,7 +2710,9 @@ impl<'m> Renderer<'_, 'm> {
         let scrut = self.value(scrut)?;
         let mut out = format!("match {} {{\n", scrut);
         for alt in alts {
-            let body = if normalize_results {
+            let body = if let Some(plan) = tail {
+                self.render_tail(&alt.body, plan)?
+            } else if normalize_results {
                 self.owned_value(&alt.body)?
             } else {
                 self.render(&alt.body, mode)?
@@ -2751,7 +2848,9 @@ impl<'m> Renderer<'_, 'm> {
             out.push_str(&arm);
         }
         if let Some(d) = default {
-            let body = if normalize_results {
+            let body = if let Some(plan) = tail {
+                self.render_tail(d, plan)?
+            } else if normalize_results {
                 self.owned_value(d)?
             } else {
                 self.render(d, mode)?

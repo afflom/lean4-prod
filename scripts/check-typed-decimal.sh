@@ -8,7 +8,7 @@ node "$repo_root/scripts/check-typed-decimal-provenance.mjs"
 
 cd "$repo_root/lean"
 lake build Conformance.LexLeanDecimal
-roots=(acceptUInt8 entry nonzeroUInt16 parseInt16 parseInt32 parseInt64 parseInt8 parseUint16 parseUint32 parseUint64 parseUint8)
+roots=(acceptUInt8 entry nonzeroUInt16 parseInt16 parseInt32 parseInt64 parseInt8 parseUint16 parseUint32 parseUint64 parseUint8 splitBounded splitEntry splitMaximum splitOne splitZero)
 arguments=()
 for root in "${roots[@]}"; do arguments+=(--root "DecimalFixture.Main.$root"); done
 for output in first second; do
@@ -48,6 +48,8 @@ diff -ru "$scratch/first" "$scratch/second"
 mkdir "$scratch/first/tests"
 cp "$repo_root/rust/prod-codegen/tests/fixtures/typed_decimal_generated_test.rs" \
   "$scratch/first/tests/decimal.rs"
+cp "$repo_root/rust/prod-codegen/tests/fixtures/split_exact_generated_test.rs" \
+  "$scratch/first/tests/split.rs"
 cd "$scratch/first"
 RUSTC_WRAPPER= cargo test --locked --offline
 RUSTC_WRAPPER= cargo test --locked --offline --no-default-features
@@ -66,6 +68,21 @@ done
 cmp "$scratch/first-guest/target/wasm32-unknown-unknown/release/typed_decimal_guest.wasm" \
   "$scratch/second-guest/target/wasm32-unknown-unknown/release/typed_decimal_guest.wasm"
 cmp "$scratch/first-guest/generation-manifest.json" "$scratch/second-guest/generation-manifest.json"
+
+for output in first-split second-split; do
+  cd "$repo_root/rust"
+  RUSTC_WRAPPER= cargo run --locked --offline -p prod-cli -- core-wasm \
+    "$scratch/first-export/kernel.ir" --output "$scratch/$output" \
+    --entry splitEntry --export-name holo_run --input-allocation-cap 128 \
+    --output-allocation-cap 4 --maximum-pages 4 --crate-name split-exact-guest
+  cd "$scratch/$output"
+  RUSTC_WRAPPER= cargo build --release --locked --offline
+  node "$repo_root/rust/prod-codegen/tests/fixtures/split_exact_wasm_test.mjs" \
+    "$scratch/$output/target/wasm32-unknown-unknown/release/split_exact_guest.wasm"
+done
+cmp "$scratch/first-split/target/wasm32-unknown-unknown/release/split_exact_guest.wasm" \
+  "$scratch/second-split/target/wasm32-unknown-unknown/release/split_exact_guest.wasm"
+cmp "$scratch/first-split/generation-manifest.json" "$scratch/second-split/generation-manifest.json"
 
 # Even a discarded Option Int payload must not acquire a fixed-width meaning.
 for root in acceptInt parseInt; do

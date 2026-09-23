@@ -201,6 +201,96 @@ fn borrowed_lists_and_mixed_equality_execute_native_no_std_and_wasm() {
     );
 }
 
+/// Scenario: owned match payloads may be shared, while borrowed/copy payloads
+/// and single-use owners retain their original ownership behavior.
+#[test]
+fn match_binder_ownership_executes_native_no_std_and_wasm() {
+    let ir = r#"(module MatchOwnership
+      (type "TextBox" (ctor "TextBox.mk" (text String)))
+      (def take ((value String)) Bytes (utf8-encode value))
+      (def duplicate ((value (Option String))) Bytes
+        (cases value (alt "Option.none" () (bytes))
+          (alt "Option.some" (text) (append (call take text) (call take text)))))
+      (def alias ((value (Option String))) Bytes
+        (cases value (alt "Option.none" () (bytes))
+          (alt "Option.some" (text) (let shared text
+            (append (call take shared) (call take shared))))))
+      (def nested ((value (Option (Option String)))) Bytes
+        (cases value (alt "Option.none" () (bytes))
+          (alt "Option.some" (inner) (let alias inner
+            (cases alias (alt "Option.none" () (bytes))
+              (alt "Option.some" (text) (append (call take text) (call take text))))))))
+      (def branch ((value (Option String)) (choose Bool)) String
+        (cases value (alt "Option.none" () (string ""))
+          (alt "Option.some" (text) (if choose text text))))
+      (def single ((value (Option String))) String
+        (cases value (alt "Option.none" () (string "")) (alt "Option.some" (text) text)))
+      (def copied ((value (Option UInt64))) Bool
+        (cases value (alt "Option.none" () false) (alt "Option.some" (number) (eq number number))))
+      (def borrowed ((value (Option String))) Bool
+        (cases value (alt "Option.none" () false)
+          (alt "Option.some" (text) (eq (call take text) (call take text)))))
+      (def makeBox ((value String)) (named "TextBox") (ctor "TextBox.mk" value))
+      (def ownedRecord ((value String)) Bytes
+        (let box (call makeBox value)
+          (cases box (alt "TextBox.mk" (text) (append (call take text) (call take text))))))
+      (def borrowedRecord ((value (named "TextBox"))) Bool
+        (cases value (alt "TextBox.mk" (text) (eq (call take text) (call take text)))))
+      (def indexed ((values (List String))) Bytes
+        (cases (index values 0) (alt "Option.none" () (bytes))
+          (alt "Option.some" (text) (append (call take text) (call take text)))))
+      (def consumeMaybe ((value (Option String))) Bytes
+        (cases value (alt "Option.none" () (bytes)) (alt "Option.some" (text) (call take text))))
+      (def indexedLocal ((values (List String))) Bytes
+        (let value (index values 0) (append (call consumeMaybe value) (call consumeMaybe value))))
+      (def indexedByte ((input Bytes)) Bool
+        (cases (index input 0) (alt "Option.none" () false)
+          (alt "Option.some" (value) (eq value value))))
+      (def consumeBytesMaybe ((value (Option Bytes))) Bytes
+        (cases value (alt "Option.none" () (bytes)) (alt "Option.some" (bytes) bytes)))
+      (def sliced ((input Bytes)) Bytes
+        (cases (slice input 0 (length input)) (alt "Option.none" () (bytes))
+          (alt "Option.some" (bytes) (append (call consumeBytesMaybe (ctor "Option.some" bytes))
+            (call consumeBytesMaybe (ctor "Option.some" bytes))))))
+      (def slicedLocal ((input Bytes)) Bytes
+        (let value (slice input 0 (length input))
+          (append (call consumeBytesMaybe value) (call consumeBytesMaybe value))))
+      (def entry ((input Bytes)) Bytes
+        (cases (utf8-decode input) (alt "Option.none" () (bytes 255))
+          (alt "Option.some" (text)
+            (let expected (append input input)
+              (if (eq (call duplicate (ctor "Option.some" text)) expected)
+                (if (eq (call alias (ctor "Option.some" text)) expected)
+                  (if (eq (call nested (ctor "Option.some" (ctor "Option.some" text))) expected)
+                    (if (eq (call ownedRecord text) expected)
+                      (if (call borrowed (ctor "Option.some" text))
+                        (if (call borrowedRecord (call makeBox text))
+                          (if (eq (call indexed (ctor "List.cons" text (ctor "List.nil"))) expected)
+                            (if (eq (call indexedLocal (ctor "List.cons" text (ctor "List.nil"))) expected)
+                              (if (eq (call sliced input) expected)
+                                (if (eq (call slicedLocal input) expected)
+                                  (if (eq (call indexedByte input) (gt (length input) 0)) input (bytes 254))
+                                  (bytes 254))
+                                (bytes 254)) (bytes 254)) (bytes 254))
+                          (bytes 254)) (bytes 254)) (bytes 254)) (bytes 254)) (bytes 254)) (bytes 254)))))))"#;
+    let (_, module) = parse_module(ir).unwrap();
+    let generated = prod_codegen::generate_module(&module).unwrap();
+    for name in ["single", "branch", "copied"] {
+        let body = generated
+            .split(&format!("pub fn {name}("))
+            .nth(1)
+            .unwrap()
+            .split("\npub fn ")
+            .next()
+            .unwrap();
+        assert!(
+            !body.contains(".clone()"),
+            "{name} must not clone a single-use/copy owner"
+        );
+    }
+    execute_owned_fixture(ir, include_str!("fixtures/match_binders_generated_test.rs"));
+}
+
 fn execute_owned_fixture(ir: &str, native_test: &str) {
     let (remaining, module) = parse_module(ir).unwrap();
     assert!(remaining.trim().is_empty());

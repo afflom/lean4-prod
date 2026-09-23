@@ -1,0 +1,22 @@
+{
+  "spec": "lean4-prod/lexlean-index-fixture/1",
+  "compiler_revision": "9c1456d34b896ab77db01c5e8ebbfed584edee26",
+  "compiler_crate_sha256": "94ee7d58bcbcc70dbb5b01fb4130e4f24f3fed314b3c63b2c252c431e53c2efb",
+  "compiler_semantics_id": "c56e1a234cee7c12f00e4f2f53d6094e2ed51f5bbf5195b60f79d4e8aa5bce53",
+  "build_id": "c9a8012bca376bc16511f5551414c6749a0855dfb9833d4eef07d6f86422aab3",
+  "semantic_id": "5cedc8d53de645695c31ed8994e2a236c78c71b94e86c41d17078e0234776203",
+  "source_id": "af9022ced666721b2fd6528b613517c7f559eae6c94bf790107e1a172e49bf0e",
+  "build_manifest_sha256": "e42ddfd32fe5280240558eb52331b70e7f636409e8575d9592109f67ad5b3d60",
+  "generated": [
+    {
+      "path": "lean/IndexFixture/Bytes.lean",
+      "source": "modules/IndexFixture/Bytes.lean",
+      "sha256": "217f17bf1fc63358bf8de85a1af7a456ce671a2373d5174aff4601368a4df17b"
+    },
+    {
+      "path": "lean/IndexFixture/Main.lean",
+      "source": "modules/IndexFixture/Main.lean",
+      "sha256": "8e465b1068915ab82d359244215f86e663cf498566ff845ae2371d31c0d8147c"
+    }
+  ]
+}

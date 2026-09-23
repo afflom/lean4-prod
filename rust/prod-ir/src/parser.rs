@@ -322,6 +322,7 @@ fn unary_operator(name: &str) -> Option<UnaryExpression> {
         "bit-not" => Expr::BitNot,
         "checked-convert" => Expr::CheckedConvert,
         "length" => Expr::Length,
+        "string-length" => Expr::StringLength,
         "utf8-encode" => Expr::Utf8Encode,
         "utf8-decode" => Expr::Utf8Decode,
         "parse-decimal" => Expr::ParseDecimal,

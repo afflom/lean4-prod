@@ -1,0 +1,26 @@
+\documentclass[11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\begin{document}
+\section*{Semantic declarations}
+\subsection*{\texttt{read}}
+\noindent Kind: \texttt{definition}.\par
+\noindent Type: \texttt{Option (UInt8)}.\par
+\noindent Definition: \texttt{IndexFixture.Bytes.byteAt (input) (offset)}.\par
+\noindent Axiom policy: \texttt{none}.\par
+\subsection*{\texttt{readSlice}}
+\noindent Kind: \texttt{definition}.\par
+\noindent Type: \texttt{Option (ByteArray)}.\par
+\noindent Definition: \texttt{IndexFixture.Bytes.sliceBytes (input) (start) (count)}.\par
+\noindent Axiom policy: \texttt{none}.\par
+\subsection*{\texttt{sliceEntry}}
+\noindent Kind: \texttt{definition}.\par
+\noindent Type: \texttt{ByteArray}.\par
+\noindent Definition: \texttt{(match readSlice (input) (1) (2) with | Option.none => ByteArray.mk \#[255] | Option.some bytes => bytes)}.\par
+\noindent Axiom policy: \texttt{none}.\par
+\subsection*{\texttt{entry}}
+\noindent Kind: \texttt{definition}.\par
+\noindent Type: \texttt{ByteArray}.\par
+\noindent Definition: \texttt{(match read (input) (3) with | Option.none => ByteArray.mk \#[255] | Option.some octet => (match (LexLeanRuntime.equal (octet) ((128 : UInt8)) : Bool) with | Bool.false => ByteArray.mk \#[0] | Bool.true => ByteArray.mk \#[1]))}.\par
+\noindent Axiom policy: \texttt{none}.\par
+\end{document}

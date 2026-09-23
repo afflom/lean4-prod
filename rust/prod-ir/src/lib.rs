@@ -102,6 +102,8 @@ pub enum Expr {
     CheckedConvert(Box<Expr>),
     Append(Box<Expr>, Box<Expr>),
     Length(Box<Expr>),
+    /// Unicode scalar count, distinct from byte or collection length.
+    StringLength(Box<Expr>),
     Index(Box<Expr>, Box<Expr>),
     Slice(Box<Expr>, Box<Expr>, Box<Expr>),
     Utf8Encode(Box<Expr>),
@@ -205,6 +207,7 @@ macro_rules! child_references {
             | Expr::BitNot(value)
             | Expr::CheckedConvert(value)
             | Expr::Length(value)
+            | Expr::StringLength(value)
             | Expr::Utf8Encode(value)
             | Expr::Utf8Decode(value)
             | Expr::ParseDecimal(value)
@@ -373,6 +376,7 @@ mod tests {
         "Slice",
         "SplitExact",
         "String",
+        "StringLength",
         "Sub",
         "Unreachable",
         "Utf8Decode",
@@ -406,6 +410,7 @@ mod tests {
             Expr::CheckedConvert(..) => "CheckedConvert",
             Expr::Append(..) => "Append",
             Expr::Length(..) => "Length",
+            Expr::StringLength(..) => "StringLength",
             Expr::Index(..) => "Index",
             Expr::Slice(..) => "Slice",
             Expr::Utf8Encode(..) => "Utf8Encode",
@@ -476,6 +481,7 @@ mod tests {
             (Expr::BitNot(bx("a")), vec!["a"]),
             (Expr::CheckedConvert(bx("a")), vec!["a"]),
             (Expr::Length(bx("a")), vec!["a"]),
+            (Expr::StringLength(bx("a")), vec!["a"]),
             (Expr::Utf8Encode(bx("a")), vec!["a"]),
             (Expr::Utf8Decode(bx("a")), vec!["a"]),
             (Expr::ParseDecimal(bx("a")), vec!["a"]),

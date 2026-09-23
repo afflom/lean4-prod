@@ -356,6 +356,92 @@ private def specializedByteAppend? (value : LetValue .pure)
   if !isExactByteAppend decl then return none
   return some s!"(append {← lookupFVar left} {← lookupFVar right})"
 
+/-- Admit only the retained mono body of bounds-checked byte indexing. A name
+    or specialization suffix is not evidence: the typed signature, comparison,
+    both branch results, array and offset must all match the closed operation. -/
+def isExactByteIndex (decl : Decl .pure) : Bool := Id.run do
+  let bytes := mkConst ``ByteArray
+  let nat := mkConst ``Nat
+  let octet := mkConst ``UInt8
+  let optional := mkApp (mkConst ``Option) octet
+  let #[input, offset] := decl.params | return false
+  if input.type != bytes || offset.type != nat then return false
+  let .forallE _ inputType (.forallE _ offsetType resultType _) _ := decl.type | return false
+  if inputType != bytes || offsetType != nat || resultType != optional then return false
+  let .code (.let data (.let size (.let guard (.cases cases)))) := decl.value | return false
+  let .const ``ByteArray.data _ #[.fvar source] := data.value | return false
+  let .const ``Array.size _ #[.erased, .fvar measured] := size.value | return false
+  let .const ``Nat.decLt _ #[.fvar index, .fvar bound] := guard.value | return false
+  if data.type != mkApp (mkConst ``Array) octet || size.type != nat ||
+      guard.type != mkConst ``Bool || source != input.fvarId ||
+      measured != data.fvarId || index != offset.fvarId || bound != size.fvarId ||
+      cases.typeName != ``Bool || cases.resultType != optional ||
+      cases.discr != guard.fvarId then return false
+  let #[.alt ``Bool.false #[] (.let missing (.return noneResult)),
+        .alt ``Bool.true #[] (.let element (.let present (.return someResult)))] := cases.alts
+    | return false
+  let .const ``Option.none _ #[.erased] := missing.value | return false
+  let .const ``Array.getInternal _ #[.erased, .fvar array, .fvar position, .erased] := element.value
+    | return false
+  let .const ``Option.some _ #[.erased, .fvar value] := present.value | return false
+  return missing.type == optional && element.type == octet && present.type == optional &&
+    array == data.fvarId && position == offset.fvarId && value == element.fvarId &&
+    noneResult == missing.fvarId && someResult == present.fvarId
+
+private def specializedByteIndex? (value : LetValue .pure)
+    (resultType : Option Expr) : LowerM (Option String) := do
+  let some (.app (.const ``Option _) (.const ``UInt8 _)) := resultType | return none
+  let .const name _ #[.fvar input, .fvar offset] := value | return none
+  if !isLexLeanRuntimeName name then return none
+  let types := (← get).fvarTypes
+  if types[input.name]? != some (mkConst ``ByteArray) ||
+      types[offset.name]? != some (mkConst ``Nat) then return none
+  let some decl ← getMonoDecl? name | return none
+  if !isExactByteIndex decl then return none
+  return some s!"(index {← lookupFVar input} {← lookupFVar offset})"
+
+/-- Recognize the exact retained mono body of bounded byte slicing. The upper
+    bound is start + count and must be checked before the same range is copied.
+    Overflowing target indices remain a rejected slice, never a wrapped range. -/
+def isExactByteSlice (decl : Decl .pure) : Bool := Id.run do
+  let bytes := mkConst ``ByteArray
+  let nat := mkConst ``Nat
+  let optional := mkApp (mkConst ``Option) bytes
+  let #[input, start, count] := decl.params | return false
+  if input.type != bytes || start.type != nat || count.type != nat then return false
+  let .forallE _ inputType (.forallE _ startType (.forallE _ countType resultType _) _) _ := decl.type
+    | return false
+  if inputType != bytes || startType != nat || countType != nat || resultType != optional then return false
+  let .code (.let upper (.let size (.let guard (.cases cases)))) := decl.value | return false
+  let .const ``Nat.add _ #[.fvar first, .fvar length] := upper.value | return false
+  let .const ``ByteArray.size _ #[.fvar measured] := size.value | return false
+  let .const ``Nat.decLe _ #[.fvar limit, .fvar bound] := guard.value | return false
+  if upper.type != nat || size.type != nat || guard.type != mkConst ``Bool ||
+      first != start.fvarId || length != count.fvarId || measured != input.fvarId ||
+      limit != upper.fvarId || bound != size.fvarId || cases.typeName != ``Bool ||
+      cases.resultType != optional || cases.discr != guard.fvarId then return false
+  let #[.alt ``Bool.false #[] (.let missing (.return noneResult)),
+        .alt ``Bool.true #[] (.let slice (.let present (.return someResult)))] := cases.alts
+    | return false
+  let .const ``Option.none _ #[.erased] := missing.value | return false
+  let .const ``ByteArray.extract _ #[.fvar source, .fvar lowerIndex, .fvar upperIndex] := slice.value | return false
+  let .const ``Option.some _ #[.erased, .fvar value] := present.value | return false
+  return missing.type == optional && slice.type == bytes && present.type == optional &&
+    source == input.fvarId && lowerIndex == start.fvarId && upperIndex == upper.fvarId &&
+    value == slice.fvarId && noneResult == missing.fvarId && someResult == present.fvarId
+
+private def specializedByteSlice? (value : LetValue .pure)
+    (resultType : Option Expr) : LowerM (Option String) := do
+  let some (.app (.const ``Option _) (.const ``ByteArray _)) := resultType | return none
+  let .const name _ #[.fvar input, .fvar start, .fvar count] := value | return none
+  if !isLexLeanRuntimeName name then return none
+  let types := (← get).fvarTypes
+  if types[input.name]? != some (mkConst ``ByteArray) ||
+      types[start.name]? != some (mkConst ``Nat) || types[count.name]? != some (mkConst ``Nat) then return none
+  let some decl ← getMonoDecl? name | return none
+  if !isExactByteSlice decl then return none
+  return some s!"(slice {← lookupFVar input} {← lookupFVar start} {← lookupFVar count})"
+
 private def isDictionaryResult (resultType : Option Expr) : LowerM Bool := do
   let some type := resultType | return false
   let some name ← liftM (Lean.Meta.MetaM.run' (Lean.Meta.isClass? type)) | return false
@@ -366,6 +452,14 @@ private def isDictionaryResult (resultType : Option Expr) : LowerM Bool := do
 def lowerLetValue (v : LetValue .pure) (resultType : Option Expr := none) : LowerM String := do
   if let some literal ← byteLiteral? v then return literal
   if let some append ← specializedByteAppend? v resultType then return append
+  -- String.length counts Unicode scalars, not the UTF-8 byte count returned by
+  -- the collection `length` opcode. Retain this distinction in typed IR.
+  if let .const ``String.length _ #[.fvar input] := v then
+    if let some (.const ``Nat _) := resultType then
+      if let some (.const ``String _) := (← get).fvarTypes[input.name]? then
+        return s!"(string-length {← lookupFVar input})"
+  if let some index ← specializedByteIndex? v resultType then return index
+  if let some slice ← specializedByteSlice? v resultType then return slice
   -- Lean can simplify a call through a byte-length wrapper to this builtin.
   -- Admit only its exact Bytes -> Nat shape, not a name-only external escape.
   if let .const ``ByteArray.size _ #[.fvar input] := v then
@@ -406,6 +500,10 @@ def lowerLetValue (v : LetValue .pure) (resultType : Option Expr := none) : Lowe
       if args'.size >= arity then
         let values := args'.extract (args'.size - arity) args'.size
         modify fun st => { st with dropped := st.dropped + (args'.size - arity) }
+        if op == "length" then
+          if let some (.fvar input) := args.back? then
+            if let some (.const ``String _) := (← get).fvarTypes[input.name]? then
+              return s!"(string-length{spaced values})"
         if op == "parse-decimal" then
           if let some target := resultType.bind decimalTarget? then
             return s!"(parse-decimal-as {target}{spaced values})"

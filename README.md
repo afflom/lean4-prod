@@ -172,9 +172,25 @@ The Rust code-generation APIs, including Cargo and Core-Wasm packages, preserve
 lexical parameter, let, match, and join-point scopes. Colliding local names are
 normalized deterministically before ownership analysis; already hygienic names
 retain their output bytes.
+Local spellings that are not Rust Unicode-XID identifiers receive fresh names;
+collision checks use Rust's NFC identity, so distinct IR locals such as `K` and
+`K` remain distinct without rewriting valid, noncolliding Unicode spellings.
+This local-binding boundary does not rename global definitions or types.
 Positional parameters still refer to the original formal parameters under
 shadowing. Duplicate names within one parameter or pattern-binding group are
 rejected as `DuplicateBinding`, rather than choosing an ambiguous binding.
+
+Imported LexLean byte-index wrappers retain an exact typed bounds-check after
+Lean monomorphization. Lowering recognizes that body, not its generated name.
+`just specialized-index` verifies the unchanged LexLean fixture, rejects 18
+altered bodies, and checks native std/no_std plus debug/release Wasm boundaries
+and deterministic bytes.
+
+Imported byte slicing likewise requires the exact typed `start + count <= size`
+guard and extraction of that same range. Overflowing indices, excessive counts
+and out-of-range starts return `None`; they cannot wrap into an admitted range.
+The fixture additionally rejects 21 altered slice bodies and exercises native
+and bounded Wasm slicing alongside indexing.
 
 Eligible self-tail recursion lowers to explicit loops in value-returning
 functions, including fallible and owned results. Parallel parameter assignment
@@ -184,6 +200,12 @@ recursion retain their existing lowering. The transformation adds no heap,
 runtime stack or ABI, and does not establish termination of arbitrary raw IR.
 The regression executes 100,000 steps in native std/no_std at O0/O3 and in
 debug/release Core-Wasm with an unchanged 64-KiB stack.
+
+String length lowers to an explicit `string-length` IR operation: Unicode
+scalar count, not UTF-8 bytes or grapheme clusters. The `length` collection
+operation retains its byte/element meaning. `just scalar-length` checks the
+unchanged LexLean source, every Unicode scalar in native std/no_std at O0/O3,
+mixed strings and record fields, and deterministic bounded debug/release Wasm.
 
 ### C headers and foreign-function calls
 
@@ -232,6 +254,12 @@ All SDKs target the same scalar C ABI (`Nat`/`Int`/`Bool`) and the same status
 codes, so the compiled Rust library remains the single implementation. The
 TypeScript binding accepts a native function loader (for example `koffi` or
 `ffi-napi`), Python uses `ctypes`, and Kotlin uses JNA.
+
+Scalar wrappers independently normalize parameter names that collide with a
+target language keyword, imported helper, temporary, or callee. One positional
+mapping is shared by all six adapters; safe names retain their bytes, and
+exported symbols, scalar types, argument order, and status handling are unchanged.
+This parameter boundary does not rename global definitions or generated types.
 
 To generate only one language, use a language-specific recipe:
 

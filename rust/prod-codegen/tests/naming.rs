@@ -255,3 +255,146 @@ fn bare_host_constructor_and_pattern_names_cannot_be_captured() {
         run(&mut Command::new(&binary));
     }
 }
+
+#[test]
+fn raw_local_identifiers_preserve_distinct_scopes_and_unicode_in_all_rust_targets() {
+    // These spellings are accepted by the public parser, not invented AST-only inputs.
+    let definitions = r#"
+      (def first ((a-b Nat) (a.b Nat) (a_b Nat) (prod_local_0 Nat)) Nat a-b)
+      (def second ((a-b Nat) (a.b Nat) (a_b Nat) (prod_local_0 Nat)) Nat (param 1))
+      (def third ((a-b Nat) (a.b Nat) (a_b Nat) (prod_local_0 Nat)) Nat a_b)
+      (def fourth ((a-b Nat) (a.b Nat) (a_b Nat) (prod_local_0 Nat)) Nat prod_local_0)
+      (def digit ((1x Nat) (١x Nat) (² Nat)) Nat (if (eq (param 0) 11) (if (eq (param 1) 22) (param 2) 0) 0))
+      (def shadow ((a-b Nat)) Nat (let a-b 99 (param 0)))
+      (def lexical ((a-b Nat)) Nat (let a.b 22 (let x-y 33 (if (eq a-b 11) (if (eq a.b 22) x-y 0) 0))))
+      (def pattern ((input (Option Nat))) Nat (cases input (alt "Option.none" () 0) (alt "Option.some" (a.b) a.b)))
+      (def joins ((a-b Nat)) Nat (let g.h (jp g.h (x-y) x-y) (jmp g.h a-b)))
+      (def siblings ((choice Bool)) Nat (if choice (let a-b 11 a-b) (let a-b 22 a-b)))
+      (def unicode ((é Nat) (東京 Nat) (β Nat)) Nat (if (eq é 11) (if (eq 東京 22) β 0) 0))
+      (def equivalent ((K Nat) (K Nat)) Nat (if (eq K 11) K 0))
+      (def K ((input Nat)) Nat input)
+      (def unicode_callee ((K Nat)) Nat (call K K))
+      (def nonjoiner ((control Nat)) Nat (param 0))
+      (def joiner ((control Nat)) Nat (param 0))
+      (def decomposed ((first Nat) (second Nat)) Nat (if (eq (param 0) 11) (param 1) 0))
+    "#;
+    let checks = [
+        ("(call first 11 22 33 44)", 11),
+        ("(call second 11 22 33 44)", 22),
+        ("(call third 11 22 33 44)", 33),
+        ("(call fourth 11 22 33 44)", 44),
+        ("(call digit 11 22 33)", 33),
+        ("(call shadow 11)", 11),
+        ("(call lexical 11)", 33),
+        ("(call pattern (ctor \"Option.some\" 44))", 44),
+        ("(call pattern (ctor \"Option.none\"))", 0),
+        ("(call joins 44)", 44),
+        ("(call siblings (ctor \"Bool.true\"))", 11),
+        ("(call siblings (ctor \"Bool.false\"))", 22),
+        ("(call unicode 11 22 33)", 33),
+        ("(call equivalent 11 22)", 22),
+        ("(call unicode_callee 44)", 44),
+        ("(call nonjoiner 11)", 11),
+        ("(call joiner 22)", 22),
+        ("(call decomposed 11 22)", 22),
+    ];
+    let entry = checks
+        .iter()
+        .rev()
+        .fold("input".to_owned(), |body, (call, result)| {
+            format!("(if (eq {call} {result}) {body} (bytes 254))")
+        });
+    let input =
+        format!("(module RawNames {definitions} (def entry ((input Bytes)) Bytes {entry}))");
+    let (remaining, mut module) = parse_module(&input).unwrap();
+    assert!(remaining.trim().is_empty());
+    // The public AST also permits spellings outside the textual token grammar.
+    for definition in &mut module.definitions {
+        match definition.name.as_str() {
+            "nonjoiner" => definition.params[0].0 = "a\u{200c}b".into(),
+            "joiner" => definition.params[0].0 = "a\u{200d}b".into(),
+            "decomposed" => {
+                definition.params[0].0 = "e\u{301}".into();
+                definition.params[1].0 = "é".into();
+            }
+            _ => {}
+        }
+    }
+    let fixture = Fixture::new();
+    let generated = generate_module(&module).unwrap();
+    for no_std in [false, true] {
+        let source = fixture.0.join("raw.rs");
+        fs::write(
+            &source,
+            format!(
+                "{}\nextern crate alloc;\n{generated}\n{}",
+                if no_std { "#![no_std]" } else { "" },
+                r#"
+            #[test] fn distinct_results() {
+                assert_eq!(first(11,22,33,44),11); assert_eq!(second(11,22,33,44),22);
+                assert_eq!(third(11,22,33,44),33); assert_eq!(fourth(11,22,33,44),44);
+                assert_eq!(digit(11,22,33),33); assert_eq!(shadow(11),11);
+                assert_eq!(lexical(11),33); assert_eq!(pattern(Some(44)),44);
+                assert_eq!(pattern(None),0); assert_eq!(joins(44),44);
+                assert_eq!(siblings(true),11); assert_eq!(siblings(false),22);
+                assert_eq!(unicode(11,22,33),33); assert_eq!(equivalent(11,22),22);
+                assert_eq!(unicode_callee(44),44);
+                assert_eq!(nonjoiner(11),11); assert_eq!(joiner(22),22);
+                assert_eq!(decomposed(11,22),22);
+                for bytes in [b"".as_slice(), b"distinct", "é\0東京".as_bytes(), &[255]] {
+                    assert_eq!(entry(bytes.to_vec()),bytes);
+                }
+            }
+        "#
+            ),
+        )
+        .unwrap();
+        let binary = fixture.0.join(if no_std { "no-std" } else { "std" });
+        run(Command::new("rustc")
+            .args(["--edition=2021", "--test"])
+            .arg(source)
+            .arg("-o")
+            .arg(&binary));
+        run(&mut Command::new(binary));
+    }
+    // Direct definition output remains byte-identical for valid noncolliding Unicode.
+    let (_, benign) =
+        parse_module("(module Names (def unchanged ((é Nat) (東京 Nat) (β Nat)) Nat β))").unwrap();
+    assert_eq!(
+        generate_def(&benign.definitions[0]).unwrap(),
+        "pub fn unchanged(é: u64, 東京: u64, β: u64) -> u64 {\n    β\n}\n"
+    );
+    let guest = generate_core_wasm_package(
+        &module,
+        &CoreWasmSpec {
+            crate_name: "raw-local-guest".into(),
+            entry: "entry".into(),
+            export_name: "holo_run".into(),
+            input_allocation_cap: 128,
+            output_allocation_cap: 128,
+            maximum_pages: 4,
+            input_ir_sha256: format!("{:x}", Sha256::digest(input.as_bytes())),
+        },
+    )
+    .unwrap();
+    for file in guest.files {
+        let path = fixture.0.join("guest").join(file.path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, file.bytes).unwrap();
+    }
+    run(Command::new("cargo")
+        .current_dir(fixture.0.join("guest"))
+        .args(["build", "--release", "--locked", "--offline"])
+        .env_remove("RUSTC_WRAPPER")
+        .env("CARGO_TARGET_DIR", fixture.0.join("guest-target")));
+    run(Command::new("node")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/borrowed_utf8_wasm_test.mjs"
+        ))
+        .arg(
+            fixture
+                .0
+                .join("guest-target/wasm32-unknown-unknown/release/raw_local_guest.wasm"),
+        ));
+}

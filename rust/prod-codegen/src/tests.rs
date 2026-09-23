@@ -13,6 +13,124 @@ fn generate_err(ir: &str) -> Error {
     generate_module(&module).unwrap_err()
 }
 
+#[test]
+fn unused_eager_join_arguments_still_reject_unsupported_ir() {
+    for (argument, expected) in [
+        (
+            r#"(extern "Missing.fn")"#,
+            Error::UnresolvedCall(String::from("Missing.fn")),
+        ),
+        (
+            r#"(opaque "unsupported")"#,
+            Error::OpaqueExpr(String::from("unsupported")),
+        ),
+        (
+            r#"(let hidden (extern "Missing.fn") 1)"#,
+            Error::UnresolvedCall(String::from("Missing.fn")),
+        ),
+        (
+            r#"(if true 0 (opaque "unsupported"))"#,
+            Error::OpaqueExpr(String::from("unsupported")),
+        ),
+    ] {
+        let input = format!(
+            "(module M (def probe () Nat (let continuation (jp continuation (unused) 7) (jmp continuation {argument}))))"
+        );
+        let (remaining, module) = parse_module(&input).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(generate_module(&module), Err(expected), "{argument}");
+    }
+}
+
+#[test]
+fn computed_eager_list_arguments_do_not_enter_lazy_builders() {
+    for argument in [
+        "(ctor \"List.cons\" (add input 1) (ctor \"List.nil\"))",
+        "(if true (ctor \"List.cons\" (add input 1) (ctor \"List.nil\")) (ctor \"List.nil\"))",
+        "(let list (ctor \"List.cons\" (add input 1) (ctor \"List.nil\")) list)",
+        "(cases true (alt \"Bool.true\" () (ctor \"List.cons\" (add input 1) (ctor \"List.nil\"))) (alt \"Bool.false\" () (ctor \"List.nil\")))",
+    ] {
+        let input = format!(
+            "(module M (def probe ((input Nat)) (List Nat) (let g (jp g (unused) (ctor \"List.nil\")) (jmp g {argument}))))"
+        );
+        assert!(matches!(generate_err(&input), Error::UnsupportedList(_)), "{argument}");
+    }
+    // The second expansion renames the repeated formal. Its eager identity
+    // must survive that normalization instead of becoming an ordinary lazy let.
+    assert!(matches!(
+        generate_err(
+            r#"(module M (def probe ((input Nat)) (List Nat)
+          (let g (jp g (unused) (ctor "List.nil"))
+            (if (eq input 0)
+              (jmp g (ctor "List.cons" 1 (ctor "List.nil")))
+              (jmp g (ctor "List.cons" (add input 1) (ctor "List.nil")))))))"#
+        ),
+        Error::UnsupportedList(_)
+    ));
+    assert!(matches!(
+        generate_err(
+            r#"(module M (def probe () (List Nat)
+          (let g (jp g (unused) (ctor "List.nil"))
+            (jmp g (ctor "List.cons" (unreachable) (ctor "List.nil"))))))"#
+        ),
+        Error::UnsupportedList(_)
+    ));
+    assert_eq!(
+        generate_err(
+            r#"(module M (def probe ((input Nat)) (List Nat)
+          (let g (jp g (unused) (ctor "List.nil"))
+            (jmp g (ctor "List.cons" (extern "Missing.fn") (ctor "List.nil"))))))"#
+        ),
+        Error::UnresolvedCall(String::from("Missing.fn"))
+    );
+    // Scalar continuations inside a constant list head remain supported.
+    let source = generate(
+        r#"(module M (def probe () (List Nat)
+      (ctor "List.cons" (let g (jp g (value) value) (jmp g 7)) (ctor "List.nil"))))"#,
+    );
+    assert!(source.contains("&'static [u64]"));
+}
+
+#[test]
+fn eager_list_pattern_results_cannot_allocate_behind_builder_guards() {
+    assert!(matches!(
+        generate_err(
+            r#"(module M (def probe ((input (List Nat))) (List Nat)
+          (let g (jp g (unused) (ctor "List.nil")) (jmp g (append input input)))))"#
+        ),
+        Error::UnsupportedList(_)
+    ));
+    for argument in [
+        r#"(cases (ctor "Wrapped.mk" (ctor "List.cons" (add input 1) (ctor "List.nil")))
+          (alt "Wrapped.mk" (items) items))"#,
+        r#"(cases (ctor "Option.some" (ctor "List.cons" (add input 1) (ctor "List.nil")))
+          (alt "Option.some" (items) items) (alt "Option.none" () (ctor "List.nil")))"#,
+        r#"(cases (ctor "List.cons" input (ctor "List.nil"))
+          (alt "List.cons" (head tail) tail) (alt "List.nil" () (ctor "List.nil")))"#,
+    ] {
+        let input = format!(
+            r#"(module M
+          (type "Wrapped" (ctor "Wrapped.mk" (items (List Nat))))
+          (def probe ((input Nat)) (List Nat)
+            (let g (jp g (unused) (ctor "List.nil")) (jmp g {argument}))))"#
+        );
+        assert!(
+            matches!(generate_err(&input), Error::UnsupportedList(_)),
+            "{argument}"
+        );
+    }
+    let source = generate(
+        r#"(module M
+      (type "Wrapped" (ctor "Wrapped.mk" (value Nat)))
+      (def probe ((input Nat)) (List Nat)
+        (let g (jp g (unused) (ctor "List.nil"))
+          (jmp g (cases (ctor "Wrapped.mk" input)
+            (alt "Wrapped.mk" (value) value))))))"#,
+    );
+    assert!(source.contains("match"));
+    assert!(!source.contains("alloc::vec"));
+}
+
 fn package_file<'a>(package: &'a GeneratedPackage, path: &str) -> &'a [u8] {
     &package
         .files
@@ -490,7 +608,7 @@ fn test_generate_class_index() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn classIndex(h2: u64, d: u64, l: u64, inst: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok(u64::checked_add(u64::checked_mul(stride(inst), h2).ok_or(crate::ComputeError::MulOverflow)?, u64::checked_add(u64::checked_mul((inst).O, d).ok_or(crate::ComputeError::MulOverflow)?, l).ok_or(crate::ComputeError::AddOverflow)?).ok_or(crate::ComputeError::AddOverflow)?)\n}\n\npub fn belt(inst: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok(u64::checked_mul(class_count(inst), u64::checked_shl(1, u32::try_from(core::convert::identity::<u64>(u64::saturating_sub((inst).O, 1))).map_err(|_| crate::ComputeError::ShiftExponentTooLarge)?).ok_or(crate::ComputeError::ShiftOverflow)?).ok_or(crate::ComputeError::MulOverflow)?)\n}\n\n"
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn classIndex(h2: u64, d: u64, l: u64, inst: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok(core::convert::identity::<u64>(core::convert::identity::<u64>(stride(inst)).checked_mul(h2).ok_or(crate::ComputeError::MulOverflow)?).checked_add(core::convert::identity::<u64>(core::convert::identity::<u64>((inst).O).checked_mul(d).ok_or(crate::ComputeError::MulOverflow)?).checked_add(l).ok_or(crate::ComputeError::AddOverflow)?).ok_or(crate::ComputeError::AddOverflow)?)\n}\n\npub fn belt(inst: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok(core::convert::identity::<u64>(class_count(inst)).checked_mul(core::convert::identity::<u64>(1).checked_shl(u32::try_from(core::convert::identity::<u64>(core::convert::identity::<u64>((inst).O).saturating_sub(1))).map_err(|_| crate::ComputeError::ShiftExponentTooLarge)?).ok_or(crate::ComputeError::ShiftOverflow)?).ok_or(crate::ComputeError::MulOverflow)?)\n}\n\n"
     );
 }
 
@@ -530,7 +648,7 @@ fn test_generate_list_param_is_a_slice_and_return_is_a_buffer() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn digitSum(xs: &[u64]) -> Result<u64, crate::ComputeError> {\n    Ok(match xs {\n        [] => 0,\n        [h, t @ ..] => { let h = h.clone(); u64::checked_add(h, digitSum(&(t))?).ok_or(crate::ComputeError::AddOverflow)? },\n    })\n}\n\npub fn digits(n: u64, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    if (n < 8) { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = n; let __len0 = Ok::<usize, crate::ComputeError>(0)?; Ok(__len0 + 1) } } } else { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = if (8) == 0 { 0 } else { (n) % (8) }; let __len0 = digits(if (8) == 0 { 0 } else { (n) / (8) }, __rest0)?; Ok(__len0 + 1) } } }\n}\n\n"
+        "pub fn digitSum(xs: &[u64]) -> Result<u64, crate::ComputeError> {\n    Ok(match xs {\n        [] => 0,\n        [h, t @ ..] => { let h = h.clone(); core::convert::identity::<u64>(h).checked_add(digitSum(&(t))?).ok_or(crate::ComputeError::AddOverflow)? },\n    })\n}\n\npub fn digits(n: u64, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    if (n < 8) { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = n; let __len0 = Ok::<usize, crate::ComputeError>(0)?; Ok(__len0 + 1) } } } else { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = match (core::convert::identity::<u64>(n), core::convert::identity::<u64>(8)) { (__left, 0) => __left, (__left, __right) => __left % __right }; let __len0 = digits(match (core::convert::identity::<u64>(n), core::convert::identity::<u64>(8)) { (__left, 0) => 0, (__left, __right) => __left / __right }, __rest0)?; Ok(__len0 + 1) } } }\n}\n\n"
     );
 }
 
@@ -561,7 +679,7 @@ fn test_generate_list_builder_resolves_anf_let_bindings() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn digits(fuel: u64, n: u64, i: crate::Instance, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    match fuel {\n        0 => Ok::<usize, crate::ComputeError>(0),\n        _ => { let n_25 = (fuel).saturating_sub(1); { let _x_47 = (i).O; if (n < _x_47) { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = n; let __len0 = Ok::<usize, crate::ComputeError>(0)?; Ok(__len0 + 1) } } } else { { let _x_50 = if (_x_47) == 0 { 0 } else { (n) % (_x_47) }; { let _x_51 = if (_x_47) == 0 { 0 } else { (n) / (_x_47) }; match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = _x_50; let __len0 = digits(n_25, _x_51, i, __rest0)?; Ok(__len0 + 1) } } } } } } },\n    }\n}\n\n"
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn digits(fuel: u64, n: u64, i: crate::Instance, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    match fuel {\n        0 => Ok::<usize, crate::ComputeError>(0),\n        _ => { let n_25 = (fuel).saturating_sub(1); { let _x_47 = (i).O; if (n < _x_47) { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = n; let __len0 = Ok::<usize, crate::ComputeError>(0)?; Ok(__len0 + 1) } } } else { { let _x_50 = match (core::convert::identity::<u64>(n), core::convert::identity::<u64>(_x_47)) { (__left, 0) => __left, (__left, __right) => __left % __right }; { let _x_51 = match (core::convert::identity::<u64>(n), core::convert::identity::<u64>(_x_47)) { (__left, 0) => 0, (__left, __right) => __left / __right }; match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = _x_50; let __len0 = digits(n_25, _x_51, i, __rest0)?; Ok(__len0 + 1) } } } } } } },\n    }\n}\n\n"
     );
 }
 
@@ -604,7 +722,7 @@ fn test_fallibility_is_precise_not_uniform() {
     assert!(out.contains("Ok(risky(x)?)"));
     // A recursive definition reaches its own fixpoint.
     assert!(out.contains("pub fn loops(fuel: u64, x: u64) -> Result<u64, crate::ComputeError> {"));
-    assert!(out.contains("loops(k, u64::checked_add(x, 1)"));
+    assert!(out.contains("loops(k, core::convert::identity::<u64>(x).checked_add(1)"));
 }
 
 #[test]
@@ -766,7 +884,7 @@ fn test_generate_nat_cases_recursion() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn digitCount(fuel: u64, n: u64) -> Result<u64, crate::ComputeError> {\n    Ok(match fuel {\n        0 => 0,\n        _ => { let k = (fuel).saturating_sub(1); if (n < 8) { 1 } else { u64::checked_add(1, digitCount(k, if (8) == 0 { 0 } else { (n) / (8) })?).ok_or(crate::ComputeError::AddOverflow)? } },\n    })\n}\n\n"
+        "pub fn digitCount(fuel: u64, n: u64) -> Result<u64, crate::ComputeError> {\n    Ok(match fuel {\n        0 => 0,\n        _ => { let k = (fuel).saturating_sub(1); if (n < 8) { 1 } else { core::convert::identity::<u64>(1).checked_add(digitCount(k, match (core::convert::identity::<u64>(n), core::convert::identity::<u64>(8)) { (__left, 0) => 0, (__left, __right) => __left / __right })?).ok_or(crate::ComputeError::AddOverflow)? } },\n    })\n}\n\n"
     );
 }
 
@@ -839,7 +957,7 @@ fn test_generate_kernel_ir_shapes() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn stride(i: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok({ let _x_4 = (i).T; { let _x_5 = (i).O; { let _x_13 = u64::checked_mul(_x_4, _x_5).ok_or(crate::ComputeError::MulOverflow)?; _x_13 } } })\n}\n\npub fn classDecode(idx: u64, i: crate::Instance) -> Result<(u64, (u64, u64)), crate::ComputeError> {\n    Ok({ let _x_4 = stride(i)?; { let h2 = if (_x_4) == 0 { 0 } else { (idx) / (_x_4) }; { let rem = if (_x_4) == 0 { 0 } else { (idx) % (_x_4) }; { let _x_10 = (i).O; { let d = if (_x_10) == 0 { 0 } else { (rem) / (_x_10) }; { let l = if (_x_10) == 0 { 0 } else { (rem) % (_x_10) }; { let _x_13 = (d, l); { let _x_14 = (h2, _x_13); _x_14 } } } } } } } })\n}\n\n"
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Instance {\n    pub q: u64,\n    pub T: u64,\n    pub O: u64,\n}\n\npub fn stride(i: crate::Instance) -> Result<u64, crate::ComputeError> {\n    Ok({ let _x_4 = (i).T; { let _x_5 = (i).O; { let _x_13 = core::convert::identity::<u64>(_x_4).checked_mul(_x_5).ok_or(crate::ComputeError::MulOverflow)?; _x_13 } } })\n}\n\npub fn classDecode(idx: u64, i: crate::Instance) -> Result<(u64, (u64, u64)), crate::ComputeError> {\n    Ok({ let _x_4 = stride(i)?; { let h2 = match (core::convert::identity::<u64>(idx), core::convert::identity::<u64>(_x_4)) { (__left, 0) => 0, (__left, __right) => __left / __right }; { let rem = match (core::convert::identity::<u64>(idx), core::convert::identity::<u64>(_x_4)) { (__left, 0) => __left, (__left, __right) => __left % __right }; { let _x_10 = (i).O; { let d = match (core::convert::identity::<u64>(rem), core::convert::identity::<u64>(_x_10)) { (__left, 0) => 0, (__left, __right) => __left / __right }; { let l = match (core::convert::identity::<u64>(rem), core::convert::identity::<u64>(_x_10)) { (__left, 0) => __left, (__left, __right) => __left % __right }; { let _x_13 = (d, l); { let _x_14 = (h2, _x_13); _x_14 } } } } } } } })\n}\n\n"
     );
 }
 
@@ -938,6 +1056,7 @@ fn test_every_error_variant_is_published_in_rejections() {
         Error::UnresolvedCall(s()),
         Error::UnknownField(s(), s()),
         Error::UnsupportedJoinPoint(s()),
+        Error::JoinExpansionLimit,
         Error::DuplicateBinding(s()),
     ];
 
@@ -956,6 +1075,7 @@ fn test_every_error_variant_is_published_in_rejections() {
             Error::UnresolvedCall(_) => "UnresolvedCall",
             Error::UnknownField(..) => "UnknownField",
             Error::UnsupportedJoinPoint(_) => "UnsupportedJoinPoint",
+            Error::JoinExpansionLimit => "JoinExpansionLimit",
             Error::DuplicateBinding(_) => "DuplicateBinding",
         };
         assert!(
@@ -1026,7 +1146,7 @@ fn test_generate_jp_jmp_inlined() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn f(x: u64) -> Result<u64, crate::ComputeError> {\n    Ok({ let g = /* jp \"g\" inlined at its jump site */ (); { let a = x; u64::checked_add(a, 1).ok_or(crate::ComputeError::AddOverflow)? } })\n}\n\n"
+        "pub fn f(x: u64) -> Result<u64, crate::ComputeError> {\n    Ok({ let a = x; core::convert::identity::<u64>(a).checked_add(1).ok_or(crate::ComputeError::AddOverflow)? })\n}\n\n"
     );
 }
 
@@ -1061,10 +1181,10 @@ fn test_multi_caller_acyclic_join_point_is_inlined_at_every_jump() {
 )
 "#;
     let out = generate(ir);
-    assert_eq!(out.matches("let a =").count(), 2);
-    assert_eq!(out.matches("u64::checked_add(a, 1)").count(), 2);
+    assert_eq!(out.matches("let ").count(), 2);
+    assert_eq!(out.matches("checked_add(1)").count(), 2);
     assert!(out.contains("let a = x"));
-    assert!(out.contains("let a = c"));
+    assert!(out.contains(" = c;"));
 }
 
 #[test]
@@ -1077,7 +1197,7 @@ fn test_join_point_with_no_callers_still_renders() {
     (jp g (a) x))
 )
 "#;
-    assert!(generate(ir).contains("no jump sites"));
+    assert_eq!(generate(ir), "pub fn f(x: u64) -> u64 {\n    x\n}\n\n");
 }
 
 #[test]
@@ -1091,7 +1211,7 @@ fn test_generate_pow() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn belt(i: u64) -> Result<u64, crate::ComputeError> {\n    Ok(u64::checked_pow(2, u32::try_from(core::convert::identity::<u64>(u64::saturating_sub(i, 1))).map_err(|_| crate::ComputeError::PowExponentTooLarge)?).ok_or(crate::ComputeError::PowOverflow)?)\n}\n\n"
+        "pub fn belt(i: u64) -> Result<u64, crate::ComputeError> {\n    Ok(core::convert::identity::<u64>(2).checked_pow(u32::try_from(core::convert::identity::<u64>(core::convert::identity::<u64>(i).saturating_sub(1))).map_err(|_| crate::ComputeError::PowExponentTooLarge)?).ok_or(crate::ComputeError::PowOverflow)?)\n}\n\n"
     );
 }
 
@@ -1109,7 +1229,7 @@ fn test_generate_shr() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn half(n: u64, k: u64) -> u64 {\n    u64::checked_shr(n, u32::try_from(core::convert::identity::<u64>(k)).unwrap_or(u32::MAX)).unwrap_or(0)\n}\n\n"
+        "pub fn half(n: u64, k: u64) -> u64 {\n    core::convert::identity::<u64>(n).checked_shr(u32::try_from(core::convert::identity::<u64>(k)).unwrap_or(u32::MAX)).unwrap_or(0)\n}\n\n"
     );
 }
 
@@ -1145,12 +1265,12 @@ fn test_generate_nat_arithmetic_policy_never_panics() {
 )
 "#;
     let out = generate(ir);
-    assert!(out.contains("u64::checked_add(x, y).ok_or(crate::ComputeError::AddOverflow)?"));
-    assert!(out.contains("u64::saturating_sub(x, y)"));
-    assert!(out.contains("if (y) == 0 { 0 } else { (x) / (y) }"));
-    assert!(out.contains("if (y) == 0 { 0 } else { (x) % (y) }"));
-    assert!(out.contains("u64::checked_shl(x, u32::try_from(core::convert::identity::<u64>(y)).map_err(|_| crate::ComputeError::ShiftExponentTooLarge)?).ok_or(crate::ComputeError::ShiftOverflow)?"));
-    assert!(out.contains("u64::checked_pow(x, u32::try_from(core::convert::identity::<u64>(y)).map_err(|_| crate::ComputeError::PowExponentTooLarge)?).ok_or(crate::ComputeError::PowOverflow)?"));
+    assert!(out.contains("checked_add(y).ok_or(crate::ComputeError::AddOverflow)?"));
+    assert!(out.contains("saturating_sub(y)"));
+    assert!(out.contains("match (core::convert::identity::<u64>(x), core::convert::identity::<u64>(y)) { (__left, 0) => 0, (__left, __right) => __left / __right }"));
+    assert!(out.contains("match (core::convert::identity::<u64>(x), core::convert::identity::<u64>(y)) { (__left, 0) => __left, (__left, __right) => __left % __right }"));
+    assert!(out.contains("checked_shl(u32::try_from(core::convert::identity::<u64>(y)).map_err(|_| crate::ComputeError::ShiftExponentTooLarge)?).ok_or(crate::ComputeError::ShiftOverflow)?"));
+    assert!(out.contains("checked_pow(u32::try_from(core::convert::identity::<u64>(y)).map_err(|_| crate::ComputeError::PowExponentTooLarge)?).ok_or(crate::ComputeError::PowOverflow)?"));
     // The whole point: no panicking exit remains in the arithmetic lowering.
     assert!(!out.contains(".expect("));
     assert!(!out.contains(".unwrap("));

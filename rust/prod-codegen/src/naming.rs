@@ -35,10 +35,20 @@ struct Names {
     buffer: bool,
     protected: BTreeSet<String>,
     formals: Vec<String>,
+    tracked_sources: BTreeSet<String>,
+    tracked_bindings: BTreeSet<String>,
 }
 
 impl Names {
     fn bind(&mut self, original: &str) -> String {
+        let bound = self.bind_name(original);
+        if self.tracked_sources.contains(original) {
+            self.tracked_bindings.insert(bound.clone());
+        }
+        bound
+    }
+
+    fn bind_name(&mut self, original: &str) -> String {
         let rendered = crate::rust_local_ident(original);
         let key = collision_key(&rendered);
         let indexed_buffer_temporary = self.buffer
@@ -253,6 +263,18 @@ pub(crate) fn normalize_definition(
     emitted_call_name: &impl Fn(&str) -> String,
     types: &TypeTable<'_>,
 ) -> Result<Definition, Error> {
+    normalize_tracking(definition, emitted_call_name, types, &BTreeSet::new())
+        .map(|(definition, _)| definition)
+}
+
+/// Carry compiler-owned binder identity through renaming without reserving a
+/// user-spellable prefix or treating coincidentally named raw IR specially.
+pub(crate) fn normalize_tracking(
+    definition: &Definition,
+    emitted_call_name: &impl Fn(&str) -> String,
+    types: &TypeTable<'_>,
+    tracked_sources: &BTreeSet<String>,
+) -> Result<(Definition, BTreeSet<String>), Error> {
     distinct_bindings(definition.params.iter().map(|(name, _)| name.as_str()))?;
     let mut result = definition.clone();
     let mut reserved = BTreeSet::new();
@@ -286,6 +308,8 @@ pub(crate) fn normalize_definition(
         buffer,
         protected: temporaries.iter().map(|name| collision_key(name)).collect(),
         formals: Vec::new(),
+        tracked_sources: tracked_sources.clone(),
+        tracked_bindings: BTreeSet::new(),
     };
     let mut variables = Scope::new();
     for (name, _) in &mut result.params {
@@ -295,7 +319,7 @@ pub(crate) fn normalize_definition(
         names.formals.push(name.clone());
     }
     names.rewrite(&mut result.body, &variables, &Scope::new())?;
-    Ok(result)
+    Ok((result, names.tracked_bindings))
 }
 
 #[cfg(test)]

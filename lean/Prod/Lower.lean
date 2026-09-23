@@ -1,5 +1,6 @@
 import Lean
 import Prod.Attribute
+import Prod.LocalFunctions
 
 /-!
 # LCNF → sexp IR lowering
@@ -47,9 +48,10 @@ corresponding IR nodes. Design decisions:
   `cases`. Lowered directly to the IR comparison expression `(lt|le|eq a b)`,
   which is valid outside an `if` too. Same immediately-bound-shape caveat as
   above; anything else still lowers as an extern call to `decide`.
-- **Closures** (`Code.fun`) lower to `(opaque "<name>-closure")` plus a
-  coverage note — closures are phase-2 work. Impure-phase-only constructors
-  never occur at the pure phase; wildcard arms keep the matches total.
+- **First-order local functions** are validated as saturated, non-escaping and
+  acyclic, then emitted as expression-valued IR continuations. Rust's bounded
+  continuation expansion preserves caller continuations, captures and eager
+  argument order. General higher-order/runtime closures remain unsupported.
 -/
 
 open Lean Compiler LCNF
@@ -77,6 +79,7 @@ structure LowerState where
   opaques : Array String := #[]            -- opaque markers emitted
   externs : Array String := #[]            -- non-tagged, non-whitelisted calls
   dropped : Nat := 0                       -- erased/type args dropped
+  localFunctions : Std.HashSet Name := {}
 
 abbrev LowerM := ReaderT LowerCtx (StateRefT LowerState CoreM)
 
@@ -448,6 +451,8 @@ def lowerLetValue (v : LetValue .pure) (resultType : Option Expr := none) : Lowe
   | .fvar f args => do
     let nm ← lookupFVar f
     let args' ← lowerArgs args
+    if (← get).localFunctions.contains f.name then
+      return s!"(jmp {nm}{spaced args'})"
     match (← get).knownOps[nm]? with
     | some op =>
       if args'.size == 2 then return s!"({op} {args'[0]!} {args'[1]!})"
@@ -551,11 +556,7 @@ partial def lowerCode : Code .pure → LowerM String
         let val ← lowerLetValue value (some decl.type)
         let body ← lowerCode k
         return s!"(let {nm} {val} {body})"
-  | .fun (.mk fid bn _ _ _) k => do
-    let nm ← registerFVar fid bn
-    let val ← opaqueNode s!"{nm}-closure"
-    let body ← lowerCode k
-    return s!"(let {nm} {val} {body})"
+  | .fun (.mk fid bn ps _ v) k
   | .jp (.mk fid bn ps _ v) k => do
     let nm ← registerFVar fid bn
     let pnames ← ps.mapM fun p => do
@@ -636,6 +637,12 @@ def stripForalls : Nat → Expr → Expr
 /-- Lower one pure-phase LCNF declaration to a sexp `def`, returning the sexp
     and the collected lowering state (opaque/extern/dropped facts). -/
 def lowerDecl (ctx : LowerCtx) (d : Decl .pure) : CoreM (String × LowerState) := do
+  let locals ← match d.value with
+    | .code code =>
+      match firstOrderLocalFunctions code with
+      | .ok locals => pure locals
+      | .error reason => throwError "unsupported local function in {d.name}: {repr reason}"
+    | .extern _ => pure {}
   let go : LowerM String := do
     let mut ps : Array String := #[]
     for p in d.params do
@@ -648,7 +655,7 @@ def lowerDecl (ctx : LowerCtx) (d : Decl .pure) : CoreM (String × LowerState) :
       | .code c => lowerCode c
       | .extern _ => opaqueNode "extern"
     return s!"(def {lastComponent d.name} ({String.intercalate " " ps.toList}) {ret}\n  {body})"
-  (go.run ctx).run {}
+  (go.run ctx).run { localFunctions := locals }
 
 /-- Indent every line of `s` by `n` spaces. -/
 def indent (n : Nat) (s : String) : String :=

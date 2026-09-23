@@ -66,10 +66,10 @@ caller-controlled input, and no heap allocation.** Concretely:
   into the formatter, so even the error path allocates nothing.
 - **Bounded `Nat`.** `Nat` maps to `u64`: addition, multiplication, shifts, and
   powers report overflow as an error (including shift/power exponents that do
-  not fit `u32`); subtraction truncates at zero and division/modulo by zero
-  return zero, matching Lean's total operations. Arbitrary-precision `Nat` is
-  ruled out *by* the no-heap rule, not merely unimplemented — bounded `u64` is
-  the deliberate policy.
+  not fit `u32`); subtraction truncates at zero, division by zero returns zero,
+  and remainder by zero returns the dividend, matching Lean's total operations.
+  Arbitrary-precision `Nat` is ruled out *by* the no-heap rule, not merely
+  unimplemented — bounded `u64` is the deliberate policy.
 - **Bounded recursion.** Generated recursion is structurally bounded by a fuel
   or data argument (Lean must already have proved termination for LCNF to emit
   it), so stack depth is a function of the caller's inputs.

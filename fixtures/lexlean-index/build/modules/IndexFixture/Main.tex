@@ -8,6 +8,16 @@
 \noindent Type: \texttt{Option (UInt8)}.\par
 \noindent Definition: \texttt{IndexFixture.Bytes.byteAt (input) (offset)}.\par
 \noindent Axiom policy: \texttt{none}.\par
+\subsection*{\texttt{readSlice}}
+\noindent Kind: \texttt{definition}.\par
+\noindent Type: \texttt{Option (ByteArray)}.\par
+\noindent Definition: \texttt{IndexFixture.Bytes.sliceBytes (input) (start) (count)}.\par
+\noindent Axiom policy: \texttt{none}.\par
+\subsection*{\texttt{sliceEntry}}
+\noindent Kind: \texttt{definition}.\par
+\noindent Type: \texttt{ByteArray}.\par
+\noindent Definition: \texttt{(match readSlice (input) (1) (2) with | Option.none => ByteArray.mk \#[255] | Option.some bytes => bytes)}.\par
+\noindent Axiom policy: \texttt{none}.\par
 \subsection*{\texttt{entry}}
 \noindent Kind: \texttt{definition}.\par
 \noindent Type: \texttt{ByteArray}.\par

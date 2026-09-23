@@ -290,4 +290,6 @@ end LexLeanRuntime
 
 @[expose] public def byteAt (input : ByteArray) (offset : Nat) : Option (UInt8) := (LexLeanRuntime.index (input) (offset) : Option (UInt8))
 
+@[expose] public def sliceBytes (input : ByteArray) (start : Nat) (count : Nat) : Option (ByteArray) := (LexLeanRuntime.slice (input) (start) (count) : Option (ByteArray))
+
 end IndexFixture.Bytes

@@ -291,6 +291,10 @@ end LexLeanRuntime
 
 @[expose] public def read (input : ByteArray) (offset : Nat) : Option (UInt8) := IndexFixture.Bytes.byteAt (input) (offset)
 
+@[expose] public def readSlice (input : ByteArray) (start : Nat) (count : Nat) : Option (ByteArray) := IndexFixture.Bytes.sliceBytes (input) (start) (count)
+
+@[expose] public def sliceEntry (input : ByteArray) : ByteArray := (match readSlice (input) (1) (2) with | Option.none => ByteArray.mk #[255] | Option.some bytes => bytes)
+
 @[expose] public def entry (input : ByteArray) : ByteArray := (match read (input) (3) with | Option.none => ByteArray.mk #[255] | Option.some octet => (match (LexLeanRuntime.equal (octet) ((128 : UInt8)) : Bool) with | Bool.false => ByteArray.mk #[0] | Bool.true => ByteArray.mk #[1]))
 
 end IndexFixture.Main

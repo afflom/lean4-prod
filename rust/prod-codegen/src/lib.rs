@@ -627,6 +627,51 @@ fn count_path_uses(expr: &Expr, name: &str) -> usize {
     }
 }
 
+/// Uses of a local inside a join-point body are duplicated at every one of
+/// the join point's jump sites: the renderer inlines an acyclic join point
+/// at each `jmp`, so a payload captured once in the body but jumped to twice
+/// is really used twice. `count_path_uses` sees only the single syntactic
+/// use inside the body; without these extra uses such a payload keeps no
+/// clone flag, and its first inlined use renders as a move (E0382 on every
+/// remaining use). A body reference shadowed by one of the join point's own
+/// parameters names the parameter, not the captured local, and contributes
+/// nothing. Returns only the uses beyond the syntactic one, so callers add
+/// it to an ordinary `count_path_uses` total.
+fn inlined_join_extra_uses(root: &Expr, name: &str) -> usize {
+    fn jump_sites(expr: &Expr, join: &str) -> usize {
+        usize::from(matches!(expr, Expr::Jmp(candidate, _) if candidate == join))
+            + expr
+                .children()
+                .map(|child| jump_sites(child, join))
+                .sum::<usize>()
+    }
+    fn walk(expr: &Expr, root: &Expr, name: &str) -> usize {
+        match expr {
+            Expr::Jp {
+                name: join,
+                params,
+                body,
+            } => {
+                let captured = if params.iter().any(|param| param == name) {
+                    0
+                } else {
+                    count_path_uses(body, name)
+                };
+                // With no jump sites the body still renders once in place;
+                // otherwise once per jump. The syntactic use is already
+                // counted by the caller's `count_path_uses`.
+                let renders = jump_sites(root, join).max(1);
+                captured * (renders - 1) + walk(body, root, name)
+            }
+            _ => expr
+                .children()
+                .map(|child| walk(child, root, name))
+                .sum(),
+        }
+    }
+    walk(root, root, name)
+}
+
 /// Whether a binding expression produces a known non-`Copy` Rust value.
 ///
 /// This deliberately answers `false` when the type is not recoverable from
@@ -757,7 +802,10 @@ fn repeated_non_copy_locals(
                     nested.insert(name.clone());
                     // Projections of non-Copy fields are already borrows and
                     // may be reused without cloning the underlying value.
-                    if !matches!(value.as_ref(), Expr::Proj(..)) && count_var_uses(body, name) > 1 {
+                    if !matches!(value.as_ref(), Expr::Proj(..))
+                        && count_var_uses(body, name) > 1
+                        && !single_owned_option_match(name, value, body, definitions, table)
+                    {
                         output.insert(name.clone());
                     }
                 }
@@ -782,7 +830,9 @@ fn repeated_non_copy_locals(
                         if !copy_type(&ty, table, &mut BTreeSet::new()) {
                             nested.insert(name.clone());
                             if !borrowed_bindings.contains(&name)
-                                && count_path_uses(&alt.body, &name) > 1
+                                && count_path_uses(&alt.body, &name)
+                                    + inlined_join_extra_uses(&alt.body, &name)
+                                    > 1
                             {
                                 output.insert(name.clone());
                             }
@@ -1029,6 +1079,63 @@ fn borrowed_locals(
         &mut locals,
     );
     locals
+}
+
+/// Matching None does not move a payload, so that arm can return the original
+/// Option without cloning the Some payload. Keep the original typed expression
+/// intact: replacing the return with an untyped None can lose type inference.
+/// Any other use of the owner retains the existing conservative clone policy.
+fn single_owned_option_match(
+    name: &str,
+    value: &Expr,
+    body: &Expr,
+    definitions: &[Definition],
+    table: &TypeTable<'_>,
+) -> bool {
+    let Expr::Call(callee, _) = value else {
+        return false;
+    };
+    if !definitions.iter().any(|definition| {
+        definition.name == *callee
+            && matches!(definition.ret, Type::Option(_))
+            && !returns_borrowed_projection(&definition.body, &definition.ret, table)
+    }) {
+        return false;
+    }
+    let Expr::Match {
+        scrut,
+        alts,
+        default,
+    } = body
+    else {
+        return false;
+    };
+    if !matches!(scrut.as_ref(), Expr::Var(scrutinee) if scrutinee == name)
+        || default.is_some()
+        || alts.len() != 2
+        || !alts.iter().any(|alt| {
+            alt.ctor == "Option.some"
+                && alt.binders.len() == 1
+                && count_var_uses(&alt.body, name) == 0
+                // The payload may itself move out of the owner, but only an
+                // untouched payload or a pure `Some(x) => Some(x)` rewrap
+                // leaves the None arm's owner reusable. Binder names are
+                // normalized before this pass, so a payload that shadowed
+                // the owner arrives under a fresh name: count the binder's
+                // own uses rather than trusting lexical equality.
+                && (count_var_uses(&alt.body, &alt.binders[0]) == 0
+                    || matches!(&alt.body, Expr::Ctor(ctor, args)
+                        if ctor == "Option.some"
+                            && matches!(args.as_slice(), [Expr::Var(returned)] if returned == &alt.binders[0])))
+        })
+    {
+        return false;
+    }
+    alts.iter().any(|alt| {
+        alt.ctor == "Option.none"
+            && alt.binders.is_empty()
+            && matches!(&alt.body, Expr::Var(returned) if returned == name)
+    })
 }
 
 fn generate_def_in<'m>(
@@ -1472,6 +1579,16 @@ impl<'m> Renderer<'_, 'm> {
         self.render(expr, &Mode::Value)
     }
 
+    /// A read-only operand does not consume a local even when other uses do.
+    /// Cloning here can copy an entire parser record merely to read one field.
+    /// Non-local expressions retain ordinary evaluation and ownership rules.
+    fn read_value(&self, expr: &'m Expr) -> Result<String, Error> {
+        match self.resolved_inline(expr) {
+            Expr::Var(name) => Ok(rust_local_ident(name)),
+            other => self.value(other),
+        }
+    }
+
     fn owned_value(&self, expr: &'m Expr) -> Result<String, Error> {
         let rendered = self.value(expr)?;
         if expression_is_borrowed(expr, self.definitions, self.types, &self.borrowed_locals) {
@@ -1507,7 +1624,7 @@ impl<'m> Renderer<'_, 'm> {
         // new IR prevents Rust inference from changing the source width.
         Ok(format!(
             "{{ let __input = &({}); let __text: &str = core::convert::AsRef::<str>::as_ref(__input); __text.{parse}.ok().filter(|__value| alloc::string::ToString::to_string(__value) == __text) }}",
-            self.value(value)?
+            self.read_value(value)?
         ))
     }
 
@@ -1600,11 +1717,11 @@ impl<'m> Renderer<'_, 'm> {
                         Ok(format!("&{value:?}"))
                     }
                     Some((Type::String | Type::Bytes, true)) => {
-                        let rendered = self.value(argument)?;
+                        let rendered = self.read_value(argument)?;
                         Ok(format!("({rendered}).as_ref()"))
                     }
                     Some((_, true)) => {
-                        let rendered = self.value(argument)?;
+                        let rendered = self.read_value(argument)?;
                         Ok(format!("&({rendered})"))
                     }
                     Some((_, false)) => self.owned_value(argument),
@@ -1883,19 +2000,19 @@ impl<'m> Renderer<'_, 'm> {
             Expr::Append(left, right) => Ok(format!(
                 "{{ let mut __value = {}; __value.extend_from_slice(&{}); __value }}",
                 self.owned_value(left)?,
-                self.value(right)?
+                self.read_value(right)?
             )),
-            Expr::Length(value) => Ok(format!("({}).len() as u64", self.value(value)?)),
+            Expr::Length(value) => Ok(format!("({}).len() as u64", self.read_value(value)?)),
             Expr::Index(value, offset) => Ok(format!(
                 "usize::try_from({}).ok().and_then(|__index| ({}).get(__index).cloned())",
                 self.value(offset)?,
-                self.value(value)?
+                self.read_value(value)?
             )),
             Expr::Slice(value, start, count) => Ok(format!(
                 "{{ let __start = usize::try_from({}).ok(); let __count = usize::try_from({}).ok(); match (__start, __count) {{ (Some(__start), Some(__count)) => __start.checked_add(__count).and_then(|__end| ({}).get(__start..__end).map(|__slice| __slice.to_vec())), _ => None }} }}",
                 self.value(start)?,
                 self.value(count)?,
-                self.value(value)?
+                self.read_value(value)?
             )),
             // Encoding consumes its String. Borrowed parameters and record
             // fields must cross the existing owned boundary first; already
@@ -1907,8 +2024,8 @@ impl<'m> Renderer<'_, 'm> {
             )),
             Expr::CompareBytes(left, right) => Ok(format!(
                 "({}).cmp(&{})",
-                self.value(left)?,
-                self.value(right)?
+                self.read_value(left)?,
+                self.read_value(right)?
             )),
             Expr::SplitExact(value, delimiter, maximum) => Ok(format!(
                 "{{ let __value = {}; let __delimiter = {}; let __limit: u32 = {}; let __maximum = usize::try_from(__limit).ok(); if __delimiter.is_empty() {{ None }} else {{ let __fields: alloc::vec::Vec<alloc::string::String> = __value.split(&__delimiter).map(alloc::string::String::from).collect(); __maximum.filter(|__maximum| __fields.len() <= *__maximum).map(|_| __fields) }} }}",
@@ -1918,8 +2035,8 @@ impl<'m> Renderer<'_, 'm> {
             )),
             Expr::Join(values, delimiter) => Ok(format!(
                 "({}).join(&{})",
-                self.value(values)?,
-                self.value(delimiter)?
+                self.read_value(values)?,
+                self.read_value(delimiter)?
             )),
             Expr::ParseDecimal(value) => self.parse_decimal(value, None),
             Expr::ParseDecimalAs(target, value) => self.parse_decimal(value, Some(target)),
@@ -1979,17 +2096,17 @@ impl<'m> Renderer<'_, 'm> {
                 self.resolved_inline(b.as_ref()),
             ) {
                 (other, Expr::String(value)) | (Expr::String(value), other) => {
-                    Ok(format!("{} == {value:?}", self.value(other)?))
+                    Ok(format!("{} == {value:?}", self.read_value(other)?))
                 }
                 (Expr::Bytes(left), Expr::Bytes(right)) => Ok(format!("{}", left == right)),
                 (other, Expr::Bytes(value)) | (Expr::Bytes(value), other) => {
-                    Ok(format!("core::convert::AsRef::<[u8]>::as_ref(&({})) == &{value:?}", self.value(other)?))
+                    Ok(format!("core::convert::AsRef::<[u8]>::as_ref(&({})) == &{value:?}", self.read_value(other)?))
                 }
                 _ => {
                     let borrowed_a = expression_is_borrowed(a, self.definitions, self.types, &self.borrowed_locals);
                     let borrowed_b = expression_is_borrowed(b, self.definitions, self.types, &self.borrowed_locals);
-                    let a = self.value(a)?;
-                    let b = self.value(b)?;
+                    let a = self.read_value(a)?;
+                    let b = self.read_value(b)?;
                     // Equality borrows its operands; normalize mixed owned /
                     // borrowed values without cloning either collection.
                     match (borrowed_a, borrowed_b) {
@@ -2070,7 +2187,7 @@ impl<'m> Renderer<'_, 'm> {
                 if self.types.contains_key(ty.as_str()) && field_type.is_none() {
                     return Err(Error::UnknownField(ty.clone(), field.clone()));
                 }
-                let projection = format!("({}).{}", self.value(e)?, rust_ident(field));
+                let projection = format!("({}).{}", self.read_value(e)?, rust_ident(field));
                 if field_type.is_some_and(|field_type| {
                     !copy_type(field_type, self.types, &mut BTreeSet::new())
                 }) {

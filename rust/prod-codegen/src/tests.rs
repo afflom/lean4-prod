@@ -721,8 +721,10 @@ fn test_fallibility_is_precise_not_uniform() {
     assert!(out.contains("pub fn caller(x: u64) -> Result<u64, crate::ComputeError> {"));
     assert!(out.contains("Ok(risky(x)?)"));
     // A recursive definition reaches its own fixpoint.
-    assert!(out.contains("pub fn loops(fuel: u64, x: u64) -> Result<u64, crate::ComputeError> {"));
-    assert!(out.contains("loops(k, core::convert::identity::<u64>(x).checked_add(1)"));
+    assert!(out
+        .contains("pub fn loops(mut fuel: u64, mut x: u64) -> Result<u64, crate::ComputeError> {"));
+    assert!(out.contains("loop { return Ok("));
+    assert!(out.contains("(fuel, x,) = (k, core::convert::identity::<u64>(x).checked_add(1).ok_or(crate::ComputeError::AddOverflow)?,); continue;"));
 }
 
 #[test]

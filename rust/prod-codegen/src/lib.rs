@@ -736,10 +736,7 @@ fn inlined_join_extra_uses(root: &Expr, name: &str) -> usize {
                 let renders = jump_sites(root, join).max(1);
                 captured * (renders - 1) + walk(body, root, name)
             }
-            _ => expr
-                .children()
-                .map(|child| walk(child, root, name))
-                .sum(),
+            _ => expr.children().map(|child| walk(child, root, name)).sum(),
         }
     }
     walk(root, root, name)
@@ -2766,7 +2763,18 @@ impl<'m> Renderer<'_, 'm> {
             && branch_borrows.iter().any(|borrowed| *borrowed)
             && branch_borrows.iter().any(|borrowed| !borrowed);
         let scrut = self.value(scrut)?;
-        let mut out = format!("match {} {{\n", scrut);
+        // A projected list can be a Vec or a borrowed Vec, whereas a list
+        // parameter is already a slice. Match all representations through a
+        // borrowed full slice without moving or cloning the owner.
+        let match_scrut = if alts
+            .iter()
+            .any(|alt| matches!(alt.ctor.as_str(), "List.nil" | "List.cons"))
+        {
+            format!("&({})[..]", scrut)
+        } else {
+            scrut.clone()
+        };
+        let mut out = format!("match {} {{\n", match_scrut);
         for alt in alts {
             let body = if let Some(plan) = tail {
                 self.render_tail(&alt.body, plan)?

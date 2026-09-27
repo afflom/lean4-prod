@@ -736,10 +736,7 @@ fn inlined_join_extra_uses(root: &Expr, name: &str) -> usize {
                 let renders = jump_sites(root, join).max(1);
                 captured * (renders - 1) + walk(body, root, name)
             }
-            _ => expr
-                .children()
-                .map(|child| walk(child, root, name))
-                .sum(),
+            _ => expr.children().map(|child| walk(child, root, name)).sum(),
         }
     }
     walk(root, root, name)
@@ -1376,7 +1373,7 @@ fn generate_def_in<'m>(
     let generated_name = if helper {
         borrowed_helper_name(def, definitions)
     } else {
-        def.name.clone()
+        rust_ident(&def.name)
     };
     let visibility = if helper { "" } else { "pub " };
     let borrowed_return = returns_borrowed_projection(def, table);
@@ -1538,7 +1535,7 @@ fn generate_def_in<'m>(
     };
     Ok(format!(
         "pub fn {}({}) -> {} {{\n    {}({})\n}}\n\n{}",
-        def.name,
+        rust_ident(&def.name),
         public_params.join(", "),
         public_return,
         generated_name,
@@ -1690,7 +1687,7 @@ fn emitted_call_name(name: &str, definitions: &[Definition], table: &TypeTable<'
         .find(|definition| definition.name == name)
         .filter(|definition| needs_borrowed_helper(definition, table))
         .map(|definition| borrowed_helper_name(definition, definitions))
-        .unwrap_or_else(|| String::from(name))
+        .unwrap_or_else(|| rust_ident(name))
 }
 
 /// A `(named ...)` type occurring in a definition's signature must be

@@ -37,3 +37,4 @@ fi
 
 echo "generated-fixture provenance passed"
 node "$repo_root/scripts/check-typed-decimal-provenance.mjs"
+node "$repo_root/scripts/check-shared-decidable-provenance.mjs"

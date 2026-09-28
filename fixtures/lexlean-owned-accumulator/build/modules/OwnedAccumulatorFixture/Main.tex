@@ -1,0 +1,27 @@
+\documentclass[11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\begin{document}
+\section*{Semantic declarations}
+\subsection*{\texttt{Input}}
+\noindent Kind: \texttt{structure}.\par
+\subsection*{\texttt{Row}}
+\noindent Kind: \texttt{structure}.\par
+\subsection*{\texttt{Rows}}
+\noindent Kind: \texttt{structure}.\par
+\subsection*{\texttt{collect}}
+\noindent Kind: \texttt{definition}.\par
+\noindent Type: \texttt{Rows}.\par
+\noindent Definition: \texttt{(match fuel with | Nat.zero => (\{ items := items \} : Rows) | Nat.succ rest => (match (LexLeanRuntime.slice ((input).bytes) ((LexLeanRuntime.multiply (rest) (262144) : Nat)) (262144) : Option (ByteArray)) with | Option.none => (\{ items := items \} : Rows) | Option.some payload => collect (input) ((LexLeanRuntime.append (items) (((\{ payload := payload, position := rest \} : Row) :: ([] : List (Row)))) : List (Row))) (rest)))}.\par
+\noindent Axiom policy: \texttt{none}.\par
+\subsection*{\texttt{finish}}
+\noindent Kind: \texttt{definition}.\par
+\noindent Type: \texttt{ByteArray}.\par
+\noindent Definition: \texttt{(match fuel with | Nat.zero => output | Nat.succ rest => (match (LexLeanRuntime.index ((rows).items) (index) : Option (Row)) with | Option.none => ByteArray.mk \#[255] | Option.some row => finish (rows) ((index + 1)) (rest) ((LexLeanRuntime.append (output) ((row).payload) : ByteArray))))}.\par
+\noindent Axiom policy: \texttt{none}.\par
+\subsection*{\texttt{entry}}
+\noindent Kind: \texttt{definition}.\par
+\noindent Type: \texttt{ByteArray}.\par
+\noindent Definition: \texttt{(if ((Nat.ble ((LexLeanRuntime.length (request) : Nat)) (67108864)) \&\& (Nat.beq ((LexLeanRuntime.remainder ((LexLeanRuntime.length (request) : Nat)) (262144) (0) : Nat)) (0))) then finish (collect ((\{ bytes := request \} : Input)) (([] : List (Row))) ((LexLeanRuntime.quotient ((LexLeanRuntime.length (request) : Nat)) (262144) (0) : Nat))) (0) ((LexLeanRuntime.quotient ((LexLeanRuntime.length (request) : Nat)) (262144) (0) : Nat)) (ByteArray.mk \#[]) else ByteArray.mk \#[255])}.\par
+\noindent Axiom policy: \texttt{none}.\par
+\end{document}

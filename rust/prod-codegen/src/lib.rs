@@ -7,14 +7,13 @@
 //!
 //! # Code generation policy
 //!
-//! The generated code targets the project's production standard: it must not
-//! panic on caller-controlled input, and it must not allocate. Those two rules
-//! drive everything below.
+//! Generated checked operations report typed errors. Scalar and list-buffer
+//! paths avoid allocation; explicitly owned strings, bytes and record fields
+//! use the portable `alloc` data path. These are distinct memory contracts.
 //!
-//! ## Memory profile: no heap, ever
+//! ## Memory profiles and public list ABI
 //!
-//! Nothing rendered here can allocate. Lean `List α` is the only type that
-//! would naïvely need a heap, so its lowering is position-dependent:
+//! Lean `List α` lowering is position-dependent:
 //!
 //! - **Parameter position** → `&[α]`. `List.nil` match arms render as the
 //!   slice pattern `[]` and `List.cons (h t)` as `[h, t @ ..]`, so structural
@@ -32,11 +31,14 @@
 //! - **Zero-argument definitions returning a list** (the golden values) →
 //!   `&'static [α]` built from a promoted array literal.
 //!
-//! A list value that reaches any other position — an intermediate value used
-//! as something other than a builder tail, or a list nested inside another
-//! type — is an [`Error::UnsupportedList`]: an honest codegen failure rather
-//! than a silently allocating fallback. `Type::Vec` is rejected outright as
-//! [`Error::HeapType`].
+//! Nested owned list fields use `Vec` in portable generated packages. A
+//! single-consumption list accumulator in an owned-record self-tail function
+//! may use a private owned worker and an explicit loop. Its public slice
+//! wrapper makes one ownership copy; internal owned arguments move. Unsupported
+//! alias, borrowed-back-edge, join and escaping shapes retain ordinary lowering.
+//! This does not add allocation to scalar, predicate or list-buffer paths and
+//! is not a general heapless claim. Other unsupported list positions report
+//! [`Error::UnsupportedList`]; `Type::Vec` reports [`Error::HeapType`].
 //!
 //! ## Error contract: fallibility is precise, not uniform
 //!
@@ -108,6 +110,7 @@ mod c_abi;
 mod core_wasm;
 mod joins;
 mod naming;
+mod owned_accumulators;
 mod ownership;
 mod package;
 mod sdk;
@@ -829,7 +832,6 @@ fn repeated_non_copy_locals(
     definitions: &[Definition],
     table: &TypeTable<'_>,
     params: &[(String, Type)],
-    returns_copy: bool,
     borrowed_bindings: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     struct Context<'a, 'm> {
@@ -940,7 +942,7 @@ fn repeated_non_copy_locals(
 
     let mut output = BTreeSet::new();
     for (name, ty) in params {
-        if !internal_borrowed_parameter(ty, table, returns_copy)
+        if !borrowed_bindings.contains(name)
             && !copy_type(ty, table, &mut BTreeSet::new())
             && count_path_uses(expr, name) > 1
         {
@@ -1124,6 +1126,7 @@ fn binding_ownership(
     definitions: &[Definition],
     table: &TypeTable<'_>,
     movable: &BTreeSet<String>,
+    owned_parameters: &BTreeSet<usize>,
 ) -> BindingOwnership {
     fn walk(
         expr: &Expr,
@@ -1264,8 +1267,12 @@ fn binding_ownership(
         borrowed: definition
             .params
             .iter()
-            .filter(|(_, ty)| internal_borrowed_parameter(ty, table, returns_copy))
-            .map(|(name, _)| name.clone())
+            .enumerate()
+            .filter(|(index, (_, ty))| {
+                !owned_parameters.contains(index)
+                    && internal_borrowed_parameter(ty, table, returns_copy)
+            })
+            .map(|(_, (name, _))| name.clone())
             .collect(),
         copied_patterns: BTreeSet::new(),
     };
@@ -1346,6 +1353,9 @@ fn generate_def_in<'m>(
 ) -> Result<String, Error> {
     // Ownership and inline-value tables are keyed by local name. Preserve
     // lexical scopes at the public IR boundary before building those tables.
+    // Plan against the original declaration, consistently with every caller.
+    // Unsupported raw-IR shadowing is conservatively excluded by this plan.
+    let owned_parameters = owned_accumulators::parameters(def, table);
     let normalized = naming::normalize_definition(
         def,
         &|name| emitted_call_name(name, definitions, table),
@@ -1372,8 +1382,10 @@ fn generate_def_in<'m>(
         .copied()
         .unwrap_or(Shape::Value);
     let returns_copy = copy_type(&def.ret, table, &mut BTreeSet::new());
-    let helper = needs_borrowed_helper(def, table);
-    let generated_name = if helper {
+    let helper = !owned_parameters.is_empty() || needs_borrowed_helper(def, table);
+    let generated_name = if !owned_parameters.is_empty() {
+        owned_helper_name(def, definitions)
+    } else if helper {
         borrowed_helper_name(def, definitions)
     } else {
         def.name.clone()
@@ -1381,12 +1393,18 @@ fn generate_def_in<'m>(
     let visibility = if helper { "" } else { "pub " };
     let borrowed_return = returns_borrowed_projection(def, table);
     let tail_plan = if matches!(shape, Shape::Value | Shape::Fallible) && !borrowed_return {
-        tail_calls::plan(def, table)
+        tail_calls::plan(def, table, &owned_parameters)
     } else {
         None
     };
     let movable_projections = movable_projection_owners(def, table);
-    let bindings = binding_ownership(def, definitions, table, &movable_projections);
+    let bindings = binding_ownership(
+        def,
+        definitions,
+        table,
+        &movable_projections,
+        &owned_parameters,
+    );
     let renderer = Renderer {
         shapes,
         definitions,
@@ -1398,7 +1416,6 @@ fn generate_def_in<'m>(
             definitions,
             table,
             &def.params,
-            returns_copy,
             &bindings.borrowed,
         ),
         inline_values: inline_bindings(&def.body),
@@ -1424,7 +1441,8 @@ fn generate_def_in<'m>(
             param_type_to_rust(
                 ty,
                 table,
-                internal_borrowed_parameter(ty, table, returns_copy),
+                !owned_parameters.contains(&i)
+                    && internal_borrowed_parameter(ty, table, returns_copy),
             )?
         ));
     }
@@ -1511,10 +1529,11 @@ fn generate_def_in<'m>(
 
     let mut public_params = Vec::with_capacity(def.params.len());
     let mut arguments = Vec::with_capacity(def.params.len());
-    for (name, ty) in &def.params {
+    for (index, (name, ty)) in def.params.iter().enumerate() {
         let local = rust_local_ident(name);
         let public_borrowed = public_borrowed_parameter(ty, table, def.ret == Type::Bool);
-        let internal_borrowed = internal_borrowed_parameter(ty, table, returns_copy);
+        let internal_borrowed = !owned_parameters.contains(&index)
+            && internal_borrowed_parameter(ty, table, returns_copy);
         public_params.push(format!(
             "{local}: {}",
             param_type_to_rust(ty, table, public_borrowed)?
@@ -1525,6 +1544,8 @@ fn generate_def_in<'m>(
             } else {
                 format!("&{local}")
             }
+        } else if public_borrowed && !internal_borrowed {
+            format!("alloc::borrow::ToOwned::to_owned({local})")
         } else {
             local
         });
@@ -1684,7 +1705,25 @@ fn borrowed_helper_name(definition: &Definition, definitions: &[Definition]) -> 
     candidate
 }
 
+fn owned_helper_name(definition: &Definition, definitions: &[Definition]) -> String {
+    // The length makes this encoding prefix-free: appending underscores to
+    // avoid a source declaration cannot collide with another owned helper.
+    let mut candidate = format!("__prod_owned_{}_{}", definition.name.len(), definition.name);
+    while definitions.iter().any(|row| row.name == candidate) {
+        candidate.push('_');
+    }
+    candidate
+}
+
 fn emitted_call_name(name: &str, definitions: &[Definition], table: &TypeTable<'_>) -> String {
+    if let Some(definition) = definitions
+        .iter()
+        .find(|definition| definition.name == name)
+    {
+        if !owned_accumulators::parameters(definition, table).is_empty() {
+            return owned_helper_name(definition, definitions);
+        }
+    }
     definitions
         .iter()
         .find(|definition| definition.name == name)
@@ -1994,11 +2033,13 @@ impl<'m> Renderer<'_, 'm> {
                     definition.params.get(index).map(|(_, ty)| {
                         (
                             ty,
-                            internal_borrowed_parameter(
-                                ty,
-                                self.types,
-                                copy_type(&definition.ret, self.types, &mut BTreeSet::new()),
-                            ),
+                            !owned_accumulators::parameters(definition, self.types)
+                                .contains(&index)
+                                && internal_borrowed_parameter(
+                                    ty,
+                                    self.types,
+                                    copy_type(&definition.ret, self.types, &mut BTreeSet::new()),
+                                ),
                         )
                     })
                 }) {

@@ -736,10 +736,7 @@ fn inlined_join_extra_uses(root: &Expr, name: &str) -> usize {
                 let renders = jump_sites(root, join).max(1);
                 captured * (renders - 1) + walk(body, root, name)
             }
-            _ => expr
-                .children()
-                .map(|child| walk(child, root, name))
-                .sum(),
+            _ => expr.children().map(|child| walk(child, root, name)).sum(),
         }
     }
     walk(root, root, name)

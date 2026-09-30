@@ -27,12 +27,20 @@ fn returned_binding(expr: &Expr) -> Option<&Expr> {
     }
 }
 
-pub(super) fn plan(definition: &Definition, table: &TypeTable<'_>) -> Option<Plan> {
+pub(super) fn plan(
+    definition: &Definition,
+    table: &TypeTable<'_>,
+    owned_parameters: &BTreeSet<usize>,
+) -> Option<Plan> {
     let returns_copy = copy_type(&definition.ret, table, &mut BTreeSet::new());
     let borrowed = definition
         .params
         .iter()
-        .map(|(_, ty)| internal_borrowed_parameter(ty, table, returns_copy))
+        .enumerate()
+        .map(|(index, (_, ty))| {
+            !owned_parameters.contains(&index)
+                && internal_borrowed_parameter(ty, table, returns_copy)
+        })
         .collect::<Vec<_>>();
     let mut result = Plan {
         name: definition.name.clone(),

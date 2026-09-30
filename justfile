@@ -3,7 +3,11 @@ default:
     @just --list
 
 # Complete clean-checkout CI contract.
-ci: fixture-provenance prod fmt-check lint wasm-check portable-package specialized-index scalar-length typed-decimal shared-decidable core-wasm view text-view workspace-view wasm-sdk-fixture uor-fixture
+ci: fixture-provenance prod fmt-check lint wasm-check portable-package specialized-index scalar-length typed-decimal shared-decidable owned-accumulator core-wasm view text-view workspace-view wasm-sdk-fixture uor-fixture
+
+# Move single-use owned record accumulators without changing public slice ABI.
+owned-accumulator:
+    bash scripts/check-owned-accumulator.sh
 
 # Preserve shared Bool conditions through proof-erased Decidable join points.
 shared-decidable:
@@ -49,6 +53,7 @@ core-wasm:
 # source and compiler-semantics identity.
 fixture-provenance:
     scripts/check-generated-fixtures.sh
+    node scripts/check-owned-accumulator-provenance.mjs
 
 # Full pipeline: export from Lean, then verify the Rust build against it.
 prod: lean-fixtures prod-export conformance named-export test test-assertions no-alloc roots-check subset-check

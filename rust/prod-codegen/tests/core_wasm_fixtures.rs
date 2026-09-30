@@ -388,6 +388,90 @@ fn match_binder_ownership_executes_native_no_std_and_wasm() {
     execute_owned_fixture(ir, include_str!("fixtures/match_binders_generated_test.rs"));
 }
 
+#[test]
+fn projected_list_patterns_execute_native_no_std_and_wasm() {
+    let ir = r#"(module ProjectedLists
+      (type "Probe" (ctor "Probe.mk" (refs (List Bytes))))
+      (type "Numbers" (ctor "Numbers.mk" (values (List Nat))))
+      (def direct ((root (named "Probe"))) Bool
+        (cases (proj "Probe" "refs" root)
+          (alt "List.nil" () true) (alt "List.cons" (head tail) false)))
+      (def aliased ((root (named "Probe"))) Bool
+        (let refs (proj "Probe" "refs" root)
+          (let alias refs (cases alias
+            (alt "List.nil" () true) (alt "List.cons" (head tail) false)))))
+      (def default_empty ((root (named "Probe"))) Bool
+        (cases (proj "Probe" "refs" root)
+          (alt "List.nil" () true) (default false)))
+      (def number_head ((root (named "Numbers"))) Nat
+        (cases (proj "Numbers" "values" root)
+          (alt "List.nil" () 0) (alt "List.cons" (head tail) head)))
+      (def wrap ((input Bytes)) (named "Probe")
+        (ctor "Probe.mk" (ctor "List.cons" input (ctor "List.nil"))))
+      (def temporary ((input Bytes)) Bytes
+        (cases (proj "Probe" "refs" (ctor "Probe.mk" (ctor "List.cons" input (ctor "List.nil"))))
+          (alt "List.nil" () (bytes)) (alt "List.cons" (head tail) head)))
+      (def returned ((input Bytes)) Bytes
+        (cases (proj "Probe" "refs" (call wrap input))
+          (alt "List.nil" () (bytes)) (alt "List.cons" (head tail) head)))
+      (def first ((root (named "Probe"))) Bytes
+        (let refs (proj "Probe" "refs" root)
+          (cases refs (alt "List.nil" () (bytes))
+            (alt "List.cons" (head tail) head))))
+      (def second ((root (named "Probe"))) Bytes
+        (cases (proj "Probe" "refs" root) (alt "List.nil" () (bytes))
+          (alt "List.cons" (head tail)
+            (cases tail (alt "List.nil" () (bytes))
+              (alt "List.cons" (next rest) next)))))
+      (def projected ((input Bytes)) Bytes
+        (let empty (ctor "Probe.mk" (ctor "List.nil"))
+          (let full (ctor "Probe.mk" (ctor "List.cons" input (ctor "List.cons" input (ctor "List.nil"))))
+            (if (call direct empty)
+              (if (call aliased empty)
+                (if (call direct full) (bytes 254)
+                  (if (call aliased full) (bytes 254)
+                    (if (eq (call first full) input)
+                      (if (eq (call second full) input) input (bytes 254)) (bytes 254))))
+                (bytes 254)) (bytes 254)))))
+      (def entry ((input Bytes)) Bytes
+        (if (eq (call projected input) input)
+          (if (eq (call temporary input) input)
+            (if (eq (call returned input) input)
+              (if (call default_empty (ctor "Probe.mk" (ctor "List.nil")))
+                (if (call default_empty (call wrap input)) (bytes 254)
+                  (if (eq (call number_head (ctor "Numbers.mk" (ctor "List.cons" 4294967296 (ctor "List.nil")))) 4294967296)
+                    input (bytes 254))) (bytes 254))
+              (bytes 254)) (bytes 254)) (bytes 254))))"#;
+    execute_owned_fixture(
+        ir,
+        r#"
+        use borrowed_utf8::{Probe, Numbers, direct, aliased, default_empty, number_head,
+            temporary, returned, first, second, entry};
+        #[test] fn complete_projected_lists() {
+            for refs in [vec![], vec![vec![1,2]], vec![vec![3], vec![4,5], vec![6]]] {
+                let root = Probe { refs: refs.clone() };
+                assert_eq!(direct(&root), refs.is_empty());
+                assert_eq!(aliased(&root), refs.is_empty());
+                assert_eq!(default_empty(&root), refs.is_empty());
+                assert_eq!(first(&root), refs.first().cloned().unwrap_or_default());
+                assert_eq!(second(&root), refs.get(1).cloned().unwrap_or_default());
+                assert_eq!(root.refs, refs);
+            }
+            for values in [vec![], vec![0], vec![u64::MAX, 4], vec![1_u64 << 32]] {
+                let root = Numbers { values: values.clone() };
+                assert_eq!(number_head(&root), values.first().copied().unwrap_or_default());
+                assert_eq!(root.values, values);
+            }
+            for input in [vec![], vec![0,1,127,128,255], vec![9;128]] {
+                assert_eq!(temporary(input.clone()), input);
+                assert_eq!(returned(input.clone()), input);
+                assert_eq!(entry(input.clone()), input);
+            }
+        }
+    "#,
+    );
+}
+
 fn execute_owned_fixture(ir: &str, native_test: &str) {
     let (remaining, module) = parse_module(ir).unwrap();
     assert!(remaining.trim().is_empty());

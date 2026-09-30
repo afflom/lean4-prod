@@ -1373,7 +1373,7 @@ fn generate_def_in<'m>(
     let generated_name = if helper {
         borrowed_helper_name(def, definitions)
     } else {
-        def.name.clone()
+        rust_ident(&def.name)
     };
     let visibility = if helper { "" } else { "pub " };
     let borrowed_return = returns_borrowed_projection(def, table);
@@ -1536,7 +1536,7 @@ fn generate_def_in<'m>(
     };
     Ok(format!(
         "pub fn {}({}) -> {} {{\n    {}({})\n}}\n\n{}",
-        def.name,
+        rust_ident(&def.name),
         public_params.join(", "),
         public_return,
         generated_name,
@@ -1688,7 +1688,7 @@ fn emitted_call_name(name: &str, definitions: &[Definition], table: &TypeTable<'
         .find(|definition| definition.name == name)
         .filter(|definition| needs_borrowed_helper(definition, table))
         .map(|definition| borrowed_helper_name(definition, definitions))
-        .unwrap_or_else(|| String::from(name))
+        .unwrap_or_else(|| rust_ident(name))
 }
 
 /// A `(named ...)` type occurring in a definition's signature must be
@@ -2825,7 +2825,18 @@ impl<'m> Renderer<'_, 'm> {
             && branch_borrows.iter().any(|borrowed| *borrowed)
             && branch_borrows.iter().any(|borrowed| !borrowed);
         let scrut = self.value(scrut)?;
-        let mut out = format!("match {} {{\n", scrut);
+        // A projected list can be a Vec or a borrowed Vec, whereas a list
+        // parameter is already a slice. Match all representations through a
+        // borrowed full slice without moving or cloning the owner.
+        let match_scrut = if alts
+            .iter()
+            .any(|alt| matches!(alt.ctor.as_str(), "List.nil" | "List.cons"))
+        {
+            format!("&({})[..]", scrut)
+        } else {
+            scrut.clone()
+        };
+        let mut out = format!("match {} {{\n", match_scrut);
         for alt in alts {
             let body = if let Some(plan) = tail {
                 self.render_tail(&alt.body, plan)?

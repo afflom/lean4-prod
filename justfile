@@ -3,7 +3,11 @@ default:
     @just --list
 
 # Complete clean-checkout CI contract.
-ci: fixture-provenance prod fmt-check lint wasm-check portable-package specialized-index scalar-length typed-decimal core-wasm view text-view workspace-view wasm-sdk-fixture uor-fixture
+ci: fixture-provenance prod fmt-check lint wasm-check portable-package specialized-index scalar-length typed-decimal shared-decidable core-wasm view text-view workspace-view wasm-sdk-fixture uor-fixture
+
+# Preserve shared Bool conditions through proof-erased Decidable join points.
+shared-decidable:
+    bash scripts/check-shared-decidable.sh
 
 # Unicode scalars must not be counted as UTF-8 bytes or grapheme clusters.
 scalar-length:

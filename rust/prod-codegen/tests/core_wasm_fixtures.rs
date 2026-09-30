@@ -70,6 +70,38 @@ fn core_wasm_bytes_entries_compile_and_execute() {
                   (if (eq (mul 18446744073709551615 2) 0) input (bytes)) input)))",
             true,
         ),
+        (
+            r#"(module RuntimeNames
+              (type "Layout" (ctor "Layout.mk" (bytes Bytes)))
+              (type "Ordering" (ctor "Ordering.mk" (bytes Bytes)))
+              (type "GlobalAlloc" (ctor "GlobalAlloc.mk" (bytes Bytes)))
+              (type "AtomicU32" (ctor "AtomicU32.mk" (bytes Bytes)))
+              (type "BumpAllocator" (ctor "BumpAllocator.mk" (bytes Bytes)))
+              (type "__prod_core_wasm_runtime" (ctor "__prod_core_wasm_runtime.mk" (bytes Bytes)))
+              (type "__prod_core_wasm_runtime_1" (ctor "__prod_core_wasm_runtime_1.mk" (bytes Bytes)))
+              (def allocate ((input Bytes)) Bytes input)
+              (def trap ((input Bytes)) Bytes input)
+              (def align_to ((input Bytes)) Bytes input)
+              (def ensure_memory ((input Bytes)) Bytes input)
+              (def heap_base ((input Bytes)) Bytes input)
+              (def holo_alloc ((input Bytes)) Bytes input)
+              (def holo_run ((input Bytes)) Bytes input)
+              (def NEXT ((input Bytes)) Bytes input)
+              (def GLOBAL_ALLOCATOR ((input Bytes)) Bytes input)
+              (def INPUT_CAP ((input Bytes)) Bytes input)
+              (def OUTPUT_CAP ((input Bytes)) Bytes input)
+              (def MAXIMUM_PAGES ((input Bytes)) Bytes input)
+              (def __prod_core_wasm_runtime_2 ((input Bytes)) Bytes input)
+              (def panic ((input Bytes)) Bytes input)
+              (def __heap_base ((input Bytes)) Bytes input)
+              (def type ((input Bytes)) Bytes input)
+              (def match ((input String)) Nat (length (utf8-encode input)))
+              (def entry ((input Bytes)) Bytes
+                (if (eq (call match (string "bytes")) 5)
+                  (call type (call allocate (proj "Layout" "bytes" (ctor "Layout.mk" input))))
+                  (bytes 254))))"#,
+            false,
+        ),
     ] {
         let fixture = FixtureDir::new();
         let (_, module) = parse_module(ir).unwrap();
@@ -107,6 +139,71 @@ fn core_wasm_bytes_entries_compile_and_execute() {
                     .join("target/wasm32-unknown-unknown/release/bytes_guest.wasm"),
             )
             .arg(if fallible { "fallible" } else { "infallible" }));
+        if ir.contains("(module RuntimeNames") {
+            execute_owned_fixture(
+                ir,
+                r#"
+                use borrowed_utf8::*;
+                #[test] fn runtime_names_are_model_names() {
+                    for input in [vec![], vec![0, 1, 127, 128, 255]] {
+                        assert_eq!(entry(input.clone()), input);
+                        assert_eq!(allocate(input.clone()), input);
+                        assert_eq!(holo_alloc(input.clone()), input);
+                        assert_eq!(holo_run(input.clone()), input);
+                        assert_eq!(Layout { bytes: input.clone() }.bytes, input);
+                        assert_eq!(Ordering { bytes: input.clone() }.bytes, input);
+                        assert_eq!(r#type(input.clone()), input);
+                    }
+                    assert_eq!(r#match("bytes".into()), 5);
+                }
+            "#,
+            );
+        }
+    }
+}
+
+#[test]
+fn selected_runtime_names_execute_for_owned_and_caller_buffer_entries() {
+    for entry in ["allocate", "holo_alloc", "holo_run", "trap", "type"] {
+        for (input_type, output, fallible) in [
+            ("Bytes", "input", false),
+            ("(List UInt8)", "input", false),
+            (
+                "Bytes",
+                "(if (eq input (bytes 255)) (if (eq (add 18446744073709551615 1) 0) input (bytes)) input)",
+                true,
+            ),
+        ] {
+            let ir = format!("(module Names (def {entry} ((input {input_type})) {input_type} {output}))");
+            let (remaining, module) = parse_module(&ir).unwrap();
+            assert!(remaining.trim().is_empty());
+            let spec = CoreWasmSpec {
+                crate_name: "names-guest".into(),
+                entry: entry.into(),
+                export_name: "holo_run".into(),
+                input_allocation_cap: 128,
+                output_allocation_cap: 64,
+                maximum_pages: 4,
+                input_ir_sha256: format!("{:x}", Sha256::digest(ir.as_bytes())),
+            };
+            let package = generate_core_wasm_package(&module, &spec).unwrap();
+            assert_eq!(package, generate_core_wasm_package(&module, &spec).unwrap());
+            let fixture = FixtureDir::new();
+            for file in package.files {
+                let path = fixture.0.join(file.path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, file.bytes).unwrap();
+            }
+            run(Command::new("cargo")
+                .current_dir(&fixture.0)
+                .args(["build", "--release", "--locked", "--offline"])
+                .env_remove("RUSTC_WRAPPER")
+                .env("CARGO_TARGET_DIR", fixture.0.join("target")));
+            run(Command::new("node")
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/core_wasm_bytes_test.mjs"))
+                .arg(fixture.0.join("target/wasm32-unknown-unknown/release/names_guest.wasm"))
+                .arg(if fallible {"fallible"} else {"infallible"}));
+        }
     }
 }
 
@@ -289,6 +386,90 @@ fn match_binder_ownership_executes_native_no_std_and_wasm() {
         );
     }
     execute_owned_fixture(ir, include_str!("fixtures/match_binders_generated_test.rs"));
+}
+
+#[test]
+fn projected_list_patterns_execute_native_no_std_and_wasm() {
+    let ir = r#"(module ProjectedLists
+      (type "Probe" (ctor "Probe.mk" (refs (List Bytes))))
+      (type "Numbers" (ctor "Numbers.mk" (values (List Nat))))
+      (def direct ((root (named "Probe"))) Bool
+        (cases (proj "Probe" "refs" root)
+          (alt "List.nil" () true) (alt "List.cons" (head tail) false)))
+      (def aliased ((root (named "Probe"))) Bool
+        (let refs (proj "Probe" "refs" root)
+          (let alias refs (cases alias
+            (alt "List.nil" () true) (alt "List.cons" (head tail) false)))))
+      (def default_empty ((root (named "Probe"))) Bool
+        (cases (proj "Probe" "refs" root)
+          (alt "List.nil" () true) (default false)))
+      (def number_head ((root (named "Numbers"))) Nat
+        (cases (proj "Numbers" "values" root)
+          (alt "List.nil" () 0) (alt "List.cons" (head tail) head)))
+      (def wrap ((input Bytes)) (named "Probe")
+        (ctor "Probe.mk" (ctor "List.cons" input (ctor "List.nil"))))
+      (def temporary ((input Bytes)) Bytes
+        (cases (proj "Probe" "refs" (ctor "Probe.mk" (ctor "List.cons" input (ctor "List.nil"))))
+          (alt "List.nil" () (bytes)) (alt "List.cons" (head tail) head)))
+      (def returned ((input Bytes)) Bytes
+        (cases (proj "Probe" "refs" (call wrap input))
+          (alt "List.nil" () (bytes)) (alt "List.cons" (head tail) head)))
+      (def first ((root (named "Probe"))) Bytes
+        (let refs (proj "Probe" "refs" root)
+          (cases refs (alt "List.nil" () (bytes))
+            (alt "List.cons" (head tail) head))))
+      (def second ((root (named "Probe"))) Bytes
+        (cases (proj "Probe" "refs" root) (alt "List.nil" () (bytes))
+          (alt "List.cons" (head tail)
+            (cases tail (alt "List.nil" () (bytes))
+              (alt "List.cons" (next rest) next)))))
+      (def projected ((input Bytes)) Bytes
+        (let empty (ctor "Probe.mk" (ctor "List.nil"))
+          (let full (ctor "Probe.mk" (ctor "List.cons" input (ctor "List.cons" input (ctor "List.nil"))))
+            (if (call direct empty)
+              (if (call aliased empty)
+                (if (call direct full) (bytes 254)
+                  (if (call aliased full) (bytes 254)
+                    (if (eq (call first full) input)
+                      (if (eq (call second full) input) input (bytes 254)) (bytes 254))))
+                (bytes 254)) (bytes 254)))))
+      (def entry ((input Bytes)) Bytes
+        (if (eq (call projected input) input)
+          (if (eq (call temporary input) input)
+            (if (eq (call returned input) input)
+              (if (call default_empty (ctor "Probe.mk" (ctor "List.nil")))
+                (if (call default_empty (call wrap input)) (bytes 254)
+                  (if (eq (call number_head (ctor "Numbers.mk" (ctor "List.cons" 4294967296 (ctor "List.nil")))) 4294967296)
+                    input (bytes 254))) (bytes 254))
+              (bytes 254)) (bytes 254)) (bytes 254))))"#;
+    execute_owned_fixture(
+        ir,
+        r#"
+        use borrowed_utf8::{Probe, Numbers, direct, aliased, default_empty, number_head,
+            temporary, returned, first, second, entry};
+        #[test] fn complete_projected_lists() {
+            for refs in [vec![], vec![vec![1,2]], vec![vec![3], vec![4,5], vec![6]]] {
+                let root = Probe { refs: refs.clone() };
+                assert_eq!(direct(&root), refs.is_empty());
+                assert_eq!(aliased(&root), refs.is_empty());
+                assert_eq!(default_empty(&root), refs.is_empty());
+                assert_eq!(first(&root), refs.first().cloned().unwrap_or_default());
+                assert_eq!(second(&root), refs.get(1).cloned().unwrap_or_default());
+                assert_eq!(root.refs, refs);
+            }
+            for values in [vec![], vec![0], vec![u64::MAX, 4], vec![1_u64 << 32]] {
+                let root = Numbers { values: values.clone() };
+                assert_eq!(number_head(&root), values.first().copied().unwrap_or_default());
+                assert_eq!(root.values, values);
+            }
+            for input in [vec![], vec![0,1,127,128,255], vec![9;128]] {
+                assert_eq!(temporary(input.clone()), input);
+                assert_eq!(returned(input.clone()), input);
+                assert_eq!(entry(input.clone()), input);
+            }
+        }
+    "#,
+    );
 }
 
 fn execute_owned_fixture(ir: &str, native_test: &str) {

@@ -6,7 +6,9 @@ use sha2::{Digest, Sha256};
 
 use prod_ir::{Module, Type};
 
-use crate::{generate_module, signatures, Error, GeneratedPackage, PackageFile, Shape};
+use crate::{
+    generate_module, last_component, signatures, Error, GeneratedPackage, PackageFile, Shape,
+};
 
 /// Closed generic ABI parameters. Application behavior remains in `entry`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +99,24 @@ pub fn generate_core_wasm_package(
         ));
     }
     let generated = generate_module(module)?;
+    // Generated types and function calls retain their crate-root paths. Put
+    // only the ABI/allocator in a fresh module, so ordinary model names cannot
+    // capture runtime helpers or imports (Layout, Ordering, allocate, ...).
+    let mut runtime_module = "__prod_core_wasm_runtime".to_string();
+    for index in 0..=module.types.len() + module.definitions.len() {
+        if !module
+            .types
+            .iter()
+            .any(|ty| last_component(&ty.name) == runtime_module)
+            && !module
+                .definitions
+                .iter()
+                .any(|def| def.name == runtime_module)
+        {
+            break;
+        }
+        runtime_module = format!("__prod_core_wasm_runtime_{}", index + 1);
+    }
     let maximum_memory = u64::from(spec.maximum_pages) * 65_536;
     let cargo = format!(
         "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\ncrate-type = [\"cdylib\"]\npath = \"src/lib.rs\"\n\n[profile.release]\npanic = \"abort\"\nopt-level = \"s\"\nlto = true\ncodegen-units = 1\nstrip = \"symbols\"\n",
@@ -109,10 +129,10 @@ pub fn generate_core_wasm_package(
     let config = format!(
         "[build]\ntarget = \"wasm32-unknown-unknown\"\n\n[target.wasm32-unknown-unknown]\nrustflags = [\"-C\", \"link-arg=--export-memory\", \"-C\", \"link-arg=--max-memory={maximum_memory}\", \"-C\", \"link-arg=-zstack-size=65536\"]\n"
     );
+    let entry = format!("crate::{}", crate::rust_ident(&spec.entry));
     let invoke_entry = if list_entry {
         format!(
             "let output_ptr = allocate(OUTPUT_CAP, 8);\n    let output_end = output_ptr.checked_add(OUTPUT_CAP).unwrap_or_else(|| trap());\n    if input_ptr < output_end && output_ptr < input_end {{ trap(); }}\n    let output = unsafe {{ core::slice::from_raw_parts_mut(output_ptr as *mut u8, OUTPUT_CAP as usize) }};\n    let output_len = {entry}(input, output).unwrap_or_else(|_| trap());\n    if output_len > OUTPUT_CAP as usize {{ trap(); }}",
-            entry = spec.entry,
         )
     } else {
         // Use the same whole-module fixpoint as Rust generation: a Bytes
@@ -126,16 +146,12 @@ pub fn generate_core_wasm_package(
             };
         format!(
             "let generated_output = {entry}(input.to_vec()){result_adapter};\n    if generated_output.len() > OUTPUT_CAP as usize {{ trap(); }}\n    let output_len = generated_output.len();\n    let output_ptr = allocate(u32::try_from(output_len).unwrap_or_else(|_| trap()), 8);\n    let output_end = output_ptr.checked_add(u32::try_from(output_len).unwrap_or_else(|_| trap())).unwrap_or_else(|| trap());\n    if input_ptr < output_end && output_ptr < input_end {{ trap(); }}\n    unsafe {{ core::ptr::copy_nonoverlapping(generated_output.as_ptr(), output_ptr as *mut u8, output_len); }}",
-            entry = spec.entry,
         )
     };
     let source = format!(
         r#"#![no_std]
 #![allow(dead_code, non_snake_case, unused_parens, unused_variables)]
 extern crate alloc;
-
-use core::alloc::{{GlobalAlloc, Layout}};
-use core::sync::atomic::{{AtomicU32, Ordering}};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeError {{
@@ -149,6 +165,10 @@ pub enum ComputeError {{
 }}
 
 {generated}
+
+mod {runtime_module} {{
+use core::alloc::{{GlobalAlloc, Layout}};
+use core::sync::atomic::{{AtomicU32, Ordering}};
 
 const INPUT_CAP: u32 = {input_cap};
 const OUTPUT_CAP: u32 = {output_cap};
@@ -242,8 +262,10 @@ pub extern "C" fn {export_name}(input_ptr: i32, input_len: i32) -> i64 {{
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {{ trap() }}
+}}
 "#,
         generated = generated,
+        runtime_module = runtime_module,
         input_cap = spec.input_allocation_cap,
         output_cap = spec.output_allocation_cap,
         maximum_pages = spec.maximum_pages,

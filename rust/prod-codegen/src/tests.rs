@@ -319,7 +319,7 @@ fn test_core_wasm_bytes_entry_uses_module_fallibility() {
         };
         assert!(
             source.contains(&format!(
-                "let generated_output = entry(input.to_vec()){suffix};"
+                "let generated_output = crate::entry(input.to_vec()){suffix};"
             )),
             "wrong Bytes ABI adapter for {ir}"
         );
@@ -648,7 +648,7 @@ fn test_generate_list_param_is_a_slice_and_return_is_a_buffer() {
     let out = generate(ir);
     assert_eq!(
         out,
-        "pub fn digitSum(xs: &[u64]) -> Result<u64, crate::ComputeError> {\n    Ok(match xs {\n        [] => 0,\n        [h, t @ ..] => { let h = h.clone(); core::convert::identity::<u64>(h).checked_add(digitSum(&(t))?).ok_or(crate::ComputeError::AddOverflow)? },\n    })\n}\n\npub fn digits(n: u64, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    if (n < 8) { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = n; let __len0 = Ok::<usize, crate::ComputeError>(0)?; Ok(__len0 + 1) } } } else { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = match (core::convert::identity::<u64>(n), core::convert::identity::<u64>(8)) { (__left, 0) => __left, (__left, __right) => __left % __right }; let __len0 = digits(match (core::convert::identity::<u64>(n), core::convert::identity::<u64>(8)) { (__left, 0) => 0, (__left, __right) => __left / __right }, __rest0)?; Ok(__len0 + 1) } } }\n}\n\n"
+        "pub fn digitSum(xs: &[u64]) -> Result<u64, crate::ComputeError> {\n    Ok(match &(xs)[..] {\n        [] => 0,\n        [h, t @ ..] => { let h = h.clone(); core::convert::identity::<u64>(h).checked_add(digitSum(&(t))?).ok_or(crate::ComputeError::AddOverflow)? },\n    })\n}\n\npub fn digits(n: u64, output: &mut [u64]) -> Result<usize, crate::ComputeError> {\n    if (n < 8) { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = n; let __len0 = Ok::<usize, crate::ComputeError>(0)?; Ok(__len0 + 1) } } } else { match (output).split_first_mut() { None => Err(crate::ComputeError::OutputTooSmall), Some((__head0, __rest0)) => { *__head0 = match (core::convert::identity::<u64>(n), core::convert::identity::<u64>(8)) { (__left, 0) => __left, (__left, __right) => __left % __right }; let __len0 = digits(match (core::convert::identity::<u64>(n), core::convert::identity::<u64>(8)) { (__left, 0) => 0, (__left, __right) => __left / __right }, __rest0)?; Ok(__len0 + 1) } } }\n}\n\n"
     );
 }
 

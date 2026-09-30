@@ -1385,7 +1385,7 @@ fn generate_def_in<'m>(
     } else if helper {
         borrowed_helper_name(def, definitions)
     } else {
-        def.name.clone()
+        rust_ident(&def.name)
     };
     let visibility = if helper { "" } else { "pub " };
     let borrowed_return = returns_borrowed_projection(def, table);
@@ -1459,13 +1459,14 @@ fn generate_def_in<'m>(
                     def.name
                 )));
             }
-            let mut items = Vec::new();
-            renderer.static_list(&def.body, &[], &mut items)?;
+            let mut output = StaticOutput::new(&def.body, renderer.definitions);
+            renderer.static_list(&def.body, &[], &[], &[], elem, &mut output)?;
             Ok(format!(
-                "{visibility}fn {}() -> &'static [{}] {{\n    &[{}]\n}}\n",
+                "{visibility}fn {}() -> &'static [{}] {{\n{}    &[{}]\n}}\n",
                 generated_name,
                 type_to_rust(elem)?,
-                items.join(", ")
+                output.declarations.concat(),
+                output.items.join(", ")
             ))
         }
         Shape::Buffer => {
@@ -1556,7 +1557,7 @@ fn generate_def_in<'m>(
     };
     Ok(format!(
         "pub fn {}({}) -> {} {{\n    {}({})\n}}\n\n{}",
-        def.name,
+        rust_ident(&def.name),
         public_params.join(", "),
         public_return,
         generated_name,
@@ -1726,7 +1727,7 @@ fn emitted_call_name(name: &str, definitions: &[Definition], table: &TypeTable<'
         .find(|definition| definition.name == name)
         .filter(|definition| needs_borrowed_helper(definition, table))
         .map(|definition| borrowed_helper_name(definition, definitions))
-        .unwrap_or_else(|| String::from(name))
+        .unwrap_or_else(|| rust_ident(name))
 }
 
 /// A `(named ...)` type occurring in a definition's signature must be
@@ -1857,6 +1858,67 @@ enum Mode<'x, 'm> {
         /// Nesting depth, used to keep generated temporaries unique.
         depth: usize,
     },
+}
+
+/// A closed, allocation-free initializer captured at its lexical binding.
+/// Only compiler storage owns the rendered aggregate text; generated values
+/// remain literals and typed record/enum constructors in a promoted slice.
+#[derive(Clone)]
+enum StaticConstant<'m> {
+    Nat(u64),
+    Int(i64),
+    Bool(bool),
+    Aggregate { name: &'m str, rendered: String },
+}
+
+struct StaticOutput {
+    items: Vec<String>,
+    declarations: Vec<String>,
+    reserved: BTreeSet<String>,
+}
+
+impl StaticOutput {
+    fn new(body: &Expr, definitions: &[Definition]) -> Self {
+        fn reserve(expr: &Expr, names: &mut BTreeSet<String>) {
+            match expr {
+                Expr::Var(name) | Expr::Let(name, _, _) | Expr::Call(name, _) => {
+                    names.insert(rust_local_ident(name));
+                }
+                _ => {}
+            }
+            for child in expr.children() {
+                reserve(child, names);
+            }
+        }
+        let mut reserved = definitions
+            .iter()
+            .map(|definition| rust_ident(&definition.name))
+            .collect();
+        reserve(body, &mut reserved);
+        Self {
+            items: Vec::new(),
+            declarations: Vec::new(),
+            reserved,
+        }
+    }
+
+    fn aggregate(&mut self, ty: &str, initializer: &str) -> String {
+        // Keep shared immutable aggregate bindings shared in generated text.
+        // Expanding a binary constructor DAG inline would grow exponentially.
+        let mut ordinal = self.declarations.len();
+        let name = loop {
+            let candidate = format!("__PROD_STATIC_CONSTANT_{ordinal}");
+            if self.reserved.insert(candidate.clone()) {
+                break candidate;
+            }
+            ordinal += 1;
+        };
+        self.declarations.push(format!(
+            "    const {name}: crate::{} = {initializer};\n",
+            rust_ident(last_component(ty))
+        ));
+        name
+    }
 }
 
 struct Renderer<'s, 'm> {
@@ -2804,7 +2866,18 @@ impl<'m> Renderer<'_, 'm> {
             && branch_borrows.iter().any(|borrowed| *borrowed)
             && branch_borrows.iter().any(|borrowed| !borrowed);
         let scrut = self.value(scrut)?;
-        let mut out = format!("match {} {{\n", scrut);
+        // A projected list can be a Vec or a borrowed Vec, whereas a list
+        // parameter is already a slice. Match all representations through a
+        // borrowed full slice without moving or cloning the owner.
+        let match_scrut = if alts
+            .iter()
+            .any(|alt| matches!(alt.ctor.as_str(), "List.nil" | "List.cons"))
+        {
+            format!("&({})[..]", scrut)
+        } else {
+            scrut.clone()
+        };
+        let mut out = format!("match {} {{\n", match_scrut);
         for alt in alts {
             let body = if let Some(plan) = tail {
                 self.render_tail(&alt.body, plan)?
@@ -2958,20 +3031,41 @@ impl<'m> Renderer<'_, 'm> {
     }
 
     /// Flatten a constant `List.cons`/`List.nil` chain into array elements for
-    /// a promoted `&'static [T]`. Only `let`-bound list values are followed;
-    /// anything computed belongs in builder mode instead.
+    /// a promoted `&'static [T]`. LCNF also binds literals and closed record/enum
+    /// constructors before its cons cells. Keep those in a separate lexical
+    /// environment: aliases capture their exact initializer at binding time. Computed
+    /// bindings still belong in builder mode instead. `generate_def_in` has
+    /// already made every lexical binder unique. Each list additionally keeps
+    /// its original visible constant boundary and list prefix, so unresolved
+    /// names cannot capture a later binding when the retained body is read.
     fn static_list(
         &self,
         expr: &'m Expr,
         env: &[(&'m str, &'m Expr)],
-        items: &mut Vec<String>,
+        scalar_scopes: &[usize],
+        scalars: &[(&'m str, StaticConstant<'m>)],
+        element: &Type,
+        output: &mut StaticOutput,
     ) -> Result<(), Error> {
         if let Expr::Let(name, value, _) = expr {
             self.reject_eager_list_binding(name, value, env)?;
         }
         match expr {
-            Expr::Var(name) => match lookup(env, name) {
-                Some(bound) => self.static_list(bound, env, items),
+            Expr::Var(name) => match env
+                .iter()
+                .zip(scalar_scopes)
+                .enumerate()
+                .rev()
+                .find(|(_, ((bound, _), _))| bound == name)
+            {
+                Some((index, ((_, bound), scope))) => self.static_list(
+                    bound,
+                    &env[..index],
+                    &scalar_scopes[..index],
+                    &scalars[..*scope],
+                    element,
+                    output,
+                ),
                 None => Err(Error::UnsupportedList(format!(
                     "`{}` is not a constant list",
                     name
@@ -2980,17 +3074,166 @@ impl<'m> Renderer<'_, 'm> {
             Expr::Let(name, val, body) if self.is_list_valued(val, env) => {
                 let mut extended = env.to_vec();
                 extended.push((name.as_str(), val));
-                self.static_list(body, &extended, items)
+                let mut extended_scopes = scalar_scopes.to_vec();
+                extended_scopes.push(scalars.len());
+                self.static_list(body, &extended, &extended_scopes, scalars, element, output)
+            }
+            Expr::Let(name, value, body) => {
+                let mut literal = self.static_constant(value, scalars)?;
+                if !matches!(value.as_ref(), Expr::Var(_)) {
+                    if let StaticConstant::Aggregate { name, rendered } = &mut literal {
+                        *rendered = output.aggregate(name, rendered);
+                    }
+                }
+                let mut extended = scalars.to_vec();
+                extended.push((name.as_str(), literal));
+                self.static_list(body, env, scalar_scopes, &extended, element, output)
             }
             Expr::Ctor(name, args) if name == "List.nil" && args.is_empty() => Ok(()),
             Expr::Ctor(name, args) if name == "List.cons" && args.len() == 2 => {
-                items.push(self.value(&args[0])?);
-                self.static_list(&args[1], env, items)
+                output
+                    .items
+                    .push(self.static_list_element(&args[0], scalars, element)?);
+                self.static_list(&args[1], env, scalar_scopes, scalars, element, output)
             }
             _ => Err(Error::UnsupportedList(
                 "zero-argument list definitions must be constant cons chains".to_string(),
             )),
         }
+    }
+
+    fn static_constant(
+        &self,
+        expr: &'m Expr,
+        scalars: &[(&'m str, StaticConstant<'m>)],
+    ) -> Result<StaticConstant<'m>, Error> {
+        match expr {
+            Expr::Nat(value) => Ok(StaticConstant::Nat(*value)),
+            Expr::Int(value) => Ok(StaticConstant::Int(*value)),
+            Expr::Bool(value) => Ok(StaticConstant::Bool(*value)),
+            // Stored values are already resolved constants, never expressions
+            // that can acquire a later binding or form an alias cycle.
+            Expr::Var(name) => scalars
+                .iter()
+                .rev()
+                .find(|(bound, _)| *bound == name)
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| Error::UnsupportedList("unbound static list initializer".into())),
+            Expr::Ctor(name, arguments) if arguments.is_empty() && name == "Bool.true" => {
+                Ok(StaticConstant::Bool(true))
+            }
+            Expr::Ctor(name, arguments) if arguments.is_empty() && name == "Bool.false" => {
+                Ok(StaticConstant::Bool(false))
+            }
+            Expr::Ctor(name, arguments) => {
+                let (declaration, constructor) = self.ctor_decl(name).ok_or_else(|| {
+                    Error::UnsupportedList(format!(
+                        "static initializer `{name}` is not a declared record or enum constructor"
+                    ))
+                })?;
+                if arguments.len() != constructor.fields.len() {
+                    return Err(Error::UnsupportedFieldType(format!(
+                        "`{name}` takes {} field(s) but got {} argument(s)",
+                        constructor.fields.len(),
+                        arguments.len()
+                    )));
+                }
+                let mut fields = Vec::with_capacity(arguments.len());
+                for ((field, ty), argument) in constructor.fields.iter().zip(arguments) {
+                    let value = self.static_constant(argument, scalars)?;
+                    fields.push(format!(
+                        "{}: {}",
+                        rust_ident(field),
+                        self.static_constant_value(&value, ty)?
+                    ));
+                }
+                let path = if declaration.ctors.len() == 1 {
+                    format!("crate::{}", rust_ident(last_component(&declaration.name)))
+                } else {
+                    format!(
+                        "crate::{}::{}",
+                        rust_ident(last_component(&declaration.name)),
+                        rust_ident(last_component(&constructor.name))
+                    )
+                };
+                let rendered = if fields.is_empty() && declaration.ctors.len() != 1 {
+                    path
+                } else {
+                    format!("{path} {{ {} }}", fields.join(", "))
+                };
+                Ok(StaticConstant::Aggregate {
+                    name: &declaration.name,
+                    rendered,
+                })
+            }
+            _ => Err(Error::UnsupportedList(
+                "static list bindings require closed allocation-free constants".into(),
+            )),
+        }
+    }
+
+    fn static_constant_value(
+        &self,
+        value: &StaticConstant<'m>,
+        element: &Type,
+    ) -> Result<String, Error> {
+        let valid = match (value, element) {
+            (StaticConstant::Nat(_), Type::Nat | Type::UInt64)
+            | (StaticConstant::Bool(_), Type::Bool) => true,
+            (StaticConstant::Nat(value), Type::UInt8) => u8::try_from(*value).is_ok(),
+            (StaticConstant::Nat(value), Type::UInt16) => u16::try_from(*value).is_ok(),
+            (StaticConstant::Nat(value), Type::UInt32) => u32::try_from(*value).is_ok(),
+            (StaticConstant::Nat(value), Type::Int8) => i8::try_from(*value).is_ok(),
+            (StaticConstant::Nat(value), Type::Int16) => i16::try_from(*value).is_ok(),
+            (StaticConstant::Nat(value), Type::Int32) => i32::try_from(*value).is_ok(),
+            (StaticConstant::Nat(value), Type::Int64) => i64::try_from(*value).is_ok(),
+            (StaticConstant::Int(value), Type::Int8) => i8::try_from(*value).is_ok(),
+            (StaticConstant::Int(value), Type::Int16) => i16::try_from(*value).is_ok(),
+            (StaticConstant::Int(value), Type::Int32) => i32::try_from(*value).is_ok(),
+            (StaticConstant::Int(_), Type::Int64) => true,
+            (StaticConstant::Aggregate { name, .. }, Type::Named(expected)) => *name == expected,
+            _ => false,
+        };
+        if !valid {
+            return Err(Error::UnsupportedList(
+                "static list constant does not fit its declared type".to_string(),
+            ));
+        }
+        Ok(match value {
+            StaticConstant::Nat(value) => format!("{value}"),
+            StaticConstant::Int(value) => format!("{value}"),
+            StaticConstant::Bool(value) => format!("{value}"),
+            StaticConstant::Aggregate { rendered, .. } => rendered.clone(),
+        })
+    }
+
+    fn static_list_element(
+        &self,
+        expr: &'m Expr,
+        scalars: &[(&'m str, StaticConstant<'m>)],
+        element: &Type,
+    ) -> Result<String, Error> {
+        if let Ok(value) = self.static_constant(expr, scalars) {
+            return self.static_constant_value(&value, element);
+        }
+        if matches!(expr, Expr::Var(_)) {
+            return Err(Error::UnsupportedList(
+                "static list element is not a bound scalar literal".to_string(),
+            ));
+        }
+        // Preserve previously supported closed element expressions, including
+        // scalar continuations. This extension does not evaluate expressions
+        // involving newly admitted outer literal bindings.
+        fn uses_scalar(expr: &Expr, scalars: &[(&str, StaticConstant<'_>)]) -> bool {
+            matches!(expr, Expr::Var(name) if scalars.iter().any(|(bound,_)| *bound == name))
+                || expr.children().any(|child| uses_scalar(child, scalars))
+        }
+        if uses_scalar(expr, scalars) {
+            return Err(Error::UnsupportedList(
+                "static list literal aliases cannot be used in computed elements".to_string(),
+            ));
+        }
+        self.value(expr)
     }
 
     fn binop(&self, a: &'m Expr, b: &'m Expr, op: &str) -> Result<String, Error> {

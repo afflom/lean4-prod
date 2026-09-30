@@ -10,6 +10,7 @@ named error rather than silently mis-compiled.
 
 - `Nat (bounded u64 target policy)`
 - `Bool`
+- `Decidable (builtin proof-erased Bool tags, including shared join-point cases)`
 - `Int (mathematical; target closure rejected as UnboundedInt)`
 - `Int8`
 - `Int16`

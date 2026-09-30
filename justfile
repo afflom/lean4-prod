@@ -3,11 +3,15 @@ default:
     @just --list
 
 # Complete clean-checkout CI contract.
-ci: fixture-provenance prod fmt-check lint wasm-check portable-package specialized-index scalar-length typed-decimal owned-accumulator core-wasm view text-view workspace-view wasm-sdk-fixture uor-fixture
+ci: fixture-provenance prod fmt-check lint wasm-check portable-package specialized-index scalar-length typed-decimal shared-decidable owned-accumulator core-wasm view text-view workspace-view wasm-sdk-fixture uor-fixture
 
 # Move single-use owned record accumulators without changing public slice ABI.
 owned-accumulator:
     bash scripts/check-owned-accumulator.sh
+
+# Preserve shared Bool conditions through proof-erased Decidable join points.
+shared-decidable:
+    bash scripts/check-shared-decidable.sh
 
 # Unicode scalars must not be counted as UTF-8 bytes or grapheme clusters.
 scalar-length:

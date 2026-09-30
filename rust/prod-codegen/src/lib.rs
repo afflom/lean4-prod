@@ -1442,7 +1442,7 @@ fn generate_def_in<'m>(
                 )));
             }
             let mut items = Vec::new();
-            renderer.static_list(&def.body, &[], &mut items)?;
+            renderer.static_list(&def.body, &[], &[], &[], elem, &mut items)?;
             Ok(format!(
                 "{visibility}fn {}() -> &'static [{}] {{\n    &[{}]\n}}\n",
                 generated_name,
@@ -2928,20 +2928,41 @@ impl<'m> Renderer<'_, 'm> {
     }
 
     /// Flatten a constant `List.cons`/`List.nil` chain into array elements for
-    /// a promoted `&'static [T]`. Only `let`-bound list values are followed;
-    /// anything computed belongs in builder mode instead.
+    /// a promoted `&'static [T]`. LCNF also binds scalar literals before its
+    /// cons cells. Keep those in a separate lexical environment: they are not
+    /// lists, and aliases capture their literal at binding time. Computed
+    /// bindings still belong in builder mode instead. `generate_def_in` has
+    /// already made every lexical binder unique. Each list additionally keeps
+    /// its original visible scalar boundary and list prefix, so unresolved
+    /// names cannot capture a later binding when the retained body is read.
     fn static_list(
         &self,
         expr: &'m Expr,
         env: &[(&'m str, &'m Expr)],
+        scalar_scopes: &[usize],
+        scalars: &[(&'m str, &'m Expr)],
+        element: &Type,
         items: &mut Vec<String>,
     ) -> Result<(), Error> {
         if let Expr::Let(name, value, _) = expr {
             self.reject_eager_list_binding(name, value, env)?;
         }
         match expr {
-            Expr::Var(name) => match lookup(env, name) {
-                Some(bound) => self.static_list(bound, env, items),
+            Expr::Var(name) => match env
+                .iter()
+                .zip(scalar_scopes)
+                .enumerate()
+                .rev()
+                .find(|(_, ((bound, _), _))| bound == name)
+            {
+                Some((index, ((_, bound), scope))) => self.static_list(
+                    bound,
+                    &env[..index],
+                    &scalar_scopes[..index],
+                    &scalars[..*scope],
+                    element,
+                    items,
+                ),
                 None => Err(Error::UnsupportedList(format!(
                     "`{}` is not a constant list",
                     name
@@ -2950,17 +2971,89 @@ impl<'m> Renderer<'_, 'm> {
             Expr::Let(name, val, body) if self.is_list_valued(val, env) => {
                 let mut extended = env.to_vec();
                 extended.push((name.as_str(), val));
-                self.static_list(body, &extended, items)
+                let mut extended_scopes = scalar_scopes.to_vec();
+                extended_scopes.push(scalars.len());
+                self.static_list(body, &extended, &extended_scopes, scalars, element, items)
+            }
+            Expr::Let(name, value, body) => {
+                let literal = Self::static_literal(value, scalars).ok_or_else(|| {
+                    Error::UnsupportedList(
+                        "static list scalar bindings must be literals or lexical literal aliases"
+                            .to_string(),
+                    )
+                })?;
+                let mut extended = scalars.to_vec();
+                extended.push((name.as_str(), literal));
+                self.static_list(body, env, scalar_scopes, &extended, element, items)
             }
             Expr::Ctor(name, args) if name == "List.nil" && args.is_empty() => Ok(()),
             Expr::Ctor(name, args) if name == "List.cons" && args.len() == 2 => {
-                items.push(self.value(&args[0])?);
-                self.static_list(&args[1], env, items)
+                items.push(self.static_list_element(&args[0], scalars, element)?);
+                self.static_list(&args[1], env, scalar_scopes, scalars, element, items)
             }
             _ => Err(Error::UnsupportedList(
                 "zero-argument list definitions must be constant cons chains".to_string(),
             )),
         }
+    }
+
+    fn static_literal(expr: &'m Expr, scalars: &[(&'m str, &'m Expr)]) -> Option<&'m Expr> {
+        match expr {
+            Expr::Nat(_) | Expr::Int(_) | Expr::Bool(_) => Some(expr),
+            // Stored values are already resolved literals, never expressions
+            // that can acquire a later binding or form an alias cycle.
+            Expr::Var(name) => lookup(scalars, name),
+            _ => None,
+        }
+    }
+
+    fn static_list_element(
+        &self,
+        expr: &'m Expr,
+        scalars: &[(&'m str, &'m Expr)],
+        element: &Type,
+    ) -> Result<String, Error> {
+        if let Some(literal) = Self::static_literal(expr, scalars) {
+            let valid = match (literal, element) {
+                (Expr::Nat(_), Type::Nat | Type::UInt64) | (Expr::Bool(_), Type::Bool) => true,
+                (Expr::Nat(value), Type::UInt8) => u8::try_from(*value).is_ok(),
+                (Expr::Nat(value), Type::UInt16) => u16::try_from(*value).is_ok(),
+                (Expr::Nat(value), Type::UInt32) => u32::try_from(*value).is_ok(),
+                (Expr::Nat(value), Type::Int8) => i8::try_from(*value).is_ok(),
+                (Expr::Nat(value), Type::Int16) => i16::try_from(*value).is_ok(),
+                (Expr::Nat(value), Type::Int32) => i32::try_from(*value).is_ok(),
+                (Expr::Nat(value), Type::Int64) => i64::try_from(*value).is_ok(),
+                (Expr::Int(value), Type::Int8) => i8::try_from(*value).is_ok(),
+                (Expr::Int(value), Type::Int16) => i16::try_from(*value).is_ok(),
+                (Expr::Int(value), Type::Int32) => i32::try_from(*value).is_ok(),
+                (Expr::Int(_), Type::Int64) => true,
+                _ => false,
+            };
+            if !valid {
+                return Err(Error::UnsupportedList(
+                    "static list literal does not fit its declared element type".to_string(),
+                ));
+            }
+            return self.value(literal);
+        }
+        if matches!(expr, Expr::Var(_)) {
+            return Err(Error::UnsupportedList(
+                "static list element is not a bound scalar literal".to_string(),
+            ));
+        }
+        // Preserve previously supported closed element expressions, including
+        // scalar continuations. This extension does not evaluate expressions
+        // involving newly admitted outer literal bindings.
+        fn uses_scalar(expr: &Expr, scalars: &[(&str, &Expr)]) -> bool {
+            matches!(expr, Expr::Var(name) if lookup(scalars, name).is_some())
+                || expr.children().any(|child| uses_scalar(child, scalars))
+        }
+        if uses_scalar(expr, scalars) {
+            return Err(Error::UnsupportedList(
+                "static list literal aliases cannot be used in computed elements".to_string(),
+            ));
+        }
+        self.value(expr)
     }
 
     fn binop(&self, a: &'m Expr, b: &'m Expr, op: &str) -> Result<String, Error> {

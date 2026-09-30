@@ -96,6 +96,135 @@ fn cost(
     }
 }
 
+// A control-flow diamond can select a continuation's argument once instead of
+// copying the continuation into every branch. Only a single, lexically visible
+// argument is supported: no tuple packaging, coercion, closure, or allocation.
+fn tail_destination(source: &Expr) -> Option<&str> {
+    match source {
+        Expr::Jmp(name, arguments) if arguments.len() == 1 => Some(name),
+        Expr::Let(_, _, body) => tail_destination(body),
+        Expr::If(_, yes, no) => {
+            let name = tail_destination(yes)?;
+            (tail_destination(no)? == name).then_some(name)
+        }
+        Expr::Match { alts, default, .. } => {
+            let first = alts.first().map(|alt| &alt.body).or(default.as_deref())?;
+            let name = tail_destination(first)?;
+            (alts
+                .iter()
+                .all(|alt| tail_destination(&alt.body) == Some(name))
+                && default
+                    .as_deref()
+                    .is_none_or(|body| tail_destination(body) == Some(name)))
+            .then_some(name)
+        }
+        _ => None,
+    }
+}
+
+fn take_tail_arguments(source: &mut Expr, destination: &str) -> Result<(), Error> {
+    match source {
+        Expr::Jmp(name, arguments) if name == destination && arguments.len() == 1 => {
+            *source = arguments
+                .pop()
+                .ok_or_else(|| Error::UnsupportedJoinPoint(String::from(destination)))?;
+        }
+        Expr::Let(_, _, body) => take_tail_arguments(body, destination)?,
+        Expr::If(_, yes, no) => {
+            take_tail_arguments(yes, destination)?;
+            take_tail_arguments(no, destination)?;
+        }
+        Expr::Match { alts, default, .. } => {
+            for alt in alts {
+                take_tail_arguments(&mut alt.body, destination)?;
+            }
+            if let Some(body) = default {
+                take_tail_arguments(body, destination)?;
+            }
+        }
+        _ => return Err(Error::UnsupportedJoinPoint(String::from(destination))),
+    }
+    Ok(())
+}
+
+fn factor_tail_diamonds(
+    source: &mut Expr,
+    available: &mut BTreeSet<String>,
+    tail: bool,
+) -> Result<(), Error> {
+    match source {
+        Expr::Let(_, value, body) => {
+            factor_tail_diamonds(value, available, false)?;
+            let declared = if let Expr::Jp { name, .. } = value.as_ref() {
+                available.insert(name.clone()).then(|| name.clone())
+            } else {
+                None
+            };
+            factor_tail_diamonds(body, available, tail)?;
+            if let Some(name) = declared {
+                available.remove(&name);
+            }
+        }
+        Expr::Jp { body, .. } => factor_tail_diamonds(body, available, true)?,
+        Expr::If(condition, yes, no) => {
+            factor_tail_diamonds(condition, available, false)?;
+            factor_tail_diamonds(yes, available, tail)?;
+            factor_tail_diamonds(no, available, tail)?;
+        }
+        Expr::Match {
+            scrut,
+            alts,
+            default,
+        } => {
+            factor_tail_diamonds(scrut, available, false)?;
+            for alt in alts {
+                factor_tail_diamonds(&mut alt.body, available, tail)?;
+            }
+            if let Some(body) = default {
+                factor_tail_diamonds(body, available, tail)?;
+            }
+        }
+        _ => {
+            for child in source.children_mut() {
+                factor_tail_diamonds(child, available, false)?;
+            }
+        }
+    }
+    if tail && matches!(source, Expr::If(..) | Expr::Match { .. }) {
+        if let Some(name) = tail_destination(source).filter(|name| available.contains(*name)) {
+            let name = String::from(name);
+            let mut argument = core::mem::replace(source, Expr::Nat(0));
+            take_tail_arguments(&mut argument, &name)?;
+            *source = Expr::Jmp(name, alloc::vec![argument]);
+        }
+    }
+    Ok(())
+}
+
+fn validate_jumps(source: &Expr, context: &JpContext<'_>) -> Result<(), Error> {
+    if let Expr::Jmp(name, arguments) = source {
+        if !context
+            .decls
+            .get(name.as_str())
+            .is_some_and(|(parameters, _)| parameters.len() == arguments.len())
+        {
+            return Err(Error::UnsupportedJoinPoint(name.clone()));
+        }
+    }
+    for child in source.children() {
+        validate_jumps(child, context)?;
+    }
+    Ok(())
+}
+
+fn reserve_compaction_nodes(source: &Expr, remaining: &mut usize) -> Result<(), Error> {
+    *remaining = remaining.checked_sub(1).ok_or(Error::JoinExpansionLimit)?;
+    for child in source.children() {
+        reserve_compaction_nodes(child, remaining)?;
+    }
+    Ok(())
+}
+
 /// Input names are already alpha-unique. Callers normalize again afterward,
 /// because each continuation expansion creates a new lexical binding scope.
 pub(crate) fn expand(definition: &Definition) -> Result<Option<Definition>, Error> {
@@ -108,14 +237,44 @@ pub(crate) fn expand(definition: &Definition) -> Result<Option<Definition>, Erro
             return Err(Error::UnsupportedJoinPoint(String::from(*name)));
         }
     }
-    cost(
+    validate_jumps(&definition.body, &context)?;
+    let checked = cost(
         &definition.body,
         &context,
         &mut BTreeMap::new(),
         &mut BTreeSet::new(),
-    )?;
+    );
+    // Preserve the established lowering of every already-admitted definition.
+    // The fallback never expands first and never raises the resource limits.
+    if checked == Err(Error::JoinExpansionLimit) {
+        // Bound the fallback's unexpanded working copy as well. This does not
+        // alter previously admitted input or claim a general IR-depth bound.
+        let mut remaining = MAX_NODES;
+        reserve_compaction_nodes(&definition.body, &mut remaining)?;
+    }
     let mut result = definition.clone();
-    expression(&mut result.body, &context, &mut BTreeSet::new())?;
+    if checked == Err(Error::JoinExpansionLimit) {
+        factor_tail_diamonds(&mut result.body, &mut BTreeSet::new(), true)?;
+        let compact = JpContext::collect(&result.body);
+        for name in compact.decls.keys() {
+            if compact.is_cyclic(name) {
+                return Err(Error::UnsupportedJoinPoint(String::from(*name)));
+            }
+        }
+        validate_jumps(&result.body, &compact)?;
+        cost(
+            &result.body,
+            &compact,
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+        )?;
+        let compact_source = result.clone();
+        let compact = JpContext::collect(&compact_source.body);
+        expression(&mut result.body, &compact, &mut BTreeSet::new())?;
+    } else {
+        checked?;
+        expression(&mut result.body, &context, &mut BTreeSet::new())?;
+    }
     Ok(Some(result))
 }
 
@@ -273,12 +432,160 @@ mod tests {
 
     #[test]
     fn acyclic_exponential_expansion_is_rejected_before_materialization() {
-        let source = chain(16, true);
+        let mut source = chain(16, true);
+        fn widen(source: &mut Expr) {
+            match source {
+                Expr::Jp { name, params, .. } => params.push(format!("extra{name}")),
+                Expr::Jmp(_, arguments) => arguments.push(Expr::Nat(0)),
+                _ => (),
+            }
+            for child in source.children_mut() {
+                widen(child);
+            }
+        }
+        // Multi-argument DAGs are not factored; the same hard guard still
+        // refuses expansion before materializing an exponential tree.
+        widen(&mut source.body);
+        let original = source.clone();
         assert_eq!(expand(&source), Err(Error::JoinExpansionLimit));
+        assert_eq!(source, original, "rejection does not modify source IR");
+    }
+
+    fn nodes(source: &Expr) -> usize {
+        1 + source.children().map(nodes).sum::<usize>()
+    }
+
+    #[test]
+    fn one_argument_diamonds_keep_the_guard_and_materialize_linear_size() {
+        let source = chain(16, true);
+        assert_eq!(measured(&source), Err(Error::JoinExpansionLimit));
+        let expanded = expand(&source).unwrap().unwrap();
+        assert!(nodes(&expanded.body) < 150);
+        assert_eq!(source, chain(16, true), "factoring preserves source IR");
+    }
+
+    #[test]
+    fn actual_verified_foundry_definition_is_compacted_before_materialization() {
+        use sha2::{Digest, Sha256};
+        let input = include_str!("../tests/fixtures/foundry_anonymous_ui_lcnf.ir");
         assert_eq!(
-            source,
-            chain(16, true),
-            "rejection does not modify source IR"
+            format!("{:x}", Sha256::digest(input.as_bytes())),
+            "7fda32ce4c2bde87716b034b819520f1c6728aafd78289e1df0823c80e369133"
         );
+        let (remaining, module) = prod_ir::parser::parse_module(input).unwrap();
+        assert!(remaining.is_empty());
+        let source = module
+            .definitions
+            .iter()
+            .find(|d| d.name == "anonymousPresentation")
+            .unwrap();
+        assert_eq!(nodes(&source.body), 834);
+        assert_eq!(JpContext::collect(&source.body).decls.len(), 17);
+        assert_eq!(measured(source), Err(Error::JoinExpansionLimit));
+        let expanded = expand(source).unwrap().unwrap();
+        assert!(
+            nodes(&expanded.body) < 2_000,
+            "actual expanded nodes {}",
+            nodes(&expanded.body)
+        );
+        assert!(JpContext::collect(&expanded.body).decls.is_empty());
+    }
+
+    fn body(input: &str) -> Expr {
+        let input = format!("(module Probe (def probe () Nat {input}))");
+        prod_ir::parser::parse_module(&input)
+            .unwrap()
+            .1
+            .definitions
+            .remove(0)
+            .body
+    }
+
+    #[test]
+    fn factoring_preserves_branch_scopes_and_conditions_without_copying_arguments() {
+        let mut source = body("(if flag (let local 1 (jmp finish (add local 3))) (let local 2 (jmp finish (add local 4))))");
+        let expected =
+            body("(jmp finish (if flag (let local 1 (add local 3)) (let local 2 (add local 4))))");
+        factor_tail_diamonds(
+            &mut source,
+            &mut BTreeSet::from([String::from("finish")]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(source, expected);
+    }
+
+    #[test]
+    fn factoring_visits_default_branches_and_requires_one_lexically_available_target() {
+        let mut source =
+            body("(cases flag (alt \"Bool.true\" () (jmp finish 1)) (default (jmp finish 2)))");
+        let expected = body("(jmp finish (cases flag (alt \"Bool.true\" () 1) (default 2)))");
+        factor_tail_diamonds(
+            &mut source,
+            &mut BTreeSet::from([String::from("finish")]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(source, expected);
+        for input in [
+            "(if flag (jmp finish 1) (jmp other 2))",
+            "(if flag (jmp finish 1 2) (jmp finish 3 4))",
+            "(cases flag (alt \"Bool.true\" () (jmp finish 1)) (default (jmp other 2)))",
+            "(add 1 (if flag (jmp finish 1) (jmp finish 2)))",
+            "(let result (if flag (jmp finish 1) (jmp finish 2)) result)",
+        ] {
+            let mut source = body(input);
+            let original = source.clone();
+            factor_tail_diamonds(
+                &mut source,
+                &mut BTreeSet::from([String::from("finish"), String::from("other")]),
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                source, original,
+                "unsupported shape remains unchanged: {input}"
+            );
+        }
+        let mut source = body("(if flag (jmp hidden 1) (jmp hidden 2))");
+        let original = source.clone();
+        factor_tail_diamonds(&mut source, &mut BTreeSet::new(), true).unwrap();
+        assert_eq!(
+            source, original,
+            "join identity cannot escape its declaration scope"
+        );
+    }
+
+    #[test]
+    fn malformed_branches_are_checked_before_early_expansion_refusal() {
+        for bad in ["(jmp absent 1)", "(jmp join0 1 2)"] {
+            let source = chain(16, true);
+            let invalid = Definition {
+                body: Expr::If(
+                    Box::new(Expr::Bool(true)),
+                    Box::new(source.body),
+                    Box::new(body(bad)),
+                ),
+                ..source
+            };
+            assert!(matches!(
+                expand(&invalid),
+                Err(Error::UnsupportedJoinPoint(_))
+            ));
+        }
+        let source = chain(16, true);
+        let cyclic = body("(let hidden (jp hidden (value) (jmp hidden value)) (jmp hidden 1))");
+        let invalid = Definition {
+            body: Expr::If(
+                Box::new(Expr::Bool(true)),
+                Box::new(source.body),
+                Box::new(cyclic),
+            ),
+            ..source
+        };
+        assert!(matches!(
+            expand(&invalid),
+            Err(Error::UnsupportedJoinPoint(_))
+        ));
     }
 }

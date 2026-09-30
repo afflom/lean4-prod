@@ -63,6 +63,7 @@ def subsetJson : String :=
   -- erased) — the only shape the conformance suite exercises
   -- (`Conformance.MidProp`, `Conformance.NoProp`, `UorAtlas.Instance`).
   let types := ["Nat (bounded u64 target policy)", "Bool",
+                "Decidable (builtin proof-erased Bool tags, including shared join-point cases)",
                 "Int (mathematical; target closure rejected as UnboundedInt)",
                 "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
                 "String", "ByteArray", "Ordering", "Prod", "List", "Option", "Except",

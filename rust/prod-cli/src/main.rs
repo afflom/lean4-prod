@@ -483,6 +483,11 @@ fn build_wasm_sdk(source: &str, output: &Path, stem: &str) {
     let _ = fs::remove_dir_all(staging);
 }
 
+fn refuse_codegen(error: prod_codegen::Error) -> ! {
+    eprintln!("Code generation refused: {error:?}: {error}");
+    std::process::exit(1);
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -506,7 +511,7 @@ fn main() {
                 .unwrap_or_else(|e| panic!("Parse error: {:?}", e));
 
             let body = prod_codegen::generate_module(&module)
-                .unwrap_or_else(|e| panic!("Codegen error: {}", e));
+                .unwrap_or_else(|error| refuse_codegen(error));
 
             let mut out = String::from("#![allow(dead_code)]\n\n");
             out.push_str(&format!(
@@ -577,7 +582,7 @@ fn main() {
                         .collect(),
                 },
             )
-            .unwrap_or_else(|e| panic!("Cargo package generation error: {}", e));
+            .unwrap_or_else(|error| refuse_codegen(error));
             let root = Path::new(&output);
             publish_generated_package(package, root);
             println!("Generated Cargo package: {}", root.display());
@@ -609,7 +614,7 @@ fn main() {
                     input_ir_sha256: format!("{:x}", Sha256::digest(&ir)),
                 },
             )
-            .unwrap_or_else(|e| panic!("Core-Wasm generation error: {}", e));
+            .unwrap_or_else(|error| refuse_codegen(error));
             let root = Path::new(&output);
             publish_generated_package(package, root);
             println!("Generated Core-Wasm package: {}", root.display());

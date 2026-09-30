@@ -48,6 +48,11 @@ corresponding IR nodes. Design decisions:
   `cases`. Lowered directly to the IR comparison expression `(lt|le|eq a b)`,
   which is valid outside an `if` too. Same immediately-bound-shape caveat as
   above; anything else still lowers as an extern call to `decide`.
+- **Shared Decidable tags**: repeated Bool conditions can leave proof-erased
+  `Decidable` constructors and cases behind join points. Their runtime value
+  is exactly a Bool tag. Only the builtin constructors with erased arguments
+  and unused, erased case proofs are admitted; no general polymorphic type
+  or computational proof payload is admitted by this representation.
 - **First-order local functions** are validated as saturated, non-escaping and
   acyclic, then emitted as expression-valued IR continuations. Rust's bounded
   continuation expansion preserves caller continuations, captures and eager
@@ -261,7 +266,23 @@ def lexLeanPrimitive? (n : Name) : Option (String × Nat) :=
 def isPortableBuiltinTypeName (n : Name) : Bool :=
   [``Nat, ``Bool, ``Int, ``Int8, ``Int16, ``Int32, ``Int64,
    ``UInt8, ``UInt16, ``UInt32, ``UInt64, ``String, ``ByteArray,
-   ``Ordering, ``Prod, ``List, ``Option, ``Except].contains n
+   ``Ordering, ``Prod, ``List, ``Option, ``Except, ``Decidable].contains n
+
+/-- Pure LCNF retains the erased proposition argument on this builtin type.
+    It has two runtime tags and no computational constructor fields. -/
+def isDecidableType : Expr → Bool
+  | .app (.const ``Decidable _) (.const ``lcErased _) => true
+  | _ => false
+
+/-- Map only Lean's builtin proof-erased decision constructors. Requiring
+    the original arity prevents silently discarding a computational payload. -/
+def decidableTag? (name : Name) (args : Array (Arg .pure))
+    (resultType : Option Expr) : Option Bool := do
+  guard (resultType.any isDecidableType)
+  let #[.erased, .erased] := args | failure
+  if name == ``Decidable.isFalse then some false
+  else if name == ``Decidable.isTrue then some true
+  else none
 
 def isErasedPortableDictionary (n : Name) : Bool :=
   let part := lastComponent n
@@ -496,6 +517,10 @@ def lowerLetValue (v : LetValue .pure) (resultType : Option Expr := none) : Lowe
   | .const declName _ args => do
     let env ← getEnv
     let args' ← lowerArgs args
+    if declName == ``Decidable.isFalse || declName == ``Decidable.isTrue then
+      let some tag := decidableTag? declName args resultType
+        | throwError "unsupported Decidable constructor shape: {declName}"
+      return if tag then "true" else "false"
     if let some (op, arity) := lexLeanPrimitive? declName then
       if args'.size >= arity then
         let values := args'.extract (args'.size - arity) args'.size
@@ -669,12 +694,25 @@ partial def lowerCode : Code .pure → LowerM String
     let nm ← lookupFVar f
     let args' ← lowerArgs args
     return s!"(jmp {nm}{spaced args'})"
-  | .cases (.mk _tn _rt discr alts) => do
+  | .cases (.mk typeName _rt discr alts) => do
     let scrut ← lookupFVar discr
+    if typeName == ``Decidable &&
+        !((← get).fvarTypes[discr.name]?.any isDecidableType) then
+      throwError "unsupported Decidable discriminant type"
     let mut parts : Array String := #[]
     for a in alts do
       match a with
       | .alt ctorName ps c =>
+        let (ctorName, ps) ← if typeName == ``Decidable then do
+          let #[proof] := ps | throwError "unsupported Decidable case arity"
+          unless proof.type == mkConst ``lcErased && !c.collectUsed.contains proof.fvarId do
+            throwError "unsupported computational Decidable proof"
+          let tag ← if ctorName == ``Decidable.isFalse then pure ``Bool.false
+            else if ctorName == ``Decidable.isTrue then pure ``Bool.true
+            else throwError "unsupported Decidable case constructor: {ctorName}"
+          modify fun st => { st with dropped := st.dropped + 1 }
+          pure (tag, #[])
+        else pure (ctorName, ps)
         let pnames ← ps.mapM fun p => do
           modify fun st => { st with fvarTypes := st.fvarTypes.insert p.fvarId.name p.type }
           registerFVar p.fvarId p.binderName
@@ -717,6 +755,7 @@ partial def lowerType (e : Expr) : LowerM String := do
     return s!"(Option {← lowerType a})"
   | .app (.app (.const ``Except _) error) ok =>
     return s!"(Result {← lowerType ok} {← lowerType error})"
+  | .app (.const ``Decidable _) (.const ``lcErased _) => return "Bool"
   | _ =>
     match e.getAppFn with
     | .const n _ =>

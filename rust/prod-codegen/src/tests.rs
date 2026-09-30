@@ -319,7 +319,7 @@ fn test_core_wasm_bytes_entry_uses_module_fallibility() {
         };
         assert!(
             source.contains(&format!(
-                "let generated_output = entry(input.to_vec()){suffix};"
+                "let generated_output = crate::entry(input.to_vec()){suffix};"
             )),
             "wrong Bytes ABI adapter for {ir}"
         );
